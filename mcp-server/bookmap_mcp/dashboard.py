@@ -822,19 +822,116 @@ def _load_pax_weights() -> Dict[str, Any]:
         if not _PAX_WEIGHTS_CACHE: _PAX_WEIGHTS_CACHE = defaults
     return _PAX_WEIGHTS_CACHE
 
-# Legacy constant kept for backward-compat with code that imports it directly.
-# Live values come from _load_pax_weights() at every poll.
-# Tuned 2026-05-17 — IB placeholder retired (always 0); its 5% redistributed to
-# level (fast proximity-driven signal). Half-lives sped up so the conviction
-# tracks rotations: a 5-min rotation now charges most EMAs to >0.5×, where the
-# old config left vp/vwap at ~0.3×, stranding the composite below the 0.50
-# TREND threshold even when every component was clearly directional.
+# Legacy EMA-model constants — kept for backward compatibility with the
+# helper-signal unit tests (_regime_to_signal / _slope_to_signal / _level_to_signal
+# sign conventions are still used by the v2 engine's `regime`, `vwap_slope`, and
+# `level_reaction` sources). No live code path reads these dicts directly; the
+# v2 engine reads `conviction_source_weights` / `conviction_cluster_caps` from
+# pax_weights.json instead.
 CONVICTION_WEIGHTS = {"regime":0.25,"bias":0.15,"vwap":0.15,"vp":0.15,
                       "slope":0.15,"level":0.15,"ib":0.00}
 CONVICTION_HALFLIFE_SEC = {"regime":120,"bias":120,"vwap":240,"vp":360,
                            "slope":180,"level":90,"ib":7200}
 
+# ─── v2 conviction engine — anchored multi-source ───────────────────────────
+#
+# Replaces the EMA-over-7-labels model. Per source we maintain a per-alias
+# ring of (ts_ms, instantaneous_value) bounded by the medium window, plus a
+# session-anchored running sum/count. The per-source score blends a short
+# rolling SMA, a medium rolling SMA, and the session SMA. Each source declares
+# a reliability in [0,1] derived from availability, sample count, freshness,
+# and a source-specific regime gate. Effective weight = base × reliability,
+# scaled down inside correlation clusters that exceed their cap.
+#
+# Composite score = Σ(eff_w · src_score) / Σ|eff_w|, clipped to [-1,+1].
+# Trajectory = SMA slope of the composite over the last 30s vs 30-90s.
+CONVICTION_METHOD_VERSION = "anchored_multi_source_v2"
+
+CONVICTION_SOURCE_WEIGHTS = {
+    "flow_ofi":                    0.14,
+    "flow_cvd":                    0.12,
+    "flow_vpt_absorption":         0.08,
+    "regime":                      0.08,
+    "bias_score":                  0.08,
+    "vwap_dislocation":            0.08,
+    "vwap_slope":                  0.08,
+    "volume_profile":              0.08,
+    "pull_stack":                  0.10,
+    "tape_large_lot":              0.06,
+    "lt_liquidity":                0.04,
+    "micro_events":                0.04,
+    "level_reaction":              0.08,
+    "anchored_vwap_opening_drive": 0.08,
+    "ib_context":                  0.04,
+}
+
+CONVICTION_CLUSTERS = {
+    "flow":           ["flow_ofi", "flow_cvd", "bias_score", "regime"],
+    "vwap":           ["vwap_dislocation", "vwap_slope", "anchored_vwap_opening_drive"],
+    "structure":      ["volume_profile", "ib_context"],
+    "microstructure": ["pull_stack", "tape_large_lot", "lt_liquidity", "micro_events"],
+}
+
+CONVICTION_CLUSTER_CAPS = {
+    "flow":           0.35,
+    "vwap":           0.25,
+    "structure":      0.20,
+    "microstructure": 0.30,
+}
+
+CONVICTION_WINDOWS_SEC = {
+    "short":                  30,
+    "medium":                 120,
+    "freshness_halflife_sec": 8,
+    "required_samples":       10,
+}
+
+CONVICTION_AGG_WEIGHTS = {"sma_medium": 0.50, "sma_short": 0.30, "sma_session": 0.20}
+
+CONVICTION_THRESHOLDS = {
+    "trend":             0.35,
+    "lean":              0.18,
+    "chop":              0.10,
+    "trajectory_strong": 0.08,
+    "trajectory_normal": 0.02,
+    "min_total_weight":  0.05,
+}
+
+# Maps the 7 legacy component keys (still consumed by dashboard.js) to the v2
+# source names that supersede them. Used to populate `components` and
+# `instantaneous` blocks in the output for backward compatibility.
+_CONVICTION_LEGACY_KEY_MAP = {
+    "regime": "regime",
+    "bias":   "bias_score",
+    "vwap":   "vwap_dislocation",
+    "vp":     "volume_profile",
+    "slope":  "vwap_slope",
+    "level":  "level_reaction",
+    "ib":     "ib_context",
+}
+
 _CONVICTION_STATE: Dict[str, Dict[str, Any]] = {}
+
+
+def _rolling_sma(ring: List[Tuple[int, float]], now_ms: int, window_sec: float
+                 ) -> Tuple[float, int]:
+    """Mean of values whose timestamp is within `window_sec` of `now_ms`.
+
+    Returns (mean, count). count==0 → mean==0.0.
+    """
+    cutoff = now_ms - int(window_sec * 1000)
+    s, n = 0.0, 0
+    for ts, v in ring:
+        if ts >= cutoff:
+            s += v
+            n += 1
+    return (s / n if n else 0.0, n)
+
+
+def _prune_ring(ring: List[Tuple[int, float]], now_ms: int, window_sec: float
+                ) -> List[Tuple[int, float]]:
+    cutoff = now_ms - int(window_sec * 1000)
+    return [(ts, v) for ts, v in ring if ts >= cutoff]
 
 
 def _conv_session_anchor(now_et: dt.datetime) -> Tuple[int, dt.datetime]:
@@ -883,123 +980,632 @@ def _level_to_signal(or_levels: Optional[Dict[str, Any]]) -> float:
     return _clip(contrib)
 
 
-def compute_session_conviction(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Phase A: session-anchored conviction accumulator.
+# ─── v2 source helpers ──────────────────────────────────────────────────────
+# Every helper accepts the live snapshot and returns:
+#   {"score": float in [-1,+1], "reliability": float in [0,1],
+#    "raw": {…},  "reason": str}
+#
+# Sources should never raise. If their fields are missing, return
+# reliability=0 with score=0 so they drop cleanly out of the composite.
 
-    Per-alias EMA over each component, weighted into a single score in [-1,+1].
-    Resets at 08:30 CT daily.
+
+def _as_float(x: Any, default: float = 0.0) -> Tuple[float, bool]:
+    """Tolerant float coercion. Returns (value, ok)."""
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return default, False
+    if math.isnan(f) or math.isinf(f):
+        return default, False
+    return f, True
+
+
+def _source_flow_ofi(snap: Dict[str, Any]) -> Dict[str, Any]:
+    flow = snap.get("flow") or {}
+    ofiz = flow.get("ofiZ")
+    if ofiz is None:
+        ofi, ok = _as_float(flow.get("ofi"))
+        if not ok:
+            return {"score": 0.0, "reliability": 0.0, "raw": {"ofiZ": None}, "reason": "no OFI"}
+        return {"score": _clip(_tanh(ofi / 1000.0)), "reliability": 0.5,
+                "raw": {"ofi": ofi}, "reason": f"OFI={ofi:+.0f} (no z)"}
+    z, ok = _as_float(ofiz)
+    if not ok:
+        return {"score": 0.0, "reliability": 0.0, "raw": {"ofiZ": ofiz}, "reason": "OFI parse err"}
+    return {"score": _clip(_tanh(z / 2.0)), "reliability": 1.0,
+            "raw": {"ofiZ": z}, "reason": f"OFI z={z:+.2f}"}
+
+
+def _source_flow_cvd(snap: Dict[str, Any]) -> Dict[str, Any]:
+    flow = snap.get("flow") or {}
+    cvdz = flow.get("cvdDeltaZ")
+    if cvdz is None:
+        return {"score": 0.0, "reliability": 0.0, "raw": {"cvdDeltaZ": None}, "reason": "no CVD"}
+    z, ok = _as_float(cvdz)
+    if not ok:
+        return {"score": 0.0, "reliability": 0.0, "raw": {"cvdDeltaZ": cvdz}, "reason": "CVD parse err"}
+    return {"score": _clip(_tanh(z / 2.0)), "reliability": 1.0,
+            "raw": {"cvdDeltaZ": z}, "reason": f"CVD z={z:+.2f}"}
+
+
+def _source_flow_vpt_absorption(snap: Dict[str, Any]) -> Dict[str, Any]:
+    flow = snap.get("flow") or {}
+    regime = (flow.get("regime") or "").upper()
+    vptz, vpt_ok = _as_float(flow.get("vptZ"))
+    bias, bias_ok = _as_float(flow.get("biasScore"))
+    mag = _clip(_tanh(abs(vptz) / 2.0)) if vpt_ok else 0.0
+    if regime == "ABSORPTION_BID":
+        return {"score": _clip(0.4 + 0.6 * mag), "reliability": 1.0,
+                "raw": {"vptZ": vptz, "regime": regime},
+                "reason": f"ABS_BID vptZ={vptz:+.2f}"}
+    if regime == "ABSORPTION_ASK":
+        return {"score": -_clip(0.4 + 0.6 * mag), "reliability": 1.0,
+                "raw": {"vptZ": vptz, "regime": regime},
+                "reason": f"ABS_ASK vptZ={vptz:+.2f}"}
+    # Non-absorption regime: small, signed contribution from biasScore × |vptZ|
+    if vpt_ok and bias_ok and abs(bias) > 0.05:
+        sign = 1.0 if bias > 0 else -1.0
+        return {"score": _clip(sign * 0.35 * mag), "reliability": 0.55,
+                "raw": {"vptZ": vptz, "biasScore": bias, "regime": regime},
+                "reason": f"vptZ={vptz:+.2f} bias={bias:+.2f}"}
+    if vpt_ok:
+        return {"score": 0.0, "reliability": 0.30,
+                "raw": {"vptZ": vptz, "regime": regime},
+                "reason": f"vptZ={vptz:+.2f} no direction"}
+    return {"score": 0.0, "reliability": 0.0, "raw": {}, "reason": "no VPT data"}
+
+
+def _source_regime(snap: Dict[str, Any]) -> Dict[str, Any]:
+    flow = snap.get("flow") or {}
+    regime = (flow.get("regime") or "WARMUP").upper()
+    conf, conf_ok = _as_float(flow.get("regimeConfidence"))
+    if regime in ("WARMUP", ""):
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": {"regime": regime}, "reason": "regime warmup"}
+    score = _regime_to_signal(regime, conf if conf_ok else 0.0)
+    # Reliability gated: BALANCED / QUIET carry less weight than active regimes.
+    if regime in ("BALANCED", "QUIET"):
+        reliability = 0.4
+    else:
+        reliability = max(0.3, min(1.0, conf if conf_ok else 0.5))
+    return {"score": _clip(score), "reliability": reliability,
+            "raw": {"regime": regime, "conf": conf},
+            "reason": f"{regime} conf={conf:.2f}" if conf_ok else regime}
+
+
+def _source_bias_score(snap: Dict[str, Any]) -> Dict[str, Any]:
+    flow = snap.get("flow") or {}
+    bs, ok = _as_float(flow.get("biasScore"))
+    if not ok:
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": {"biasScore": flow.get("biasScore")}, "reason": "no biasScore"}
+    return {"score": _clip(bs), "reliability": 1.0,
+            "raw": {"biasScore": bs}, "reason": f"bias={bs:+.2f}"}
+
+
+def _source_vwap_dislocation(snap: Dict[str, Any]) -> Dict[str, Any]:
+    vobj = snap.get("vwap_obj") or {}
+    if not vobj or "_error" in vobj:
+        return {"score": 0.0, "reliability": 0.0, "raw": {}, "reason": "no vwap_obj"}
+    vwap, vwap_ok = _as_float(vobj.get("vwap"))
+    stddev, sd_ok = _as_float(vobj.get("stddev"))
+    last, last_ok = _as_float(vobj.get("lastTradePrice"))
+    book = snap.get("book") or {}
+    mid, mid_ok = _as_float(book.get("mid"), default=last)
+    if not mid_ok and last_ok:
+        mid, mid_ok = last, True
+    if not (vwap_ok and sd_ok and mid_ok) or stddev <= 0:
+        return {"score": 0.0, "reliability": 0.0, "raw": {}, "reason": "vwap fields missing"}
+    z = (mid - vwap) / stddev
+    az = abs(z)
+    flow = snap.get("flow") or {}
+    slope_lbl = (flow.get("vwapSlope") or {}).get("label", "")
+    slope_z, _ = _as_float((flow.get("vwapSlope") or {}).get("slopeZ"))
+    sign = 1.0 if z > 0 else -1.0
+    if az < 1.0:
+        score = _clip(z / 1.5)
+        reason = f"σ={z:+.2f} INSIDE"
+    elif az < 2.0:
+        trend_aligned = (z > 0 and slope_lbl in ("STRONG_UP", "RISING")) \
+                     or (z < 0 and slope_lbl in ("STRONG_DOWN", "FALLING"))
+        if trend_aligned:
+            score = 0.4 * sign
+            reason = f"σ={z:+.2f} TREND-CONFIRMED"
+        else:
+            score = -0.5 * sign
+            reason = f"σ={z:+.2f} MEAN_REVERT"
+    else:
+        strong_trend = (z > 0 and slope_z > 1.5) or (z < 0 and slope_z < -1.5)
+        if strong_trend:
+            score = 0.3 * sign
+            reason = f"σ={z:+.2f} STRONG-TREND"
+        else:
+            score = -0.8 * sign
+            reason = f"σ={z:+.2f} EXHAUSTION"
+    return {"score": _clip(score), "reliability": 1.0,
+            "raw": {"sigma_z": z, "slope": slope_lbl}, "reason": reason}
+
+
+def _source_vwap_slope(snap: Dict[str, Any]) -> Dict[str, Any]:
+    flow = snap.get("flow") or {}
+    sl = flow.get("vwapSlope") or {}
+    label = sl.get("label") or "WARMUP"
+    slope_z, ok = _as_float(sl.get("slopeZ"))
+    if label == "WARMUP":
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": {"label": label}, "reason": "slope warmup"}
+    score = _slope_to_signal(label, slope_z if ok else 0.0)
+    return {"score": _clip(score), "reliability": 1.0,
+            "raw": {"label": label, "slopeZ": slope_z},
+            "reason": f"slope {label} z={slope_z:+.2f}" if ok else f"slope {label}"}
+
+
+def _source_volume_profile(snap: Dict[str, Any]) -> Dict[str, Any]:
+    vp = snap.get("vp_bias") or {}
+    if not vp or "_error" in vp:
+        return {"score": 0.0, "reliability": 0.0, "raw": {}, "reason": "no vp_bias"}
+    s, ok = _as_float(vp.get("score"))
+    if not ok:
+        return {"score": 0.0, "reliability": 0.0, "raw": {}, "reason": "vp score missing"}
+    return {"score": _clip(s), "reliability": 1.0,
+            "raw": {"score": s, "label": vp.get("label")},
+            "reason": f"vp={s:+.2f}"}
+
+
+def _source_pull_stack(snap: Dict[str, Any]) -> Dict[str, Any]:
+    ps = snap.get("pull_stack") or {}
+    if not ps or "_error" in ps:
+        return {"score": 0.0, "reliability": 0.0, "raw": {}, "reason": "no pull_stack"}
+    aggz, ok = _as_float(ps.get("aggregateZ"))
+    rotation = (ps.get("rotation") or "NONE").upper()
+    if not ok and rotation == "NONE":
+        return {"score": 0.0, "reliability": 0.0, "raw": ps,
+                "reason": "no aggregateZ / rotation"}
+    base = _tanh(aggz / 2.0) if ok else 0.0
+    if rotation == "ROTATION_UP":
+        score = _clip(base + 0.20)
+    elif rotation == "ROTATION_DN":
+        score = _clip(base - 0.20)
+    else:
+        score = _clip(base)
+    return {"score": score, "reliability": 1.0,
+            "raw": {"aggregateZ": aggz, "rotation": rotation},
+            "reason": f"aggZ={aggz:+.2f} rot={rotation}"}
+
+
+def _source_tape_large_lot(snap: Dict[str, Any]) -> Dict[str, Any]:
+    """Large-lot aggressor bias. The tape_buckets payload exposed by the bridge
+    is currently {biasScore, bias} only — large-lot breakdown by bucket is not
+    plumbed through yet. We use biasScore as a proxy but at low reliability so
+    it doesn't dominate the microstructure cluster.
+    """
+    tape = snap.get("tape_buckets") or {}
+    if not tape or "_error" in tape:
+        return {"score": 0.0, "reliability": 0.0, "raw": {}, "reason": "no tape_buckets"}
+    # Look for a true large-lot field first; the schema may grow it later.
+    buckets = tape.get("buckets") if isinstance(tape.get("buckets"), dict) else None
+    if buckets:
+        large = buckets.get("100plus") or buckets.get("largeLot") or {}
+        buy, buy_ok = _as_float(large.get("buy"))
+        sell, sell_ok = _as_float(large.get("sell"))
+        total = buy + sell
+        if buy_ok and sell_ok and total > 0:
+            imb = (buy - sell) / total
+            return {"score": _clip(_tanh(imb * 2.0)), "reliability": 1.0,
+                    "raw": {"large_buy": buy, "large_sell": sell},
+                    "reason": f"large-lot imb={imb:+.2f}"}
+    # Fallback: tape biasScore (proxy, reduced reliability).
+    bs, ok = _as_float(tape.get("biasScore"))
+    if ok:
+        return {"score": _clip(bs), "reliability": 0.5,
+                "raw": {"biasScore": bs, "shape": "proxy"},
+                "reason": f"tape biasScore={bs:+.2f} (proxy)"}
+    return {"score": 0.0, "reliability": 0.0, "raw": dict(tape), "reason": "tape shape unknown"}
+
+
+def _source_lt_liquidity(snap: Dict[str, Any]) -> Dict[str, Any]:
+    lt = snap.get("lt_liquidity") or {}
+    if not lt or "_error" in lt:
+        return {"score": 0.0, "reliability": 0.0, "raw": {}, "reason": "no lt_liquidity"}
+    bid, bok = _as_float(lt.get("bidSize"))
+    ask, aok = _as_float(lt.get("askSize"))
+    total = bid + ask
+    if not (bok and aok) or total <= 0:
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": {"bid": bid, "ask": ask}, "reason": "lt empty"}
+    # Bid > ask → support / bullish magnet. Squash so 80/20 ≈ 0.6.
+    imb = (bid - ask) / total
+    return {"score": _clip(_tanh(imb * 1.5)), "reliability": 0.8,
+            "raw": {"bid": bid, "ask": ask, "imb": imb},
+            "reason": f"LT bid/ask imb={imb:+.2f}"}
+
+
+def _source_micro_events(snap: Dict[str, Any]) -> Dict[str, Any]:
+    me = snap.get("micro_events") or {}
+    if not me or "_error" in me:
+        return {"score": 0.0, "reliability": 0.0, "raw": {}, "reason": "no micro_events"}
+    events = me.get("events") or []
+    if not events:
+        return {"score": 0.0, "reliability": 0.2, "raw": {}, "reason": "no events"}
+    now_ms = int(dt.datetime.now(ET).timestamp() * 1000)
+    score = 0.0
+    hits: List[str] = []
+    for ev in events[-30:]:
+        kind = (ev.get("kind") or ev.get("type") or "").upper()
+        is_bid = ev.get("isBid")
+        if isinstance(is_bid, bool):
+            bid_like = is_bid
+            ask_like = not is_bid
+        else:
+            side = (ev.get("side") or "").upper()
+            bid_like = side in ("BID", "BUY")
+            ask_like = side in ("ASK", "SELL")
+        if not (bid_like or ask_like):
+            continue
+        # Event-age decay so stale events fall out of the signal.
+        ev_ms, ok = _as_float(ev.get("timeMs"))
+        if ok and ev_ms > 0:
+            age_sec = max(0.0, (now_ms - ev_ms) / 1000.0)
+        else:
+            age_sec = 0.0
+        decay = math.exp(-age_sec / 30.0)
+        if kind == "ICEBERG":
+            score += (+0.4 if bid_like else -0.4) * decay
+            hits.append(f"ICE{'B' if bid_like else 'A'}")
+        elif kind == "STOP_SWEEP":
+            score += (+0.5 if bid_like else -0.5) * decay
+            hits.append(f"SWEEP{'B' if bid_like else 'A'}")
+        elif kind == "SPOOF":
+            # Spoof is contrarian: bid spoof bearish, ask spoof bullish.
+            score += (-0.3 if bid_like else +0.3) * decay
+            hits.append(f"SPOOF{'B' if bid_like else 'A'}")
+    return {"score": _clip(score), "reliability": min(1.0, len(events) / 5.0),
+            "raw": {"event_count": len(events), "hits": hits},
+            "reason": ",".join(hits[:5]) if hits else "no signed events"}
+
+
+def _source_level_reaction(snap: Dict[str, Any]) -> Dict[str, Any]:
+    or_levels = snap.get("or_levels")
+    if not or_levels or (isinstance(or_levels, dict) and "_error" in or_levels):
+        return {"score": 0.0, "reliability": 0.0, "raw": {}, "reason": "no or_levels"}
+    score = _level_to_signal(or_levels)
+    in_prox = bool(or_levels.get("inProximity"))
+    # Without proximity the level model has no edge — keep reliability low.
+    reliability = 1.0 if in_prox else 0.3
+    return {"score": _clip(score), "reliability": reliability,
+            "raw": {"inProximity": in_prox, "middleLock": or_levels.get("middleLock")},
+            "reason": f"level reaction={score:+.2f} prox={in_prox}"}
+
+
+def _source_anchored_vwap_opening_drive(snap: Dict[str, Any]) -> Dict[str, Any]:
+    """Opening-drive anchored VWAP. The /momentum payload exposed by the bridge
+    does NOT currently produce an avwap block, so this source always returns
+    reliability=0. Wired here so it activates the moment the bridge ships the
+    field — no code change needed downstream.
+    """
+    flow = snap.get("flow") or {}
+    avwap = flow.get("avwap")
+    if not isinstance(avwap, dict):
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": {"avwap": None}, "reason": "no avwap"}
+    top, t_ok = _as_float(avwap.get("topVwap"))
+    bot, b_ok = _as_float(avwap.get("botVwap"))
+    dhi, dh_ok = _as_float(avwap.get("driveHigh"))
+    dlo, dl_ok = _as_float(avwap.get("driveLow"))
+    book = snap.get("book") or {}
+    mid, m_ok = _as_float(book.get("mid"))
+    if not (t_ok and b_ok and m_ok):
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": dict(avwap), "reason": "avwap fields missing"}
+    span = max(0.5, (dhi - dlo) if (dh_ok and dl_ok and dhi > dlo) else (top - bot))
+    if mid > top:
+        score = _clip((mid - top) / span)
+        reason = f"mid {mid:.2f} > topAVWAP {top:.2f}"
+    elif mid < bot:
+        score = -_clip((bot - mid) / span)
+        reason = f"mid {mid:.2f} < botAVWAP {bot:.2f}"
+    else:
+        score = 0.0
+        reason = "inside avwap channel"
+    return {"score": _clip(score), "reliability": 1.0,
+            "raw": {"topVwap": top, "botVwap": bot, "mid": mid}, "reason": reason}
+
+
+def _source_ib_context(snap: Dict[str, Any]) -> Dict[str, Any]:
+    """IB-breakout context. The /momentum payload exposes ib.dayType / ibSizeTag
+    but no live IB-high/low or break-direction field. We treat this as a context
+    flag with no usable sign until IB break direction is plumbed through.
+    """
+    flow = snap.get("flow") or {}
+    ib = flow.get("ib") or {}
+    if not ib:
+        return {"score": 0.0, "reliability": 0.0, "raw": {}, "reason": "no ib"}
+    ib_high, hok = _as_float(ib.get("high"))
+    ib_low, lok = _as_float(ib.get("low"))
+    complete = ib.get("complete")
+    book = snap.get("book") or {}
+    mid, mok = _as_float(book.get("mid"))
+    if hok and lok and mok and ib_high > ib_low and complete:
+        if mid > ib_high:
+            return {"score": _clip((mid - ib_high) / max(1.0, ib_high - ib_low)),
+                    "reliability": 1.0,
+                    "raw": {"ib_high": ib_high, "mid": mid},
+                    "reason": f"mid {mid:.2f} > IB-H {ib_high:.2f}"}
+        if mid < ib_low:
+            return {"score": -_clip((ib_low - mid) / max(1.0, ib_high - ib_low)),
+                    "reliability": 1.0,
+                    "raw": {"ib_low": ib_low, "mid": mid},
+                    "reason": f"mid {mid:.2f} < IB-L {ib_low:.2f}"}
+        return {"score": 0.0, "reliability": 0.6,
+                "raw": {"ib_high": ib_high, "ib_low": ib_low, "mid": mid},
+                "reason": "inside IB range"}
+    return {"score": 0.0, "reliability": 0.0,
+            "raw": {"dayType": ib.get("dayType")}, "reason": "ib direction unknown"}
+
+
+_CONVICTION_SOURCES: Dict[str, Any] = {
+    "flow_ofi":                    _source_flow_ofi,
+    "flow_cvd":                    _source_flow_cvd,
+    "flow_vpt_absorption":         _source_flow_vpt_absorption,
+    "regime":                      _source_regime,
+    "bias_score":                  _source_bias_score,
+    "vwap_dislocation":            _source_vwap_dislocation,
+    "vwap_slope":                  _source_vwap_slope,
+    "volume_profile":              _source_volume_profile,
+    "pull_stack":                  _source_pull_stack,
+    "tape_large_lot":              _source_tape_large_lot,
+    "lt_liquidity":                _source_lt_liquidity,
+    "micro_events":                _source_micro_events,
+    "level_reaction":              _source_level_reaction,
+    "anchored_vwap_opening_drive": _source_anchored_vwap_opening_drive,
+    "ib_context":                  _source_ib_context,
+}
+
+
+def _conv_init_source_state(now_ms: int) -> Dict[str, Any]:
+    return {
+        "ring":           [],   # [(ts_ms, value), ...] bounded by medium window
+        "sessionSum":     0.0,
+        "sessionCount":   0,
+        "lastValue":      0.0,
+        "lastUpdateMs":   now_ms,
+        "available":      False,
+        "reliability":    0.0,
+    }
+
+
+def _conv_init_alias_state(anchor_ms: int, anchor_iso: str, now_ms: int) -> Dict[str, Any]:
+    return {
+        "anchorMs":     anchor_ms,
+        "anchorIso":    anchor_iso,
+        "lastUpdateMs": now_ms,
+        "sources":      {name: _conv_init_source_state(now_ms)
+                         for name in _CONVICTION_SOURCES},
+        "scoreRing":    [],     # [(ts_ms, score), ...] bounded by 90s
+    }
+
+
+def _conv_aggregate_source(src_state: Dict[str, Any], now_ms: int,
+                           win_short: float, win_medium: float,
+                           agg_w: Dict[str, float]) -> Tuple[float, int]:
+    """Combine short SMA + medium SMA + session SMA per the aggregation weights.
+    Returns (source_score_in_[-1,+1], samples_in_medium)."""
+    short_avg, n_short = _rolling_sma(src_state["ring"], now_ms, win_short)
+    med_avg,   n_med   = _rolling_sma(src_state["ring"], now_ms, win_medium)
+    n_sess = src_state["sessionCount"]
+    sess_avg = (src_state["sessionSum"] / n_sess) if n_sess > 0 else 0.0
+    # Pull weights for available components; fall back proportionally when one
+    # window has no samples (still ramping up).
+    parts: List[Tuple[float, float]] = []
+    if n_med > 0:    parts.append((agg_w.get("sma_medium",  0.50), med_avg))
+    if n_short > 0:  parts.append((agg_w.get("sma_short",   0.30), short_avg))
+    if n_sess > 0:   parts.append((agg_w.get("sma_session", 0.20), sess_avg))
+    if not parts:
+        return 0.0, n_med
+    w_sum = sum(w for w, _ in parts) or 1e-9
+    score = sum(w * v for w, v in parts) / w_sum
+    return _clip(score), n_med
+
+
+def _conv_apply_cluster_caps(effective: Dict[str, float],
+                             clusters: Dict[str, List[str]],
+                             caps: Dict[str, float]) -> Dict[str, float]:
+    """Scale effective weights down inside each cluster so the cluster's total
+    absolute weight cannot exceed its cap. Returns a NEW dict; unclustered
+    sources are unchanged.
+    """
+    out = dict(effective)
+    for name, members in clusters.items():
+        cap = caps.get(name)
+        if cap is None: continue
+        total = sum(abs(out.get(m, 0.0)) for m in members)
+        if total > cap and total > 0:
+            scale = cap / total
+            for m in members:
+                if m in out: out[m] = out[m] * scale
+    return out
+
+
+def compute_session_conviction(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Session-anchored multi-source weighted conviction.
+
+    Per-source rolling SMAs over short (30s) and medium (120s) windows plus a
+    session-anchored SMA from 08:30 CT, combined into a single source_score in
+    [-1,+1]. Each source declares a reliability that gates its base weight;
+    correlated sources are capped per cluster. The composite is the normalized
+    weighted sum, clipped to [-1,+1].
+
+    Returns a dict with the legacy keys still consumed by dashboard.js
+    (score / trajectory / trend / durationSec / anchorMs / anchorIso /
+    components / instantaneous / weights) plus the v2 detail blocks
+    (sourceScores / sourceReliability / effectiveWeights / rawSources / method).
+    Returns None only when there is no snapshot health or no alias.
     """
     if snap.get("health") != "ok": return None
     alias = snap.get("alias")
     if not alias: return None
 
     now_et = dt.datetime.now(ET)
+    now_ms = int(now_et.timestamp() * 1000)
     anchor_ms, anchor_dt = _conv_session_anchor(now_et)
+
+    cfg = _load_pax_weights()
+    base_weights = cfg.get("conviction_source_weights") or CONVICTION_SOURCE_WEIGHTS
+    clusters     = cfg.get("conviction_clusters")       or CONVICTION_CLUSTERS
+    caps         = cfg.get("conviction_cluster_caps")   or CONVICTION_CLUSTER_CAPS
+    win_cfg      = cfg.get("conviction_windows_sec")    or CONVICTION_WINDOWS_SEC
+    agg_w        = cfg.get("conviction_aggregation_weights") or CONVICTION_AGG_WEIGHTS
+    thresh       = cfg.get("conviction_thresholds")     or CONVICTION_THRESHOLDS
+    win_short  = float(win_cfg.get("short", 30))
+    win_medium = float(win_cfg.get("medium", 120))
+    fresh_hl   = float(win_cfg.get("freshness_halflife_sec", 8))
+    req_n      = int(win_cfg.get("required_samples", 10))
 
     st = _CONVICTION_STATE.get(alias)
     if not st or st.get("anchorMs") != anchor_ms:
-        st = {
-            "anchorMs":     anchor_ms,
-            "anchorIso":    anchor_dt.isoformat(),
-            "lastUpdateMs": int(now_et.timestamp() * 1000),
-            "ema":          {k: 0.0 for k in CONVICTION_WEIGHTS},
-            "trajectoryRing": [],      # last 30 score samples for trajectory
-        }
+        st = _conv_init_alias_state(anchor_ms, anchor_dt.isoformat(), now_ms)
         _CONVICTION_STATE[alias] = st
+    # Defensive: a brand-new source added to the registry mid-session.
+    for name in _CONVICTION_SOURCES:
+        if name not in st["sources"]:
+            st["sources"][name] = _conv_init_source_state(now_ms)
 
-    # Time elapsed since last update
-    now_ms = int(now_et.timestamp() * 1000)
-    dt_sec = max(0.001, (now_ms - st["lastUpdateMs"]) / 1000.0)
     st["lastUpdateMs"] = now_ms
 
-    # Source signals from the snapshot
-    flow = snap.get("flow") or {}
-    regime = flow.get("regime") or "WARMUP"
-    regime_conf = float(flow.get("regimeConfidence") or 0.0)
-    bias_score = float(flow.get("biasScore") or 0.0)
-    slope = flow.get("vwapSlope") or {}
-    slope_label = slope.get("label") or "WARMUP"
-    slope_z = float(slope.get("slopeZ") or 0.0)
-    vwap_bias = (snap.get("vwap_bias") or {}).get("score") or 0.0
-    vp_bias   = (snap.get("vp_bias")   or {}).get("score") or 0.0
-    ib = flow.get("ib") or {}
-    day_type = ib.get("dayType") or "UNKNOWN"
-    day_signal = {"TREND": 0.0, "NORMAL": 0.0, "NORMAL_VAR": 0.0,
-                  "NEUTRAL": 0.0, "NON_TREND": 0.0, "UNKNOWN": 0.0}.get(day_type, 0.0)
-    # Day-type itself doesn't have a sign; it MODULATES other signals via the gate
-    # already applied in vp_bias. Here we just record it as a context tag.
+    # 1. Pull each source's instantaneous reading, push into rings, compute
+    #    its time-aggregated source_score and reliability.
+    instantaneous: Dict[str, float] = {}
+    source_scores: Dict[str, float] = {}
+    source_reliability: Dict[str, float] = {}
+    raw_sources: Dict[str, Any] = {}
+    reasons: Dict[str, str] = {}
 
-    # Hot-loaded config
-    cfg = _load_pax_weights()
-    weights = cfg.get("conviction_weights") or CONVICTION_WEIGHTS
-    halflife = cfg.get("conviction_halflife_sec") or CONVICTION_HALFLIFE_SEC
+    for name, helper in _CONVICTION_SOURCES.items():
+        try:
+            result = helper(snap)
+        except Exception as exc:
+            # Source helpers must not crash the engine. Surface and skip.
+            sys.stderr.write(f"[conviction] source {name} raised: "
+                             f"{type(exc).__name__}: {exc}\n")
+            result = {"score": 0.0, "reliability": 0.0,
+                      "raw": {"_error": f"{type(exc).__name__}: {exc}"},
+                      "reason": "source crashed"}
+        inst_score = _clip(float(result.get("score") or 0.0))
+        availability = float(result.get("reliability") or 0.0)
+        src_st = st["sources"][name]
+        # Only feed the rings when the source is actually available this tick.
+        # An unavailable source must not drag the SMA back toward 0; instead
+        # we just inherit its previous ring state.
+        if availability > 0.0:
+            src_st["ring"].append((now_ms, inst_score))
+            src_st["sessionSum"]   += inst_score
+            src_st["sessionCount"] += 1
+            src_st["lastValue"]     = inst_score
+            src_st["lastUpdateMs"]  = now_ms
+            src_st["available"]     = True
+        # Prune by medium window so the ring never grows without bound.
+        src_st["ring"] = _prune_ring(src_st["ring"], now_ms, win_medium)
 
-    # Component instantaneous signals (each in [-1,+1])
-    inst = {
-        "regime": _regime_to_signal(regime, regime_conf),
-        "bias":   _clip(bias_score),
-        "vwap":   _clip(float(vwap_bias)),
-        "vp":     _clip(float(vp_bias)),
-        "slope":  _slope_to_signal(slope_label, slope_z),
-        "level":  _level_to_signal(snap.get("or_levels")),
-        "ib":     0.0,     # placeholder — wire to ib breakout direction when needed
+        instantaneous[name] = round(inst_score, 4)
+        raw_sources[name]   = result.get("raw") or {}
+        reasons[name]       = result.get("reason") or ""
+
+        # Aggregate across windows.
+        src_score, n_med = _conv_aggregate_source(src_st, now_ms,
+                                                  win_short, win_medium, agg_w)
+        source_scores[name] = src_score
+
+        # Reliability: availability × sample_conf × freshness.
+        sample_conf = min(1.0, n_med / float(req_n)) if req_n > 0 else 1.0
+        age_sec = max(0.0, (now_ms - src_st["lastUpdateMs"]) / 1000.0)
+        freshness = math.exp(-age_sec / max(0.5, fresh_hl)) if src_st["available"] else 0.0
+        reliability = availability * sample_conf * freshness
+        source_reliability[name] = max(0.0, min(1.0, reliability))
+
+    # 2. Effective weights = base × reliability, then apply cluster caps.
+    effective: Dict[str, float] = {
+        name: base_weights.get(name, 0.0) * source_reliability[name]
+        for name in _CONVICTION_SOURCES
     }
+    effective = _conv_apply_cluster_caps(effective, clusters, caps)
 
-    # EMA update — per-component half-life
-    for k, x in inst.items():
-        hl = halflife.get(k, 300)
-        alpha = 1.0 - math.exp(-math.log(2) * dt_sec / hl)
-        st["ema"][k] = (1 - alpha) * st["ema"][k] + alpha * x
+    # 3. Composite score = normalized weighted sum.
+    num = sum(effective[n] * source_scores[n] for n in effective)
+    den = sum(abs(effective[n]) for n in effective)
+    min_w = float(thresh.get("min_total_weight", 0.05))
+    score = _clip(num / den) if den >= min_w else 0.0
 
-    # Composite conviction = weighted sum, clipped
-    score = sum(weights.get(k, 0) * st["ema"][k] for k in weights)
-    score = _clip(score)
-
-    # Trajectory: keep last 30 samples (≈30 sec at 1Hz)
-    st["trajectoryRing"].append(score)
-    if len(st["trajectoryRing"]) > 30:
-        st["trajectoryRing"] = st["trajectoryRing"][-30:]
-    if len(st["trajectoryRing"]) >= 6:
-        recent = sum(st["trajectoryRing"][-3:]) / 3.0
-        older  = sum(st["trajectoryRing"][:3])  / 3.0
-        slope_30s = recent - older
-        if   slope_30s >  0.08: traj = "RISING_STRONG"
-        elif slope_30s >  0.02: traj = "RISING"
-        elif slope_30s < -0.08: traj = "FALLING_STRONG"
-        elif slope_30s < -0.02: traj = "FALLING"
+    # 4. Trajectory — SMA slope of the composite over 30s vs 30-90s.
+    st["scoreRing"].append((now_ms, score))
+    st["scoreRing"] = _prune_ring(st["scoreRing"], now_ms, 90.0)
+    recent_avg, n_recent = _rolling_sma(st["scoreRing"], now_ms, win_short)
+    prior_cutoff = now_ms - int(win_short * 1000)
+    prior_window = [(ts, v) for ts, v in st["scoreRing"] if ts < prior_cutoff]
+    if prior_window:
+        prior_avg = sum(v for _, v in prior_window) / len(prior_window)
+        n_prior = len(prior_window)
+    else:
+        prior_avg, n_prior = 0.0, 0
+    if n_recent >= 3 and n_prior >= 3:
+        slope = recent_avg - prior_avg
+        tr_strong = float(thresh.get("trajectory_strong", 0.08))
+        tr_norm   = float(thresh.get("trajectory_normal", 0.02))
+        if   slope >  tr_strong: traj = "RISING_STRONG"
+        elif slope >  tr_norm:   traj = "RISING"
+        elif slope < -tr_strong: traj = "FALLING_STRONG"
+        elif slope < -tr_norm:   traj = "FALLING"
         else:                    traj = "FLAT"
     else:
         traj = "WARMUP"
 
-    # Trend label combines score + trajectory.
-    # Thresholds calibrated 2026-05-17 against the EMA-decay math:
-    #   With sped-up halflives, a 5-min full-strength rotation reaches composite ~0.38,
-    #   and a 2-min one reaches ~0.22. So:
-    #     ±0.35  → confirmed TREND        (held for the duration of a real move)
-    #     ±0.18  → LEAN                   (early-rotation signal, before full charge)
-    #     ±0.10  → CHOP edge              (genuine flatness)
+    # 5. Trend label — same vocabulary as v1, thresholds from config.
+    t_trend = float(thresh.get("trend", 0.35))
+    t_lean  = float(thresh.get("lean",  0.18))
+    t_chop  = float(thresh.get("chop",  0.10))
     nUP   = traj in ("RISING_STRONG", "RISING", "FLAT")
     nDOWN = traj in ("FALLING_STRONG", "FALLING", "FLAT")
-    if   score >  0.35 and nUP:                       trend = "BULLISH_TREND"
-    elif score < -0.35 and nDOWN:                     trend = "BEARISH_TREND"
-    elif score >  0.18 and nUP:                       trend = "BULL_LEAN"
-    elif score < -0.18 and nDOWN:                     trend = "BEAR_LEAN"
-    elif score >  0.18 and traj == "FALLING_STRONG":  trend = "BULL_FADING"   # reversal warning
-    elif score < -0.18 and traj == "RISING_STRONG":   trend = "BEAR_FADING"
-    elif abs(score) < 0.10:                           trend = "CHOP"
-    else:                                             trend = "MIXED"
+    if   score >  t_trend and nUP:                       trend = "BULLISH_TREND"
+    elif score < -t_trend and nDOWN:                     trend = "BEARISH_TREND"
+    elif score >  t_lean  and nUP:                       trend = "BULL_LEAN"
+    elif score < -t_lean  and nDOWN:                     trend = "BEAR_LEAN"
+    elif score >  t_lean  and traj == "FALLING_STRONG":  trend = "BULL_FADING"
+    elif score < -t_lean  and traj == "RISING_STRONG":   trend = "BEAR_FADING"
+    elif abs(score) < t_chop:                            trend = "CHOP"
+    else:                                                trend = "MIXED"
+
+    # 6. Backward-compat blocks: dashboard.js iterates the 7 legacy keys on
+    #    components / instantaneous. Populate them from the v2 sources.
+    legacy_components = {
+        k: round(source_scores.get(v, 0.0), 3)
+        for k, v in _CONVICTION_LEGACY_KEY_MAP.items()
+    }
+    legacy_instant = {
+        k: round(instantaneous.get(v, 0.0), 3)
+        for k, v in _CONVICTION_LEGACY_KEY_MAP.items()
+    }
+    legacy_weights = {
+        k: round(effective.get(v, 0.0), 3)
+        for k, v in _CONVICTION_LEGACY_KEY_MAP.items()
+    }
 
     duration_sec = (now_ms - anchor_ms) // 1000
     return {
-        "score":          round(score, 3),
-        "trajectory":     traj,
-        "trend":          trend,
-        "durationSec":    int(duration_sec),
-        "anchorMs":       anchor_ms,
-        "anchorIso":      st["anchorIso"],
-        "components":     {k: round(v, 3) for k, v in st["ema"].items()},
-        "instantaneous":  {k: round(v, 3) for k, v in inst.items()},
-        "weights":        dict(weights),
+        "score":             round(score, 3),
+        "trajectory":        traj,
+        "trend":             trend,
+        "durationSec":       int(duration_sec),
+        "anchorMs":          anchor_ms,
+        "anchorIso":         st["anchorIso"],
+        "components":        legacy_components,
+        "instantaneous":     legacy_instant,
+        "weights":           legacy_weights,
+        # v2 detail
+        "sourceScores":      {n: round(v, 3) for n, v in source_scores.items()},
+        "sourceReliability": {n: round(v, 3) for n, v in source_reliability.items()},
+        "effectiveWeights":  {n: round(v, 4) for n, v in effective.items()},
+        "rawSources":        raw_sources,
+        "reasons":           reasons,
+        "method":            CONVICTION_METHOD_VERSION,
     }
 
 

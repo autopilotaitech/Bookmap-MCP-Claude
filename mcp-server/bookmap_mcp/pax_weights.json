@@ -1,10 +1,72 @@
 {
   "_comment": "Pax weight configuration. Updated by reviewing pax_replay output and manually editing this file. Restart dashboard to pick up changes.",
-  "_version": 1,
-  "_last_updated": "2026-05-17",
+  "_version": 2,
+  "_last_updated": "2026-05-18",
+
+  "conviction_method": "anchored_multi_source_v2",
+
+  "conviction_source_weights": {
+    "_comment": "Base weights for the anchored multi-source conviction engine. Sums to ~1.18; effective weights are normalized at runtime by sum(|effective|) after reliability gating and cluster caps.",
+    "flow_ofi":                    0.14,
+    "flow_cvd":                    0.12,
+    "flow_vpt_absorption":         0.08,
+    "regime":                      0.08,
+    "bias_score":                  0.08,
+    "vwap_dislocation":            0.08,
+    "vwap_slope":                  0.08,
+    "volume_profile":              0.08,
+    "pull_stack":                  0.10,
+    "tape_large_lot":              0.06,
+    "lt_liquidity":                0.04,
+    "micro_events":                0.04,
+    "level_reaction":              0.08,
+    "anchored_vwap_opening_drive": 0.08,
+    "ib_context":                  0.04
+  },
+
+  "conviction_clusters": {
+    "_comment": "Correlation clusters. Sources not listed here are unclustered (no cap). Effective weights inside a cluster are scaled down proportionally if their absolute sum exceeds the cluster cap.",
+    "flow":           ["flow_ofi", "flow_cvd", "bias_score", "regime"],
+    "vwap":           ["vwap_dislocation", "vwap_slope", "anchored_vwap_opening_drive"],
+    "structure":      ["volume_profile", "ib_context"],
+    "microstructure": ["pull_stack", "tape_large_lot", "lt_liquidity", "micro_events"]
+  },
+
+  "conviction_cluster_caps": {
+    "flow":           0.35,
+    "vwap":           0.25,
+    "structure":      0.20,
+    "microstructure": 0.30
+  },
+
+  "conviction_windows_sec": {
+    "_comment": "Anchored rolling windows for per-source SMA. 'short' = fast-reaction window. 'medium' = primary stability window. 'session' is anchored at 08:30 CT.",
+    "short":                  30,
+    "medium":                 120,
+    "freshness_halflife_sec": 8,
+    "required_samples":       10
+  },
+
+  "conviction_aggregation_weights": {
+    "_comment": "Per-source aggregation across the three time horizons. Must sum to 1.0.",
+    "sma_medium":  0.50,
+    "sma_short":   0.30,
+    "sma_session": 0.20
+  },
+
+  "conviction_thresholds": {
+    "_comment": "Composite score thresholds for trend label, plus SMA-slope thresholds for trajectory.",
+    "trend":              0.35,
+    "lean":               0.18,
+    "chop":               0.10,
+    "trajectory_strong":  0.08,
+    "trajectory_normal":  0.02,
+    "min_total_weight":   0.05
+  },
+
+  "_legacy_comment": "The fields below are the pre-v2 EMA model. Kept for backward compatibility — read by no live code path but referenced by legacy helper tests that pin _regime_to_signal / _slope_to_signal / _level_to_signal sign conventions.",
 
   "conviction_weights": {
-    "_comment": "ib placeholder returns 0 always — redistributed its 5% to level so book reaction (fast component) gets 0.15. regime kept at 0.25 (top quant signal). bias/vwap/vp/slope/level all at 0.15 for balance.",
     "regime": 0.25,
     "bias":   0.15,
     "vwap":   0.15,
@@ -15,7 +77,6 @@
   },
 
   "conviction_halflife_sec": {
-    "_comment": "Tuned for rotations. Old config (vp=600,vwap=420) was too slow — a 5-min rotation up only charged the VP EMA to ~30% of instantaneous, leaving composite stuck in MIXED/CHOP. New halflives let the score climb meaningfully within 2-3 min of a real move.",
     "regime": 120,
     "bias":   120,
     "vwap":   240,
