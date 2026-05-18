@@ -103,14 +103,75 @@ restarting Bookmap. Confirm via the startup line:
 
 `mcp-server/bookmap_mcp/pax_weights.json` reloads automatically on mtime
 change. `_*`-prefixed keys are metadata comments stripped by
-`_load_pax_weights()`. Restart the dashboard process to flush cached state.
+`_load_pax_weights()`. **The cache dict is mutated in place** (clear +
+update) — never reassigned — so `signal_engine`'s re-export reference
+stays valid across reloads. Restart the dashboard process only to flush
+non-config caches.
+
+### Paper-trading daemon (live data + sim)
+
+Run-it-all launcher at the repo root:
+
+```cmd
+pax-start.bat                       (defaults: alias NQM6.CME@RITHMIC, port 18890)
+pax-start.bat ESM6.CME@RITHMIC      (override alias)
+pax-stop.bat                        (taskkill by window title, soft then /F)
+```
+
+Manual invocation:
+
+```powershell
+$env:BOOKMAP_ALLOW_TRADING = $null      # daemon refuses to start with =1
+python -m bookmap_mcp.pax_daemon --source bookmap --alias 'NQM6.CME@RITHMIC' --poll-ms 500
+# in another terminal:
+python -m bookmap_mcp.overview_ui       # http://127.0.0.1:18890
+```
+
+First-time setup: `cd mcp-server && python -m pip install -e .` so the
+system Python can `import bookmap_mcp` from anywhere. (The MCP server
+itself uses the venv at `mcp-server/.venv/Scripts/python.exe`; this
+install is for the daemon CLI.)
+
+### Bridge port
+
+The Java bridge port is configured in `~/.bookmap-mcp/bridge.properties`
+(NOT in the repo). Default on this machine: **8765**. The CLAUDE.md
+example port `18888` is wrong for this user's setup — always read the
+actual file. The Python client (`config.py::BridgeConfig.load`) reads
+`port=` from this file and constructs the URL.
+
+### Aliases
+
+Bookmap aliases include the broker route, e.g.
+`NQM6.CME@RITHMIC`, not just `NQM6`. The daemon uses the full alias;
+the launcher defaults to the Rithmic NQ alias.
 
 ## Code layout pointers
 
-- `mcp-server/bookmap_mcp/dashboard.py` — snapshot composer (`fetch_snapshot`),
-  `compute_or_levels` (per-magnet `composite` via `_level_composite`),
-  `compute_tape_flow`, `compute_vwap_bias`, `compute_vp_bias`, `trade_decision`,
-  `compute_session_conviction`, `_sync_magnet_levels`. ~3500 lines, audited heavily.
+- `mcp-server/bookmap_mcp/dashboard.py` — live HUD snapshot composer
+  (`fetch_snapshot`), `compute_or_levels` (per-magnet `composite` via
+  `_level_composite`), `compute_tape_flow`, `compute_vwap_bias`,
+  `compute_vp_bias`, `trade_decision`, `compute_session_conviction`,
+  `_sync_magnet_levels`. ~3500 lines, audited heavily.
+- `mcp-server/bookmap_mcp/signal_engine.py` — pure-Python facade that
+  re-exports every signal helper from dashboard.py with no bridge
+  dependency. Non-dashboard consumers (pax_daemon, replay tools,
+  research notebooks) import from here.
+- `mcp-server/bookmap_mcp/sim_engine.py` — local SQLite-backed paper
+  broker. Bracket children gated by `armed_after_parent_fill` (Phase 0
+  fix). EOD auto-flatten at 15:00 CT; pass `eod_close_hour_ct=None`
+  to disable (tests do this so wall-clock can't trip the EOD path).
+- `mcp-server/bookmap_mcp/pax_daemon.py` — background paper-trading
+  daemon. Adapter -> signal_engine -> decide_and_act -> SimEngine ->
+  journal. Refuses to start if `BOOKMAP_ALLOW_TRADING=1`.
+- `mcp-server/bookmap_mcp/adapters/` — DataAdapter Protocol +
+  CsvReplayAdapter / FileTailAdapter / BookmapLiveAdapter.
+- `mcp-server/bookmap_mcp/journal.py` — SQLite journal (runs,
+  snapshots, signals, orders, fills, positions, daily_stats,
+  adapter_health, events, outcomes). WAL mode; daemon writes, UI reads.
+- `mcp-server/bookmap_mcp/overview_ui.py` — read-only HTTP dashboard
+  at `:18890` with 9 collapsible `<details>` sections (state persisted
+  in localStorage).
 - `_level_composite(side, price, mid, snap)` returns `{score, direction,
   confidence, drivers[], warnings[]}` per OR / extension magnet. 8 drivers,
   weights in `_LVL_W`. Direction = FOLLOW_LONG / FOLLOW_SHORT / FADE_LONG /
@@ -204,18 +265,29 @@ classifier; net -34 lines, no functionality change.
 
 ## What NOT to do
 
-- Don't introduce live order-placement code paths. The Pax agent is
-  CSV-logged and read-only by design.
+- Don't introduce live order-placement code paths in the daemon or any
+  non-`server.py` module. The Pax agent + `pax_daemon` are paper-sim
+  only; live order routing only exists in `server.py`'s two MCP tools
+  behind the `confirm=True` + `BOOKMAP_ALLOW_TRADING=1` two-gate guard.
+- Don't import `bookmap_place_limit_order` or `bookmap_cancel_order`
+  outside of `server.py`. AST/grep tests in
+  `tests/test_safety_boundaries.py` and `tests/test_bookmap_live.py`
+  pin this contract.
 - Don't add LLM-driven math to decision skills. Skills are deterministic
-  decision trees over the snapshot.
+  decision trees over the snapshot. `pax_daemon` passes `use_claude=False`
+  to `decide_and_act` so unattended runs don't spawn subprocesses.
 - Don't refactor `dashboard.py` without backing up. It's the production hub.
 - Don't reformat or "tidy" Unicode in files that already use it; the user
   diffs these manually.
 - Don't reinvent upstream classifications in Python. If FlowRegime,
   MomentumSnapshot, or any Java handler already emits the derived field
-  (trajectory, regime, z-score, σ-band), READ it. Python-side caches
+  (trajectory, regime, z-score, sigma-band), READ it. Python-side caches
   belong to dashboard-process-local state only.
 - Don't add trajectory modulation to direct-read static sources. The
   pattern fits slow/anchored signals (`conviction`, `bias_score`,
   `level_reaction`). Adding it to `orderbook` / `lt_liquidity` /
   `volume_profile` would be bloat — they're snapshots, not processes.
+- Don't construct `SimEngine(...)` in tests without `eod_close_hour_ct=None`
+  unless you specifically want to exercise the EOD auto-flatten path.
+  At arbitrary wall-clock times (15:01 CT through midnight), the default
+  EOD logic will cancel working orders before the test can fill them.
