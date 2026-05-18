@@ -470,6 +470,145 @@ def compute_or_levels(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Institutional tape flow — time/volume-aware delta from /tape_buckets.
+#
+# Bucket size weights (1-10..100+): 0.10 / 0.20 / 0.40 / 0.80 / 1.00.
+# Per-window weighted imbalance fed through tanh(2x); 0.65 fast (30s) + 0.35
+# slow (5m); +/-0.10 alignment bonus when both windows agree directionally;
+# thin-sample guard (floor 5 prints / hedge 15 prints in 30s).
+#
+# Bookmap trade records do NOT carry account or counterparty information.
+# This is a probabilistic institutional proxy via size-weighted aggressor
+# imbalance, not a label. The deltaReason field always cites raw counts.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TAPE_BUCKET_WEIGHTS = {
+    "1-10":   0.10,
+    "11-25":  0.20,
+    "26-50":  0.40,
+    "51-99":  0.80,
+    "100+":   1.00,
+}
+_TAPE_LARGE_LABELS = ("51-99", "100+")
+_TAPE_BLOCK_LABELS = ("100+",)
+_TAPE_THIN_FLOOR_PRINTS = 5     # n30 < this → THIN, score=0
+_TAPE_THIN_HEDGE_PRINTS = 15    # n30 between FLOOR..HEDGE → linear shrink
+_TAPE_ALIGN_BONUS = 0.10        # signed bonus when fast/slow both directional + agree
+_TAPE_ALIGN_THRESHOLD = 0.25    # min |fast|, |slow| to trigger alignment
+
+
+def _imb(buy: float, sell: float) -> float:
+    t = buy + sell
+    return ((buy - sell) / t) if t > 0 else 0.0
+
+
+def compute_tape_flow(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Size-weighted institutional flow delta over 30s + 5m windows from
+    /tape_buckets. Returns None when tape_buckets is missing or shapeless.
+    """
+    tape = snap.get("tape_buckets")
+    if not isinstance(tape, dict) or "_error" in tape:
+        return None
+    buckets = tape.get("buckets")
+    if not isinstance(buckets, list) or not buckets:
+        return None
+
+    tot_buy30 = tot_sell30 = tot_prints30 = 0
+    tot_buy5  = tot_sell5  = tot_prints5  = 0
+    lg_buy30  = lg_sell30  = lg_prints30  = 0
+    lg_buy5   = lg_sell5   = lg_prints5   = 0
+    bk_buy30  = bk_sell30  = bk_prints30  = 0
+    bk_buy5   = bk_sell5   = bk_prints5   = 0
+    wnum30 = wden30 = 0.0
+    wnum5  = wden5  = 0.0
+
+    for b in buckets:
+        if not isinstance(b, dict):
+            continue
+        label = b.get("label", "")
+        w = _TAPE_BUCKET_WEIGHTS.get(label, 0.5)
+        bv30, _ = _as_float(b.get("buyVol30s"));   bv30 = int(bv30)
+        sv30, _ = _as_float(b.get("sellVol30s"));  sv30 = int(sv30)
+        pn30, _ = _as_float(b.get("prints30s"));   pn30 = int(pn30)
+        bv5,  _ = _as_float(b.get("buyVol5m"));    bv5  = int(bv5)
+        sv5,  _ = _as_float(b.get("sellVol5m"));   sv5  = int(sv5)
+        pn5,  _ = _as_float(b.get("prints5m"));    pn5  = int(pn5)
+
+        tot_buy30  += bv30; tot_sell30 += sv30; tot_prints30 += pn30
+        tot_buy5   += bv5;  tot_sell5  += sv5;  tot_prints5  += pn5
+        if label in _TAPE_LARGE_LABELS:
+            lg_buy30 += bv30; lg_sell30 += sv30; lg_prints30 += pn30
+            lg_buy5  += bv5;  lg_sell5  += sv5;  lg_prints5  += pn5
+        if label in _TAPE_BLOCK_LABELS:
+            bk_buy30 += bv30; bk_sell30 += sv30; bk_prints30 += pn30
+            bk_buy5  += bv5;  bk_sell5  += sv5;  bk_prints5  += pn5
+
+        wnum30 += w * (bv30 - sv30)
+        wden30 += w * (bv30 + sv30)
+        wnum5  += w * (bv5  - sv5)
+        wden5  += w * (bv5  + sv5)
+
+    w_imb_30 = (wnum30 / wden30) if wden30 > 0 else 0.0
+    w_imb_5  = (wnum5  / wden5)  if wden5  > 0 else 0.0
+    fast = _tanh(2.0 * w_imb_30)
+    slow = _tanh(2.0 * w_imb_5)
+    base = 0.65 * fast + 0.35 * slow
+
+    aligned = (abs(fast) >= _TAPE_ALIGN_THRESHOLD
+               and abs(slow) >= _TAPE_ALIGN_THRESHOLD
+               and ((fast > 0) == (slow > 0))
+               and fast != 0.0)
+    align = _TAPE_ALIGN_BONUS * (1.0 if fast > 0 else -1.0) if aligned else 0.0
+
+    base_payload = {
+        "totalBuyVol30s": tot_buy30, "totalSellVol30s": tot_sell30, "totalPrints30s": tot_prints30,
+        "totalBuyVol5m":  tot_buy5,  "totalSellVol5m":  tot_sell5,  "totalPrints5m":  tot_prints5,
+        "largeBuyVol30s": lg_buy30,  "largeSellVol30s": lg_sell30,  "largePrints30s": lg_prints30,
+        "largeBuyVol5m":  lg_buy5,   "largeSellVol5m":  lg_sell5,   "largePrints5m":  lg_prints5,
+        "blockBuyVol30s": bk_buy30,  "blockSellVol30s": bk_sell30,  "blockPrints30s": bk_prints30,
+        "blockBuyVol5m":  bk_buy5,   "blockSellVol5m":  bk_sell5,   "blockPrints5m":  bk_prints5,
+        "largeImbalance30s": _imb(lg_buy30, lg_sell30),
+        "largeImbalance5m":  _imb(lg_buy5,  lg_sell5),
+        "blockImbalance30s": _imb(bk_buy30, bk_sell30),
+        "blockImbalance5m":  _imb(bk_buy5,  bk_sell5),
+        "fast": fast, "slow": slow, "aligned": aligned,
+    }
+
+    if tot_prints30 < _TAPE_THIN_FLOOR_PRINTS:
+        return {
+            "deltaScore":  0.0,
+            "deltaLabel":  "THIN",
+            "deltaReason": f"thin tape: n30={tot_prints30}",
+            "shrink":      0.0,
+            **base_payload,
+        }
+
+    shrink = min(1.0, tot_prints30 / float(_TAPE_THIN_HEDGE_PRINTS))
+    score = _clip(shrink * (base + align), -1.0, 1.0)
+
+    abs_s = abs(score)
+    if abs_s < 0.15:
+        label = "BALANCED"
+    elif abs_s < 0.50:
+        label = "BUY" if score > 0 else "SELL"
+    else:
+        label = "STRONG_BUY" if score > 0 else "STRONG_SELL"
+
+    reason = (
+        f"30s wImb={w_imb_30:+.2f}, 5m wImb={w_imb_5:+.2f}, "
+        f"{'aligned' if aligned else 'mixed'}, n30={tot_prints30}, "
+        f"large30s ▲{lg_buy30}/▼{lg_sell30}"
+    )
+    return {
+        "deltaScore":  score,
+        "deltaLabel":  label,
+        "deltaReason": reason,
+        "shrink":      shrink,
+        **base_payload,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # VWAP bias and Volume Profile bias  (Tier 1: pure-Python over existing snapshot)
 #
 # Each returns a dict shaped like:
@@ -1184,33 +1323,44 @@ def _source_pull_stack(snap: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _source_tape_large_lot(snap: Dict[str, Any]) -> Dict[str, Any]:
-    """Large-lot aggressor bias. The tape_buckets payload exposed by the bridge
-    is currently {biasScore, bias} only — large-lot breakdown by bucket is not
-    plumbed through yet. We use biasScore as a proxy but at low reliability so
-    it doesn't dominate the microstructure cluster.
-    """
-    tape = snap.get("tape_buckets") or {}
-    if not tape or "_error" in tape:
-        return {"score": 0.0, "reliability": 0.0, "raw": {}, "reason": "no tape_buckets"}
-    # Look for a true large-lot field first; the schema may grow it later.
-    buckets = tape.get("buckets") if isinstance(tape.get("buckets"), dict) else None
-    if buckets:
-        large = buckets.get("100plus") or buckets.get("largeLot") or {}
-        buy, buy_ok = _as_float(large.get("buy"))
-        sell, sell_ok = _as_float(large.get("sell"))
-        total = buy + sell
-        if buy_ok and sell_ok and total > 0:
-            imb = (buy - sell) / total
-            return {"score": _clip(_tanh(imb * 2.0)), "reliability": 1.0,
-                    "raw": {"large_buy": buy, "large_sell": sell},
-                    "reason": f"large-lot imb={imb:+.2f}"}
-    # Fallback: tape biasScore (proxy, reduced reliability).
-    bs, ok = _as_float(tape.get("biasScore"))
-    if ok:
-        return {"score": _clip(bs), "reliability": 0.5,
-                "raw": {"biasScore": bs, "shape": "proxy"},
-                "reason": f"tape biasScore={bs:+.2f} (proxy)"}
-    return {"score": 0.0, "reliability": 0.0, "raw": dict(tape), "reason": "tape shape unknown"}
+    """Institutional tape-flow source. Primary read is `snap['tape_flow']`
+    produced by `compute_tape_flow`. Falls back to recomputing from the raw
+    /tape_buckets payload if tape_flow is absent (cold start, error path)."""
+    tf = snap.get("tape_flow")
+    if isinstance(tf, dict) and "_error" not in tf and "deltaScore" in tf:
+        return _tape_source_from_flow(tf, fallback=False)
+    recomputed = compute_tape_flow(snap)
+    if recomputed is None:
+        return {"score": 0.0, "reliability": 0.0, "raw": {},
+                "reason": "no tape_buckets"}
+    return _tape_source_from_flow(recomputed, fallback=True)
+
+
+def _tape_source_from_flow(tf: Dict[str, Any], *, fallback: bool) -> Dict[str, Any]:
+    score, _ = _as_float(tf.get("deltaScore"))
+    label = tf.get("deltaLabel", "")
+    lp30, _ = _as_float(tf.get("largePrints30s"))
+    tp30, _ = _as_float(tf.get("totalPrints30s"))
+    if label == "THIN":
+        return {"score": 0.0, "reliability": 0.05,
+                "raw": {"deltaLabel": label, "largePrints30s": lp30,
+                        "totalPrints30s": tp30, "fallback": fallback},
+                "reason": tf.get("deltaReason", "thin tape")}
+    if lp30 >= 4:
+        rel = lp30 / 12.0
+        if fallback:
+            rel = min(rel, 0.7)
+        reliability = _clip(rel, 0.0, 1.0)
+    elif tp30 >= 10:
+        reliability = _clip(tp30 / 40.0, 0.0, 0.6)
+    else:
+        reliability = 0.1
+    return {"score": _clip(score),
+            "reliability": reliability,
+            "raw": {"deltaScore": score, "deltaLabel": label,
+                    "largePrints30s": lp30, "totalPrints30s": tp30,
+                    "fallback": fallback},
+            "reason": tf.get("deltaReason", f"tape delta={score:+.2f}")}
 
 
 def _source_lt_liquidity(snap: Dict[str, Any]) -> Dict[str, Any]:
@@ -2146,6 +2296,7 @@ def fetch_snapshot() -> Dict[str, Any]:
     except Exception as exc:
         sys.stderr.write(f"[dashboard] _sync_magnet_levels outer guard: "
                          f"{type(exc).__name__}: {exc}\n")
+    snap["tape_flow"] = _safe_call(compute_tape_flow, "compute_tape_flow")
     snap["vwap_bias"] = _safe_call(compute_vwap_bias, "compute_vwap_bias")
     snap["vp_bias"]   = _safe_call(compute_vp_bias,   "compute_vp_bias")
     snap["decision"]  = _safe_call(trade_decision,    "trade_decision")
@@ -2464,7 +2615,7 @@ tr.row-heat { background: var(--row-bg, transparent) !important; }
   </div>
   <div class="card">
     <h2 style="display:flex;justify-content:space-between;align-items:center;">
-      Last 25 prints
+      Tape — institutional flow
       <span id="tape-prints-bias" style="font-size:11px;font-weight:400;letter-spacing:0;text-transform:none;"></span>
     </h2>
     <div id="tape-box"></div>
@@ -3768,52 +3919,83 @@ async function refresh() {
     bookBox.innerHTML = html + legend;
   }
 
-  // ─── Last 25 prints — size-weighted heatwave ────────────────────────
-  // Strength = (buyVol − sellVol) / totalVol over visible window.
-  //   buy print  → +1 contribution, weighted by size
-  //   sell print → −1 contribution, weighted by size
-  // Per-row tint: row hue from side, intensity from size/maxSize.
-  const prints25 = (s.trades || []).slice(0, 25);
+  // ─── Tape — institutional flow ──────────────────────────────────────
+  // Heat bar is driven by snap.tape_flow.deltaScore (size-weighted,
+  // 30s + 5m windows, computed server-side). The print table below it
+  // is display-only — it is NOT the model signal.
+  const VISIBLE_RECENT_PRINTS = 25;
+  const prints25 = (s.trades || []).slice(0, VISIBLE_RECENT_PRINTS);
+  const tapeBox = document.getElementById('tape-box');
   const tapeBiasBox = document.getElementById('tape-prints-bias');
-  if (!prints25.length) {
-    document.getElementById('tape-box').innerHTML = '<span class="muted">no prints yet</span>';
-    if (tapeBiasBox) tapeBiasBox.innerHTML = '';
-  } else {
-    let buyVol = 0, sellVol = 0, buyN = 0, sellN = 0, maxSize = 0;
+  const tf = s.tape_flow;
+  const tfOk = tf && !tf._error && typeof tf.deltaScore === 'number';
+
+  let topHtml = '';
+  if (tfOk) {
+    const dScore = tf.deltaScore;
+    const dLabel = tf.deltaLabel || 'BALANCED';
+    const labels = {
+      strongUp:'STRONG INSTITUTIONAL BUY', up:'INSTITUTIONAL BUY', leanUp:'BUY LEAN',
+      chop: dLabel === 'THIN' ? 'THIN TAPE' : 'BALANCED FLOW',
+      leanDown:'SELL LEAN', down:'INSTITUTIONAL SELL', strongDown:'STRONG INSTITUTIONAL SELL'
+    };
+    const titleTxt =
+      `tape · 30s ▲${tf.largeBuyVol30s||0}/▼${tf.largeSellVol30s||0} (51+) · ` +
+      `block 30s ▲${tf.blockBuyVol30s||0}/▼${tf.blockSellVol30s||0} (100+) · ` +
+      `n30=${tf.totalPrints30s||0} ·`;
+    topHtml = mkTrendBar(dScore, {title: titleTxt, labels});
+    if (tapeBiasBox) {
+      const cls = dScore > 0.15 ? 'buy' : dScore < -0.15 ? 'sell' : 'muted';
+      tapeBiasBox.innerHTML =
+        `<span class="${cls}" style="font-size:10px;">${dLabel} ${dScore>=0?'+':''}${Number(dScore).toFixed(2)}</span>`;
+    }
+    topHtml +=
+      `<div class="muted" style="font-size:10px;margin-top:2px;">${tf.deltaReason||''}</div>`;
+  } else if (prints25.length) {
+    // Fallback: legacy in-browser heatwave so the panel doesn't go blank
+    // during a rolling deploy or when tape_flow is briefly missing.
+    let buyVol = 0, sellVol = 0;
     prints25.forEach(t => {
       const sz = Number(t.size) || 0;
-      if (sz > maxSize) maxSize = sz;
-      if (t.side === 'buy')  { buyVol += sz;  buyN++; }
-      else                    { sellVol += sz; sellN++; }
+      if (t.side === 'buy') buyVol += sz; else sellVol += sz;
     });
-    const totalVol = buyVol + sellVol;
-    const tapeStrength = totalVol > 0 ? (buyVol - sellVol) / totalVol : 0;
-    const tapeBar = mkTrendBar(tapeStrength, {
-      title: `tape · ${prints25.length} prints · buyVol ${buyVol} / sellVol ${sellVol} ·`,
+    const total = buyVol + sellVol;
+    const strength = total > 0 ? (buyVol - sellVol) / total : 0;
+    topHtml = mkTrendBar(strength, {
+      title: `tape (fallback) · prints ${prints25.length} · buyVol ${buyVol} / sellVol ${sellVol} ·`,
       labels: {
         strongUp:'STRONG BUYING', up:'BUYING', leanUp:'BUY LEAN',
-        chop:'BALANCED TAPE',
+        chop:'BALANCED (fallback)',
         leanDown:'SELL LEAN', down:'SELLING', strongDown:'STRONG SELLING'
       }
     });
-    if (tapeBiasBox) {
-      tapeBiasBox.innerHTML =
-        `<span class="buy" style="font-size:10px;">▲${buyN} ${buyVol}</span>` +
-        ` <span class="sell" style="font-size:10px;">▼${sellN} ${sellVol}</span>`;
-    }
-    let tapeHtml = tapeBar + '<table style="font-size:11px;"><tr><th>#</th><th>Price</th><th>Size</th><th>Side</th></tr>';
+    if (tapeBiasBox) tapeBiasBox.innerHTML =
+        '<span class="muted" style="font-size:10px;">(fallback)</span>';
+  } else {
+    topHtml = '<span class="muted">no prints yet</span>';
+    if (tapeBiasBox) tapeBiasBox.innerHTML = '';
+  }
+
+  // Recent-prints table — display only, NOT the model signal.
+  let tableHtml = '';
+  if (prints25.length) {
+    let maxSize = 0;
+    prints25.forEach(t => { const sz = Number(t.size) || 0; if (sz > maxSize) maxSize = sz; });
+    tableHtml += '<div class="muted" style="font-size:10px;margin-top:6px;">' +
+                 `Recent prints (display only — model signal is the 30s/5m delta above)` +
+                 '</div>';
+    tableHtml += '<table style="font-size:11px;"><tr><th>#</th><th>Price</th><th>Size</th><th>Side</th></tr>';
     prints25.forEach((t, i) => {
       const cls = t.side === 'buy' ? 'buy' : 'sell';
       const sz = Number(t.size) || 0;
-      // Row tint: bigger prints carry more weight visually.
       const rowSign = (t.side === 'buy') ? +1 : -1;
       const intensity = maxSize > 0 ? Math.min(1, sz / maxSize) : 0;
       const heat = rowHeat(rowSign, intensity);
-      tapeHtml += `<tr class="row-heat"${heat}><td>${i+1}</td><td class="${cls}">${fmtP(t.price)}</td><td>${sz}</td><td class="${cls}">${t.side}</td></tr>`;
+      tableHtml += `<tr class="row-heat"${heat}><td>${i+1}</td><td class="${cls}">${fmtP(t.price)}</td><td>${sz}</td><td class="${cls}">${t.side}</td></tr>`;
     });
-    tapeHtml += '</table>';
-    document.getElementById('tape-box').innerHTML = tapeHtml;
+    tableHtml += '</table>';
   }
+  tapeBox.innerHTML = topHtml + tableHtml;
 
   // working orders (collapses when empty)
   const w = s.working || {};

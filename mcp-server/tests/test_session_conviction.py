@@ -470,19 +470,31 @@ def test_lt_liquidity_ask_heavy_is_bearish():
     assert out["score"] < 0.0
 
 
-def test_tape_large_lot_uses_large_bucket_when_present():
-    """If the bridge ever ships a `buckets.100plus` block, the source should
-    prefer it over the proxy biasScore."""
-    out = d._source_tape_large_lot({"tape_buckets":
-        {"biasScore": 0.0, "buckets": {"100plus": {"buy": 800, "sell": 200}}}})
+def test_tape_large_lot_uses_tape_flow_when_present():
+    """The source prefers snap['tape_flow'].deltaScore (computed by
+    compute_tape_flow from the /tape_buckets bucket array). Full coverage
+    of compute_tape_flow lives in test_tape_flow.py — this just pins the
+    source's contract with the conviction engine."""
+    out = d._source_tape_large_lot({"tape_flow": {
+        "deltaScore": 0.55, "deltaLabel": "STRONG_BUY",
+        "largePrints30s": 12, "totalPrints30s": 60,
+        "deltaReason": "test"}})
     assert out["score"] > 0.0
-    assert out["reliability"] == 1.0
+    assert out["reliability"] == 1.0   # 12 large prints → saturated
 
 
-def test_tape_large_lot_falls_back_to_bias_score_at_lower_reliability():
-    out = d._source_tape_large_lot({"tape_buckets": {"biasScore": 0.6}})
+def test_tape_large_lot_falls_back_to_bucket_array_at_capped_reliability():
+    """When tape_flow is absent, the source recomputes from tape_buckets
+    directly at <= 0.7 reliability (fallback cap)."""
+    snap = {"tape_buckets": {"buckets": [
+        {"label": "100+", "minSize": 0, "maxSize": 0,
+         "buyVol30s": 1500, "sellVol30s": 100, "prints30s": 20,
+         "buyVol5m":  1500, "sellVol5m":  100, "prints5m":  20,
+         "imbalance30s": 0.0, "imbalance5m": 0.0},
+    ]}}
+    out = d._source_tape_large_lot(snap)
     assert out["score"] > 0.0
-    assert out["reliability"] < 1.0
+    assert out["reliability"] <= 0.7
 
 
 def test_level_reaction_no_proximity_is_low_reliability():
