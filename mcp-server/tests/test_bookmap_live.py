@@ -124,11 +124,14 @@ def test_health_reports_snapshot_count(monkeypatch):
     assert a.health().snapshots_emitted == 3
 
 
-def test_optional_status_other_phases_work_without_adapter():
-    """Pax daemon imports CsvReplayAdapter from `.adapters`, but it must
-    still be possible to drive the daemon without ever touching
-    BookmapLiveAdapter. Verify by inspecting pax_daemon's source — it
-    must not reference BookmapLiveAdapter at the module level."""
+def test_pax_daemon_supports_bookmap_source(monkeypatch):
+    """pax_daemon's --source bookmap routes to BookmapLiveAdapter without
+    requiring --path. CSV-only operation is still possible — the daemon
+    chooses the adapter from --source, no transitive Bookmap import for
+    --source csv runs."""
     import bookmap_mcp.pax_daemon as d
-    src = Path(d.__file__).read_text(encoding="utf-8")
-    assert "BookmapLiveAdapter" not in src
+    args = d.build_parser().parse_args(["--source", "bookmap",
+                                          "--alias", "NQM6"])
+    adapter = d._build_adapter(args.source, args.path, args.alias)
+    assert isinstance(adapter, BookmapLiveAdapter)
+    assert adapter.alias == "NQM6"

@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from . import signal_engine as se
-from .adapters import CsvReplayAdapter
+from .adapters import BookmapLiveAdapter, CsvReplayAdapter, FileTailAdapter
 from .adapters.base import AdapterHealth, DataAdapter
 from .journal import Journal
 from .sim_engine import SimEngine
@@ -76,11 +76,22 @@ def _safe_call(fn, snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return {"_error": f"{type(exc).__name__}: {exc}"}
 
 
-def _build_adapter(source: str, path: Path, alias: str) -> DataAdapter:
+def _build_adapter(source: str, path: Optional[Path],
+                    alias: str) -> DataAdapter:
     if source == "csv":
+        if path is None:
+            raise SystemExit("--path is required for --source csv")
         return CsvReplayAdapter(path, alias=alias)
-    raise SystemExit(f"unsupported source: {source} "
-                      "(supported: csv; tail/bookmap coming in later phases)")
+    if source == "tail":
+        if path is None:
+            raise SystemExit("--path is required for --source tail")
+        return FileTailAdapter(path, alias=alias)
+    if source == "bookmap":
+        # Live Bookmap snapshots → sim execution. Read-only on the bridge
+        # side; no /place_limit_order or /cancel_order. SimEngine writes
+        # paper fills locally to its own SQLite DB.
+        return BookmapLiveAdapter(alias=alias)
+    raise SystemExit(f"unsupported source: {source}")
 
 
 # ─── main loop ──────────────────────────────────────────────────────────
@@ -191,10 +202,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="pax_daemon",
         description="Background paper-trading research daemon.")
-    p.add_argument("--source", choices=["csv"], default="csv",
-                    help="Data adapter (Phase 6/7 will add tail/bookmap).")
-    p.add_argument("--path", type=Path, required=True,
-                    help="Source-specific path (CSV file for --source csv).")
+    p.add_argument("--source", choices=["csv", "tail", "bookmap"],
+                    default="csv",
+                    help="Data adapter. csv = replay; tail = live-tailed "
+                         "CSV; bookmap = live Bookmap bridge (read-only, "
+                         "paper-sim only).")
+    p.add_argument("--path", type=Path, default=None,
+                    help="Source-specific path (CSV file for csv/tail; "
+                         "ignored for bookmap).")
     p.add_argument("--alias", default="NQ", help="Instrument alias.")
     p.add_argument("--journal", type=Path,
                     default=Path(r"D:\BookmapLogs\pax-journal.db"),
