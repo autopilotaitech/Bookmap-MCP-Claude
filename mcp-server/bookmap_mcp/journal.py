@@ -151,6 +151,25 @@ CREATE TABLE IF NOT EXISTS events (
   PRIMARY KEY (run_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_events_kind_ts ON events(kind, ts_ms);
+
+-- Phase 5: forward-return outcomes per signal. Populated by
+-- journal_outcomes.backfill() — daily batch job. NEVER auto-updates
+-- pax_weights.json; that stays a human-in-the-loop decision.
+CREATE TABLE IF NOT EXISTS outcomes (
+  run_id        TEXT    NOT NULL,
+  signal_ts_ms  INTEGER NOT NULL,
+  alias         TEXT    NOT NULL,
+  horizon_sec   INTEGER NOT NULL,
+  entry_mid     REAL,
+  exit_mid      REAL,
+  return_pts    REAL,
+  win           INTEGER,         -- 1 = forward return aligned with decision direction, 0 = not, NULL = no exit data
+  decision      TEXT,
+  level_label   TEXT,
+  PRIMARY KEY (run_id, signal_ts_ms, alias, horizon_sec)
+);
+CREATE INDEX IF NOT EXISTS idx_outcomes_decision_level
+  ON outcomes(decision, level_label);
 """
 
 
