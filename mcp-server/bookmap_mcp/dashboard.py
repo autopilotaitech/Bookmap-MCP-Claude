@@ -218,11 +218,26 @@ def _lt_lean(lt_obj: Optional[Dict[str, Any]]) -> Tuple[float, str]:
 
 
 def _tape_bias(tape_obj: Optional[Dict[str, Any]]) -> Tuple[float, str]:
-    """Tape size-weighted bias in [-1,+1]."""
-    if not tape_obj or "_error" in tape_obj: return 0.0, "no tape"
+    """Per-level tape bias in [-1,+1].
+
+    Prefers the institutional-flow delta from `compute_tape_flow` (the new
+    size-weighted 30s/5m score) when present. Falls back to the legacy
+    biasScore / bias-string shape (currently dead, kept defensively).
+    """
+    if not tape_obj or "_error" in tape_obj:
+        return 0.0, "no tape"
+    if "deltaScore" in tape_obj:
+        label = tape_obj.get("deltaLabel", "")
+        if label == "THIN":
+            n30 = tape_obj.get("totalPrints30s", 0)
+            return 0.0, f"tape THIN n30={n30}"
+        s, _ = _as_float(tape_obj.get("deltaScore"))
+        s = _clip(s)
+        return s, f"tape Δ={s:+.2f} {label}"
+    # Legacy fallback (biasScore / bias string) — kept defensively in case an
+    # older bridge build ships without compute_tape_flow upstream.
     score = tape_obj.get("biasScore")
     if score is None:
-        # fall back to bias string if score not present
         b = (tape_obj.get("bias") or "").upper()
         m = {"BULL":0.6,"BULLISH":0.6,"BEAR":-0.6,"BEARISH":-0.6,"NEUTRAL":0.0,"QUIET":0.0}
         return m.get(b, 0.0), f"tape={b or '?'}"
@@ -416,7 +431,10 @@ def compute_or_levels(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     ps_obj   = snap.get("pull_stack")
     lt_obj   = snap.get("lt_liquidity")
-    tape_obj = snap.get("tape_buckets")
+    # Prefer the institutional-flow delta (size-weighted, time-windowed) from
+    # compute_tape_flow. Falls back to the raw /tape_buckets payload only when
+    # tape_flow hasn't been produced yet (cold start, error path).
+    tape_obj = snap.get("tape_flow") or snap.get("tape_buckets")
     me_obj   = snap.get("micro_events")
     vwap_obj = snap.get("vwap_obj")
     vp_obj   = snap.get("volume_profile")

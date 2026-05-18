@@ -197,6 +197,70 @@ def test_source_tape_large_lot_thin_fallback_recompute_path():
 # Conviction integration
 # ──────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────
+# Per-level wiring — _score_level reads tape_flow through the tape slot.
+# ──────────────────────────────────────────────────────────────────────
+
+def test_score_level_reads_tape_flow_delta_score_at_magnet():
+    """When a magnet level is scored, the per-level composite must pick up
+    the institutional-flow delta from snap['tape_flow'] via _tape_bias."""
+    tape_flow = {
+        "deltaScore": -0.5, "deltaLabel": "STRONG_SELL",
+        "totalPrints30s": 40, "largePrints30s": 12,
+        "deltaReason": "30s wImb=-0.40, 5m wImb=-0.30, aligned, n30=40",
+    }
+    out = dash._score_level(
+        "above", 20000.0, 20000.0,
+        None, None, tape_flow, None, None, None)
+    assert out["components"]["tape"] == pytest.approx(-0.5, abs=1e-6)
+    assert any("Δ=-0.50" in r and "STRONG_SELL" in r for r in out["reasons"]), (
+        f"expected tape Δ reason; got {out['reasons']}")
+
+
+def test_score_level_treats_thin_tape_flow_as_neutral():
+    """Thin tape (n30 < floor) must contribute 0 with a THIN reason."""
+    thin = {"deltaScore": 0.0, "deltaLabel": "THIN",
+            "totalPrints30s": 3, "largePrints30s": 0}
+    out = dash._score_level(
+        "above", 20000.0, 20000.0,
+        None, None, thin, None, None, None)
+    assert out["components"]["tape"] == 0.0
+    assert any("THIN" in r for r in out["reasons"])
+
+
+def test_score_level_falls_back_to_legacy_tape_shape_when_no_delta_score():
+    """If something pushes the legacy biasScore shape through the tape slot,
+    _tape_bias still produces a usable score (defensive fallback)."""
+    legacy = {"biasScore": 0.4}
+    out = dash._score_level(
+        "above", 20000.0, 20000.0,
+        None, None, legacy, None, None, None)
+    assert out["components"]["tape"] == pytest.approx(0.4, abs=1e-6)
+
+
+def test_compute_or_levels_wires_tape_flow_into_levels():
+    """compute_or_levels must consume snap['tape_flow'] when present so each
+    magnet (OR-H, OR-L, rungs) reflects institutional tape pressure."""
+    import datetime as dt
+    snap = {
+        "or_row": {"orHigh": "20100.00", "orLow": "20000.00"},
+        "book": {"mid": 20050.0},
+        "tape_flow": {
+            "deltaScore": -0.6, "deltaLabel": "STRONG_SELL",
+            "totalPrints30s": 40, "largePrints30s": 12,
+            "deltaReason": "test",
+        },
+    }
+    out = dash.compute_or_levels(snap)
+    assert out is not None
+    # Each of the 8 grid levels must show the negative tape component.
+    for lvl in out["levels"]:
+        assert "components" in lvl
+        assert lvl["components"]["tape"] == pytest.approx(-0.6, abs=1e-6), (
+            f"level {lvl['label']} did not pick up tape Δ; "
+            f"components={lvl['components']}")
+
+
 def test_compute_session_conviction_includes_tape_when_valid():
     # Minimal snap that compute_session_conviction can iterate over without
     # crashing. We only care that tape_large_lot is in the per-source output
