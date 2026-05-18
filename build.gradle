@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "com.bookmapmcp"
-version = "10.0.0"
+version = "11.0.0"
 
 java {
     sourceCompatibility = JavaVersion.VERSION_17
@@ -31,5 +31,5 @@ test {
 }
 
 jar {
-    archiveFileName = "bookmap-mcp-bridge-v10.jar"
+    archiveFileName = "bookmap-mcp-bridge-v11.jar"
 }

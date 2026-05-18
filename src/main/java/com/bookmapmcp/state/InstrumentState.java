@@ -40,9 +40,39 @@ public final class InstrumentState {
     public static final int MICRO_EVENT_CAPACITY = 200;
 
     private static final ZoneId CT = ZoneId.of("America/Chicago");
-    private static final LocalTime RTH_OPEN  = LocalTime.of(8, 30);
-    private static final LocalTime RTH_CLOSE = LocalTime.of(15, 0);
-    private static final LocalTime ETH_OPEN  = LocalTime.of(17, 0);
+    // Runtime-mutable via POST /config from the Python dashboard. Treat as
+    // volatile static state, NOT constants. Defaults are the CME RTH window;
+    // the Python settings file is authoritative once it pushes a value.
+    private static volatile LocalTime RTH_OPEN  = LocalTime.of(8, 30);
+    private static volatile LocalTime RTH_CLOSE = LocalTime.of(15, 0);
+    private static volatile LocalTime ETH_OPEN  = LocalTime.of(17, 0);
+    // Volume-profile value-area share (0.70 = the traditional 70% Steidlmayer
+    // construction). Runtime-mutable via POST /config.
+    private static volatile double VP_VALUE_AREA_PCT = 0.70;
+
+    public static LocalTime configRthOpen()  { return RTH_OPEN; }
+    public static LocalTime configRthClose() { return RTH_CLOSE; }
+    public static LocalTime configEthOpen()  { return ETH_OPEN; }
+    public static double    configVpValueAreaPct() { return VP_VALUE_AREA_PCT; }
+
+    /**
+     * Atomically apply new VWAP/VP config. Any null leaves that value
+     * unchanged. {@code vpValueAreaPct &lt;= 0 || &gt; 1} is rejected. The
+     * caller validates HH:MM strings before constructing the LocalTimes.
+     * Changing an anchor causes the next VWAP/VP snapshot to roll into a
+     * fresh session if {@code anchorMs} differs (existing maybeRoll logic).
+     */
+    public static synchronized void applyConfig(LocalTime rthOpen, LocalTime rthClose,
+                                                 LocalTime ethOpen, Double vpValueAreaPct) {
+        if (rthOpen  != null) RTH_OPEN  = rthOpen;
+        if (rthClose != null) RTH_CLOSE = rthClose;
+        if (ethOpen  != null) ETH_OPEN  = ethOpen;
+        if (vpValueAreaPct != null) {
+            double v = vpValueAreaPct.doubleValue();
+            if (Double.isFinite(v) && v > 0.0 && v <= 1.0) VP_VALUE_AREA_PCT = v;
+            else throw new IllegalArgumentException("vp_value_area_pct must be in (0,1]");
+        }
+    }
 
     // ---- D: tape-bucket size cutoffs ----
     private static final long[][] TAPE_BUCKETS = {
@@ -1582,7 +1612,7 @@ public final class InstrumentState {
                 levels.add(new VolumeProfileSnapshot.Level(e.getKey() * pips, v[0], v[1]));
                 if (t > vpocVol) { vpocVol = t; vpocTick = e.getKey(); }
             }
-            long target = (long) Math.ceil(total * 0.70);
+            long target = (long) Math.ceil(total * VP_VALUE_AREA_PCT);
             long enclosed = vpocVol;
             int highTick = vpocTick, lowTick = vpocTick;
             NavigableMap<Integer, long[]> above = byTick.tailMap(vpocTick, false);

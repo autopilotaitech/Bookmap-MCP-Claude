@@ -122,18 +122,26 @@ CREATE INDEX IF NOT EXISTS idx_events_alias_ts ON events(alias, ts_ms);
 class SimEngine:
     """One engine per alias (instrument). Thread-safe."""
 
+    # Sentinel marking "no explicit constructor value -> read settings".
+    _SETTINGS_SENTINEL = object()
+
     def __init__(self, alias: str, db_path: Optional[Path] = None,
                  tick_size: float = NQ_TICK_PRICE,
                  tick_value_usd: float = NQ_TICK_VALUE_USD,
                  eod_close_hour_ct: Optional[int] = 15,
                  eod_close_minute_ct: int = 0) -> None:
-        """`eod_close_hour_ct=None` disables auto-flatten entirely (useful in
-        tests so the wall-clock at test-run time can never trip the EOD
-        path)."""
+        """``eod_close_hour_ct=None`` disables auto-flatten entirely (useful in
+        tests so the wall-clock at test-run time can never trip the EOD path).
+
+        When the daemon constructs SimEngine without overriding this, the
+        production default is ``15``. To switch to live-settings-driven
+        behavior, pass ``eod_close_hour_ct=SimEngine._SETTINGS_SENTINEL`` —
+        the property then reads ``settings.get('eod_close_hour_ct')`` at
+        tick-time, so a Settings UI change propagates within one poll."""
         self.alias = alias
         self.tick_size = tick_size
         self.tick_value = tick_value_usd
-        self.eod_close_hour_ct = eod_close_hour_ct
+        self._eod_close_hour_ct = eod_close_hour_ct
         self.eod_close_minute_ct = eod_close_minute_ct
         self._lock = threading.Lock()
         self._db_path = Path(db_path) if db_path else DB_PATH
@@ -142,6 +150,25 @@ class SimEngine:
         # Track which session's EOD auto-flatten has already fired so we don't
         # re-flatten on every tick after 15:00 CT.
         self._eod_flattened_anchor_ms: Optional[int] = None
+
+    @property
+    def eod_close_hour_ct(self) -> Optional[int]:
+        """Auto-flatten hour. If the constructor was given the sentinel,
+        consult ``settings`` at call-time so a Settings UI change applies
+        immediately. Otherwise honor the constructor value (None disables;
+        int sets the hour)."""
+        if self._eod_close_hour_ct is self._SETTINGS_SENTINEL:
+            try:
+                from . import settings as _settings
+                return _settings.get("eod_close_hour_ct")
+            except Exception:
+                return 15
+        return self._eod_close_hour_ct
+
+    @eod_close_hour_ct.setter
+    def eod_close_hour_ct(self, value: Optional[int]) -> None:
+        """Allow tests + the daemon to override at runtime."""
+        self._eod_close_hour_ct = value
 
     # ─── DB helpers ───────────────────────────────────────────────────────
 

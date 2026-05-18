@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+from . import settings as _settings
 from .bridge_client import BridgeClient, BridgeError
 from .config import BridgeConfig, MissingTokenError
 
@@ -290,9 +291,11 @@ def _vwap_stretch_penalty(vwap_obj: Optional[Dict[str, Any]], price: float) -> T
     label = stretch["label"]
     a = abs(dev)
     if a <= 1.0: return 0.0, f"VWAP {dev:+.1f}σ"
-    if a <= 2.0: return -0.15, f"VWAP {dev:+.1f}σ (stretched)"
-    if a <= 3.0: return -0.35, f"VWAP {dev:+.1f}σ (extreme)"
-    return -0.60, f"VWAP {dev:+.1f}σ (blowoff)"
+    if a <= 2.0:
+        return _settings.get("vwap_stretch_penalty_1_2sigma"), f"VWAP {dev:+.1f}σ (stretched)"
+    if a <= 3.0:
+        return _settings.get("vwap_stretch_penalty_2_3sigma"), f"VWAP {dev:+.1f}σ (extreme)"
+    return _settings.get("vwap_stretch_penalty_3sigma_plus"), f"VWAP {dev:+.1f}σ (blowoff)"
 
 
 def _vp_context(vp_obj: Optional[Dict[str, Any]], price: float) -> str:
@@ -301,12 +304,13 @@ def _vp_context(vp_obj: Optional[Dict[str, Any]], price: float) -> str:
     poc = vp_obj.get("poc")
     vah = vp_obj.get("vah")
     val = vp_obj.get("val")
+    prox = _settings.get("vp_context_proximity_ticks") * NQ_TICK
     try:
-        if poc is not None and abs(price - float(poc)) <= 5 * NQ_TICK:
+        if poc is not None and abs(price - float(poc)) <= prox:
             return "near POC (HVN)"
-        if vah is not None and abs(price - float(vah)) <= 5 * NQ_TICK:
+        if vah is not None and abs(price - float(vah)) <= prox:
             return "near VAH"
-        if val is not None and abs(price - float(val)) <= 5 * NQ_TICK:
+        if val is not None and abs(price - float(val)) <= prox:
             return "near VAL"
     except (TypeError, ValueError):
         pass
@@ -439,22 +443,24 @@ def _vp_at_level(vp_obj: Optional[Dict[str, Any]], price: float,
             nearest = l
     if nearest is None:
         return 0.0, 0.0, "vp no levels"
-    if nearest_dist > 5 * NQ_TICK:
-        return 0.0, 0.3, f"vp far from nodes (Δ={nearest_dist:.2f}pts)"
+    bin_prox = _settings.get("vp_bin_proximity_ticks") * NQ_TICK
+    if nearest_dist > bin_prox:
+        return 0.0, _settings.get("vp_far_reliability"), f"vp far from nodes (Δ={nearest_dist:.2f}pts)"
     bin_vol = float(nearest.get("volume", 0))
     vols = sorted([float(l.get("volume", 0))
                    for l in levels if isinstance(l, dict)])
     n = len(vols)
     if n < 4:
-        return 0.0, 0.3, "vp too few bins"
+        return 0.0, _settings.get("vp_far_reliability"), "vp too few bins"
     p75 = vols[min(n - 1, int(n * 0.75))]
     p25 = vols[max(0, int(n * 0.25))]
     if bin_vol >= p75 and p75 > 0:
-        bias = -0.2 if side == "above" else +0.2
+        hvn_mag = _settings.get("vp_hvn_score")
+        bias = -hvn_mag if side == "above" else +hvn_mag
         return bias, 1.0, f"HVN at level (vol={int(bin_vol)}, p75={int(p75)})"
     if bin_vol <= p25:
-        return 0.0, 0.5, f"LVN at level (vol={int(bin_vol)}, p25={int(p25)})"
-    return 0.0, 0.5, f"vp neutral (vol={int(bin_vol)})"
+        return 0.0, _settings.get("vp_lvn_reliability"), f"LVN at level (vol={int(bin_vol)}, p25={int(p25)})"
+    return 0.0, _settings.get("vp_neutral_reliability"), f"vp neutral (vol={int(bin_vol)})"
 
 
 _CONVICTION_TRAJ_NUDGE = {
@@ -548,19 +554,25 @@ def _vwap_stretch_directional(vwap_obj: Optional[Dict[str, Any]],
         return 0.0, 0.0, "vwap bad"
     a = abs(dev)
     if a < 1.0:
-        return 0.0, 0.3, f"VWAP {dev:+.1f}σ (fair)"
+        return 0.0, _settings.get("vwap_inside_band_reliability"), f"VWAP {dev:+.1f}σ (fair)"
     sign = -1.0 if dev > 0 else +1.0   # mean-revert direction
     if a < 2.0:
-        return _clip(sign * 0.2), 0.7, f"VWAP {dev:+.1f}σ (stretched)"
+        return (_clip(sign * _settings.get("vwap_mean_revert_1_2sigma_score")),
+                _settings.get("vwap_mean_revert_1_2sigma_reliability"),
+                f"VWAP {dev:+.1f}σ (stretched)")
     if a < 3.0:
-        return _clip(sign * 0.5), 1.0, f"VWAP {dev:+.1f}σ (extreme)"
-    return _clip(sign * 0.8), 1.0, f"VWAP {dev:+.1f}σ (blowoff)"
+        return (_clip(sign * _settings.get("vwap_mean_revert_2_3sigma_score")),
+                _settings.get("vwap_mean_revert_2_3sigma_reliability"),
+                f"VWAP {dev:+.1f}σ (extreme)")
+    return (_clip(sign * _settings.get("vwap_mean_revert_3sigma_plus_score")),
+            1.0, f"VWAP {dev:+.1f}σ (blowoff)")
 
 
 def _level_composite(side: str, price: float, mid: float,
                       snap: Dict[str, Any]) -> Dict[str, Any]:
     """Per-magnet composite. Returns the composite block per V5 spec."""
     drivers: List[Dict[str, Any]] = []
+    lvl_w = _settings.get("level_weights")
 
     # ----- pull_stack: BBO bias + rotation combined -----
     ps_obj = snap.get("pull_stack")
@@ -571,7 +583,7 @@ def _level_composite(side: str, price: float, mid: float,
     ps_score = _clip(0.7 * ps_bbo_s + 0.3 * rot_score)
     ps_rel = 1.0 if (isinstance(ps_obj, dict) and "_error" not in ps_obj
                      and "no ps" not in ps_bbo_r) else 0.0
-    drivers.append({"name": "pull_stack", "_base_weight": _LVL_W["pull_stack"],
+    drivers.append({"name": "pull_stack", "_base_weight": lvl_w["pull_stack"],
                     "score": ps_score, "reliability": ps_rel,
                     "reason": f"bbo={ps_bbo_s:+.2f} rot={rot_dir}({rot_mag:.2f})"})
 
@@ -586,7 +598,7 @@ def _level_composite(side: str, price: float, mid: float,
         tape_rel = 0.0
     else:
         tape_rel = 1.0
-    drivers.append({"name": "tape", "_base_weight": _LVL_W["tape"],
+    drivers.append({"name": "tape", "_base_weight": lvl_w["tape"],
                     "score": tape_s, "reliability": tape_rel, "reason": tape_reason})
 
     # ----- micro events at level -----
@@ -598,7 +610,7 @@ def _level_composite(side: str, price: float, mid: float,
         micro_rel = 0.3
     else:
         micro_rel = 1.0
-    drivers.append({"name": "micro", "_base_weight": _LVL_W["micro"],
+    drivers.append({"name": "micro", "_base_weight": lvl_w["micro"],
                     "score": micro_s, "reliability": micro_rel, "reason": micro_reason})
 
     # ----- LT liquidity -----
@@ -606,13 +618,13 @@ def _level_composite(side: str, price: float, mid: float,
     lt_s, lt_reason = _lt_lean(lt_obj)
     lt_rel = 0.8 if (isinstance(lt_obj, dict) and "_error" not in lt_obj
                      and "lt empty" not in lt_reason) else 0.0
-    drivers.append({"name": "lt_liquidity", "_base_weight": _LVL_W["lt_liquidity"],
+    drivers.append({"name": "lt_liquidity", "_base_weight": lvl_w["lt_liquidity"],
                     "score": lt_s, "reliability": lt_rel, "reason": lt_reason})
 
     # ----- orderbook at level (new) -----
     book = snap.get("book")
     bk_s, bk_rel, bk_reason = _book_at_level(book, price, side)
-    drivers.append({"name": "orderbook", "_base_weight": _LVL_W["orderbook"],
+    drivers.append({"name": "orderbook", "_base_weight": lvl_w["orderbook"],
                     "score": bk_s, "reliability": bk_rel, "reason": bk_reason})
 
     # ----- vwap: stretch + or-gate combined -----
@@ -620,16 +632,17 @@ def _level_composite(side: str, price: float, mid: float,
     vw_s, vw_rel, vw_reason = _vwap_stretch_directional(vwap_obj, price)
     gate = (snap.get("gates") or {}).get("vwap_or") if isinstance(snap.get("gates"), dict) else None
     gate_s, gate_rel, gate_reason = _vwap_or_at_level(gate, side)
-    vwap_combined = _clip(0.6 * vw_s + 0.4 * gate_s)
+    sw = _settings.get("vwap_composite_stretch_weight")
+    vwap_combined = _clip(sw * vw_s + (1.0 - sw) * gate_s)
     vwap_rel = max(vw_rel, gate_rel)
-    drivers.append({"name": "vwap", "_base_weight": _LVL_W["vwap"],
+    drivers.append({"name": "vwap", "_base_weight": lvl_w["vwap"],
                     "score": vwap_combined, "reliability": vwap_rel,
                     "reason": f"{vw_reason}; {gate_reason}"})
 
     # ----- volume profile at level (new) -----
     vp_obj = snap.get("volume_profile")
     vp_s, vp_rel, vp_reason = _vp_at_level(vp_obj, price, side)
-    drivers.append({"name": "volume_profile", "_base_weight": _LVL_W["volume_profile"],
+    drivers.append({"name": "volume_profile", "_base_weight": lvl_w["volume_profile"],
                     "score": vp_s, "reliability": vp_rel, "reason": vp_reason})
 
     # ----- session conviction (slow prior, last-poll cache) -----
@@ -639,7 +652,7 @@ def _level_composite(side: str, price: float, mid: float,
         conv_obj = _LAST_CONVICTION.get(alias)
     conv_s, conv_rel, conv_reason = _conviction_at_level(conv_obj, side)
     drivers.append({"name": "session_conviction",
-                    "_base_weight": _LVL_W["session_conviction"],
+                    "_base_weight": lvl_w["session_conviction"],
                     "score": conv_s, "reliability": conv_rel, "reason": conv_reason})
 
     # ----- aggregate -----
@@ -659,7 +672,7 @@ def _level_composite(side: str, price: float, mid: float,
 
     # ----- direction mapping by row side -----
     warnings: List[str] = []
-    if abs(composite_score) < _LVL_THR_DIRECTIONAL:
+    if abs(composite_score) < _settings.get("level_directional_threshold"):
         direction = "WAIT"
     elif side == "above":
         direction = "FOLLOW_LONG" if composite_score > 0 else "FADE_SHORT"
@@ -673,7 +686,7 @@ def _level_composite(side: str, price: float, mid: float,
         elif direction.endswith("_SHORT") and gate_s > 0:
             warnings.append(f"vwap_or gate prefers long — {gate_reason}")
     # Coverage warning: too many sources missing.
-    if coverage < _LVL_THIN_COVERAGE_FRAC:
+    if coverage < _settings.get("level_thin_coverage_frac"):
         warnings.append(
             f"thin coverage: eff_weight={eff_total:.2f}/{base_total:.2f}")
     # Per-driver low-reliability hints (not full warnings; debugging aid).
@@ -934,11 +947,12 @@ def compute_tape_flow(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     wnum30 = wden30 = 0.0
     wnum5  = wden5  = 0.0
 
+    bucket_w = _settings.get("tape_bucket_weights")
     for b in buckets:
         if not isinstance(b, dict):
             continue
         label = b.get("label", "")
-        w = _TAPE_BUCKET_WEIGHTS.get(label, 0.5)
+        w = bucket_w.get(label, 0.5)
         bv30, _ = _as_float(b.get("buyVol30s"));   bv30 = int(bv30)
         sv30, _ = _as_float(b.get("sellVol30s"));  sv30 = int(sv30)
         pn30, _ = _as_float(b.get("prints30s"));   pn30 = int(pn30)
@@ -966,11 +980,12 @@ def compute_tape_flow(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     slow = _tanh(2.0 * w_imb_5)
     base = 0.65 * fast + 0.35 * slow
 
-    aligned = (abs(fast) >= _TAPE_ALIGN_THRESHOLD
-               and abs(slow) >= _TAPE_ALIGN_THRESHOLD
+    align_thr = _settings.get("tape_align_threshold")
+    aligned = (abs(fast) >= align_thr
+               and abs(slow) >= align_thr
                and ((fast > 0) == (slow > 0))
                and fast != 0.0)
-    align = _TAPE_ALIGN_BONUS * (1.0 if fast > 0 else -1.0) if aligned else 0.0
+    align = _settings.get("tape_align_bonus") * (1.0 if fast > 0 else -1.0) if aligned else 0.0
 
     base_payload = {
         "totalBuyVol30s": tot_buy30, "totalSellVol30s": tot_sell30, "totalPrints30s": tot_prints30,
@@ -986,7 +1001,7 @@ def compute_tape_flow(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "fast": fast, "slow": slow, "aligned": aligned,
     }
 
-    if tot_prints30 < _TAPE_THIN_FLOOR_PRINTS:
+    if tot_prints30 < _settings.get("tape_thin_floor_prints"):
         return {
             "deltaScore":  0.0,
             "deltaLabel":  "THIN",
@@ -995,7 +1010,7 @@ def compute_tape_flow(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             **base_payload,
         }
 
-    shrink = min(1.0, tot_prints30 / float(_TAPE_THIN_HEDGE_PRINTS))
+    shrink = min(1.0, tot_prints30 / float(_settings.get("tape_thin_hedge_prints")))
     score = _clip(shrink * (base + align), -1.0, 1.0)
 
     abs_s = abs(score)
@@ -2455,9 +2470,11 @@ def pax_decision(snap: Dict[str, Any]) -> Dict[str, Any]:
 
     ow = float(ol.get("orWidthPts") or 0)
     components["or"] = {"high": ol.get("orHigh"), "low": ol.get("orLow"), "width": ow}
-    if ow < PAX_MIN_OR_WIDTH_PTS or ow > PAX_MAX_OR_WIDTH_PTS:
+    or_min = _settings.get("pax_min_or_width_pts")
+    or_max = _settings.get("pax_max_or_width_pts")
+    if ow < or_min or ow > or_max:
         return {"decision": "STAND_DOWN", "size": 0,
-                "reason": f"OR width {ow:.1f} out of [{PAX_MIN_OR_WIDTH_PTS},{PAX_MAX_OR_WIDTH_PTS}]",
+                "reason": f"OR width {ow:.1f} out of [{or_min},{or_max}]",
                 "reasons": [f"OR width {ow:.1f}"], "components": components}
     if ol.get("middleLock"):
         return {"decision": "STAND_DOWN", "size": 0, "reason": "MIDDLE LOCK",
@@ -2481,7 +2498,7 @@ def pax_decision(snap: Dict[str, Any]) -> Dict[str, Any]:
     reasons.append(f"{level.get('label')} @ {level.get('price')} → {ldec}")
     reasons.extend((level.get("reasons") or [])[:3])
 
-    if ldec == "WAIT" or lconf < PAX_CONFIDENCE_FLOOR:
+    if ldec == "WAIT" or lconf < _settings.get("pax_confidence_floor"):
         return {"decision": "WAIT", "size": 0,
                 "reason": f"level conf {lconf:.2f} below floor",
                 "reasons": reasons, "components": components}
@@ -2525,8 +2542,9 @@ def pax_decision(snap: Dict[str, Any]) -> Dict[str, Any]:
                 "components": components}
     agree = int(vw == want) + int(vp == want)
     if agree:
-        eff *= 1.0 + 0.10 * agree
-        reasons.append(f"biases agree ×{1+0.10*agree:.2f}")
+        bag = _settings.get("pax_bias_agreement_boost")
+        eff *= 1.0 + bag * agree
+        reasons.append(f"biases agree ×{1+bag*agree:.2f}")
 
     # Subgroup override (Phase D): apply per-key multipliers learned from replay
     overrides = _load_pax_weights().get("subgroup_overrides", {}) or {}
@@ -2546,7 +2564,8 @@ def pax_decision(snap: Dict[str, Any]) -> Dict[str, Any]:
                 components.setdefault("overrides", []).append({"key": k, "mult": ov["multiplier"]})
 
     th = _load_pax_weights().get("confidence_thresholds", {})
-    full = th.get("full", PAX_CONFIDENCE_FULL); half = th.get("half", PAX_CONFIDENCE_FLOOR)
+    full = th.get("full", _settings.get("pax_confidence_full"))
+    half = th.get("half", _settings.get("pax_confidence_floor"))
     if eff >= full:    size_tier = "FULL"; size = 3
     elif eff >= half:  size_tier = "HALF"; size = 1
     else: size_tier = "NONE"; size = 0
@@ -2794,7 +2813,7 @@ def _sync_magnet_levels(cfg: BridgeConfig, alias: Optional[str],
         cached = _LAST_MAGNETS.get(alias)
         if cached is not None:
             cached_tuple, cached_ts = cached
-            if cached_tuple == new_tuple and (now_mono - cached_ts) < _MAGNET_REFRESH_SECS:
+            if cached_tuple == new_tuple and (now_mono - cached_ts) < _settings.get("magnet_refresh_secs"):
                 return
 
     payload = ",".join(f"{p:g}" for p in new_tuple)
@@ -2811,6 +2830,62 @@ def _sync_magnet_levels(cfg: BridgeConfig, alias: Optional[str],
 
     with _LAST_MAGNETS_LOCK:
         _LAST_MAGNETS[alias] = (new_tuple, time.monotonic())
+
+
+# Bridge runtime-config sync. Same pattern as _sync_magnet_levels: cache the
+# last successfully-pushed tuple + monotonic timestamp, refresh whenever the
+# desired values change OR the TTL expires. The bridge does NOT persist
+# /config across Bookmap restarts, so the dashboard must keep re-pushing.
+_LAST_BRIDGE_CONFIG: Optional[Tuple[Tuple[str, str, str, float], float]] = None
+_LAST_BRIDGE_CONFIG_LOCK = threading.Lock()
+
+
+def _sync_bridge_config(cfg: BridgeConfig) -> None:
+    """Push VWAP/VP runtime config (RTH/ETH anchor times, VP value-area %)
+    from pax_settings.json to the Java bridge's POST /config endpoint.
+
+    Cache + TTL pattern: only POSTs when the tuple changes OR the cached
+    write is older than _MAGNET_REFRESH_SECS. Bookmap restart wipes Java's
+    in-memory state, so a TTL re-push is necessary even when nothing changed
+    on the Python side. Catches every exception so a transient failure cannot
+    break fetch_snapshot."""
+    global _LAST_BRIDGE_CONFIG
+    try:
+        rth_open  = _settings.get("bridge_rth_open_hhmm_ct")
+        rth_close = _settings.get("bridge_rth_close_hhmm_ct")
+        eth_open  = _settings.get("bridge_eth_open_hhmm_ct")
+        vp_pct    = float(_settings.get("bridge_vp_value_area_pct"))
+    except Exception:
+        return
+    desired = (str(rth_open), str(rth_close), str(eth_open), vp_pct)
+    now_mono = time.monotonic()
+    ttl = _settings.get("magnet_refresh_secs")
+
+    with _LAST_BRIDGE_CONFIG_LOCK:
+        cached = _LAST_BRIDGE_CONFIG
+        if cached is not None:
+            cached_tuple, cached_ts = cached
+            if cached_tuple == desired and (now_mono - cached_ts) < ttl:
+                return
+
+    try:
+        with BridgeClient(cfg, timeout_s=2.0) as client:
+            client.post_json("/config", {
+                "rth_open":          desired[0],
+                "rth_close":         desired[1],
+                "eth_open":          desired[2],
+                "vp_value_area_pct": str(desired[3]),
+            })
+    except BridgeError as exc:
+        sys.stderr.write(f"[dashboard] /config POST failed: {exc}\n")
+        return
+    except Exception as exc:
+        sys.stderr.write(f"[dashboard] /config POST crashed: "
+                         f"{type(exc).__name__}: {exc}\n")
+        return
+
+    with _LAST_BRIDGE_CONFIG_LOCK:
+        _LAST_BRIDGE_CONFIG = (desired, time.monotonic())
 
 
 def fetch_snapshot() -> Dict[str, Any]:
@@ -2904,6 +2979,13 @@ def fetch_snapshot() -> Dict[str, Any]:
         _sync_magnet_levels(cfg, alias, snap["or_levels"])
     except Exception as exc:
         sys.stderr.write(f"[dashboard] _sync_magnet_levels outer guard: "
+                         f"{type(exc).__name__}: {exc}\n")
+    # Same pattern: push VWAP/VP runtime config (RTH/ETH anchor times,
+    # value-area %) to the Java bridge. Best-effort; never propagates.
+    try:
+        _sync_bridge_config(cfg)
+    except Exception as exc:
+        sys.stderr.write(f"[dashboard] _sync_bridge_config outer guard: "
                          f"{type(exc).__name__}: {exc}\n")
     snap["vwap_bias"] = _safe_call(compute_vwap_bias, "compute_vwap_bias")
     snap["vp_bias"]   = _safe_call(compute_vp_bias,   "compute_vp_bias")
@@ -3093,7 +3175,7 @@ tr.row-heat td { position:relative; }
 tr.row-heat { background: var(--row-bg, transparent) !important; }
 </style></head>
 <body>
-<h1><span id="dot" class="dot"></span><span id="hdr">connecting…</span><span class="muted" style="font-size:11px;" id="alias-clock"></span></h1>
+<h1><span id="dot" class="dot"></span><span id="hdr">connecting…</span><span class="muted" style="font-size:11px;" id="alias-clock"></span><a href="/settings" style="margin-left:auto;font-size:11px;color:#7aa2f7;text-decoration:none;border:1px solid #232733;padding:2px 8px;border-radius:3px;">settings ▸</a></h1>
 <div id="news-banner"></div>
 
 <!-- Pax decision banner — HIDDEN 2026-05-17 per user request.
@@ -4659,20 +4741,467 @@ refresh();
 </body></html>"""
 
 
+SETTINGS_HTML = r"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Pax — Settings</title>
+<style>
+* { box-sizing:border-box; }
+body { background:#0b0e13; color:#cfd6e4; font:13px/1.4 "JetBrains Mono","Consolas",monospace;
+       font-variant-numeric: tabular-nums; margin:0; padding:10px; }
+h1 { font-size:14px; margin:0 0 10px; color:#7aa2f7; display:flex; align-items:center; gap:8px; }
+.nav-back { margin-left:auto; font-size:11px; color:#7aa2f7; text-decoration:none;
+            border:1px solid #232733; padding:2px 8px; border-radius:3px; }
+details { background:#161a23; border:1px solid #232733; border-radius:6px;
+          margin-bottom:8px; padding:8px 10px; }
+details > summary { cursor:pointer; font-weight:600; padding:2px 0; color:#7aa2f7;
+                    text-transform:uppercase; letter-spacing:1px; font-size:11px; }
+.row { display:flex; align-items:center; padding:3px 0; gap:10px; }
+.row label { flex:1; color:#cfd6e4; }
+.row .v { width:120px; text-align:right; }
+.row .doc { color:#737994; font-size:11px; }
+.input-num { background:#232733; color:#cfd6e4; border:1px solid #414868;
+             border-radius:3px; padding:3px 6px; width:100px; text-align:right;
+             font:13px/1.4 "JetBrains Mono",monospace; font-variant-numeric: tabular-nums; }
+.input-num:focus { outline:1px solid #7aa2f7; }
+.subgrid { padding-left:18px; }
+.footer { display:flex; gap:8px; padding:10px 0; position:sticky; bottom:0;
+          background:linear-gradient(180deg, transparent, #0b0e13 30%); }
+button { font:13px/1.4 "JetBrains Mono",monospace; padding:4px 12px; border-radius:3px;
+         cursor:pointer; }
+.btn-apply  { background:#1f3a23; color:#9ece6a; border:1px solid #9ece6a; }
+.btn-revert { background:#3a2f1a; color:#e0af68; border:1px solid #e0af68; }
+.btn-reset  { background:#3a1f1f; color:#f7768e; border:1px solid #f7768e; }
+button:hover { filter:brightness(1.2); }
+.banner { padding:8px 12px; border-radius:4px; margin-bottom:10px; display:none; }
+.banner.b-ok    { background:#0f2a14; border:1px solid #9ece6a; color:#9ece6a; }
+.banner.b-block { background:#2a0f14; border:1px solid #f7768e; color:#f7768e; }
+.audit-row { font-size:11px; padding:2px 0; border-bottom:1px dotted #232733; }
+.audit-row .field { color:#7aa2f7; }
+.audit-row .v { color:#cfd6e4; }
+.audit-row .meta { color:#737994; }
+.status-line { padding:2px 0; display:flex; justify-content:space-between; }
+.status-line .k { color:#737994; }
+.status-line .v { color:#cfd6e4; font-weight:600; }
+.dirty { background:#26313d; }
+</style></head>
+<body>
+<h1><span>Pax · Settings</span><a class="nav-back" href="/">◂ live HUD</a></h1>
+<div id="banner" class="banner"></div>
+
+<details id="sec-status" open>
+  <summary>Status</summary>
+  <div id="status-box" style="margin-top:6px;"></div>
+</details>
+
+<details id="sec-general" open>
+  <summary>General</summary>
+  <div class="row"><label>magnet_refresh_secs</label>
+    <input id="f_magnet_refresh_secs" class="input-num" type="number" step="1" data-kind="float">
+    <span class="doc">how often dashboard re-pushes magnet levels to bridge</span></div>
+  <div class="row"><label>eod_close_hour_ct</label>
+    <input id="f_eod_close_hour_ct" class="input-num" type="number" step="1" data-kind="int" data-allow-null="1">
+    <span class="doc">auto-flatten hour CT; blank = disabled</span></div>
+</details>
+
+<details id="sec-pax_gates" open>
+  <summary>Pax gates</summary>
+  <div class="row"><label>pax_confidence_floor</label>
+    <input id="f_pax_confidence_floor" class="input-num" type="number" step="0.01" data-kind="float">
+    <span class="doc">min level confidence to not WAIT</span></div>
+  <div class="row"><label>pax_confidence_full</label>
+    <input id="f_pax_confidence_full" class="input-num" type="number" step="0.01" data-kind="float">
+    <span class="doc">effective confidence for FULL size</span></div>
+  <div class="row"><label>pax_min_or_width_pts</label>
+    <input id="f_pax_min_or_width_pts" class="input-num" type="number" step="0.1" data-kind="float">
+    <span class="doc">reject entries when OR is narrower</span></div>
+  <div class="row"><label>pax_max_or_width_pts</label>
+    <input id="f_pax_max_or_width_pts" class="input-num" type="number" step="0.1" data-kind="float">
+    <span class="doc">reject entries when OR is wider</span></div>
+  <div class="row"><label>pax_bias_agreement_boost</label>
+    <input id="f_pax_bias_agreement_boost" class="input-num" type="number" step="0.01" data-kind="float">
+    <span class="doc">per-bias multiplicative boost when VWAP/VP agree</span></div>
+</details>
+
+<details id="sec-level_composite" open>
+  <summary>Level composite</summary>
+  <div class="subgrid" id="level_weights_box"></div>
+  <div class="row"><label>level_directional_threshold</label>
+    <input id="f_level_directional_threshold" class="input-num" type="number" step="0.01" data-kind="float">
+    <span class="doc">|composite| below this → WAIT</span></div>
+  <div class="row"><label>level_thin_coverage_frac</label>
+    <input id="f_level_thin_coverage_frac" class="input-num" type="number" step="0.01" data-kind="float">
+    <span class="doc">eff/base coverage warning threshold</span></div>
+</details>
+
+<details id="sec-tape_flow" open>
+  <summary>Tape flow</summary>
+  <div class="subgrid" id="tape_bucket_weights_box"></div>
+  <div class="row"><label>tape_thin_floor_prints</label>
+    <input id="f_tape_thin_floor_prints" class="input-num" type="number" step="1" data-kind="int">
+    <span class="doc">prints/30s below this → THIN, score=0</span></div>
+  <div class="row"><label>tape_thin_hedge_prints</label>
+    <input id="f_tape_thin_hedge_prints" class="input-num" type="number" step="1" data-kind="int">
+    <span class="doc">linear shrink between floor and hedge</span></div>
+  <div class="row"><label>tape_align_bonus</label>
+    <input id="f_tape_align_bonus" class="input-num" type="number" step="0.01" data-kind="float">
+    <span class="doc">bonus when fast/slow agree directionally</span></div>
+  <div class="row"><label>tape_align_threshold</label>
+    <input id="f_tape_align_threshold" class="input-num" type="number" step="0.01" data-kind="float">
+    <span class="doc">min |fast|, |slow| to trigger alignment</span></div>
+</details>
+
+<details id="sec-vwap_stretch" open>
+  <summary>VWAP stretch penalties (FOLLOW)</summary>
+  <div class="row"><label>vwap_stretch_penalty_1_2sigma</label>
+    <input id="f_vwap_stretch_penalty_1_2sigma" class="input-num" type="number" step="0.05" data-kind="float">
+    <span class="doc">FOLLOW penalty for 1-2σ stretch</span></div>
+  <div class="row"><label>vwap_stretch_penalty_2_3sigma</label>
+    <input id="f_vwap_stretch_penalty_2_3sigma" class="input-num" type="number" step="0.05" data-kind="float">
+    <span class="doc">FOLLOW penalty for 2-3σ stretch</span></div>
+  <div class="row"><label>vwap_stretch_penalty_3sigma_plus</label>
+    <input id="f_vwap_stretch_penalty_3sigma_plus" class="input-num" type="number" step="0.05" data-kind="float">
+    <span class="doc">FOLLOW penalty for blowoff (3σ+)</span></div>
+</details>
+
+<details id="sec-vwap_meanrevert" open>
+  <summary>VWAP mean-revert driver</summary>
+  <div class="row"><label>vwap_inside_band_reliability</label>
+    <input id="f_vwap_inside_band_reliability" class="input-num" type="number" step="0.05" data-kind="float">
+    <span class="doc">reliability when |dev|&lt;1σ (no directional bias)</span></div>
+  <div class="row"><label>vwap_mean_revert_1_2sigma_score</label>
+    <input id="f_vwap_mean_revert_1_2sigma_score" class="input-num" type="number" step="0.05" data-kind="float">
+    <span class="doc">mean-revert magnitude at 1-2σ</span></div>
+  <div class="row"><label>vwap_mean_revert_1_2sigma_reliability</label>
+    <input id="f_vwap_mean_revert_1_2sigma_reliability" class="input-num" type="number" step="0.05" data-kind="float">
+    <span class="doc">reliability at 1-2σ</span></div>
+  <div class="row"><label>vwap_mean_revert_2_3sigma_score</label>
+    <input id="f_vwap_mean_revert_2_3sigma_score" class="input-num" type="number" step="0.05" data-kind="float">
+    <span class="doc">mean-revert magnitude at 2-3σ</span></div>
+  <div class="row"><label>vwap_mean_revert_2_3sigma_reliability</label>
+    <input id="f_vwap_mean_revert_2_3sigma_reliability" class="input-num" type="number" step="0.05" data-kind="float">
+    <span class="doc">reliability at 2-3σ</span></div>
+  <div class="row"><label>vwap_mean_revert_3sigma_plus_score</label>
+    <input id="f_vwap_mean_revert_3sigma_plus_score" class="input-num" type="number" step="0.05" data-kind="float">
+    <span class="doc">mean-revert magnitude beyond 3σ (blowoff)</span></div>
+  <div class="row"><label>vwap_composite_stretch_weight</label>
+    <input id="f_vwap_composite_stretch_weight" class="input-num" type="number" step="0.05" data-kind="float">
+    <span class="doc">share of stretch in per-magnet vwap driver; gate weight = 1 - this</span></div>
+</details>
+
+<details id="sec-volume_profile" open>
+  <summary>Volume profile</summary>
+  <div class="row"><label>vp_context_proximity_ticks</label>
+    <input id="f_vp_context_proximity_ticks" class="input-num" type="number" step="1" data-kind="int">
+    <span class="doc">"near POC/VAH/VAL" threshold in ticks</span></div>
+  <div class="row"><label>vp_bin_proximity_ticks</label>
+    <input id="f_vp_bin_proximity_ticks" class="input-num" type="number" step="1" data-kind="int">
+    <span class="doc">nearest-bin distance threshold for at-level scoring</span></div>
+  <div class="row"><label>vp_hvn_score</label>
+    <input id="f_vp_hvn_score" class="input-num" type="number" step="0.05" data-kind="float">
+    <span class="doc">HVN directional magnitude (sign by side)</span></div>
+  <div class="row"><label>vp_far_reliability</label>
+    <input id="f_vp_far_reliability" class="input-num" type="number" step="0.05" data-kind="float">
+    <span class="doc">reliability when bin is beyond proximity</span></div>
+  <div class="row"><label>vp_lvn_reliability</label>
+    <input id="f_vp_lvn_reliability" class="input-num" type="number" step="0.05" data-kind="float">
+    <span class="doc">reliability for low-volume nodes (bottom quartile)</span></div>
+  <div class="row"><label>vp_neutral_reliability</label>
+    <input id="f_vp_neutral_reliability" class="input-num" type="number" step="0.05" data-kind="float">
+    <span class="doc">reliability for mid-quartile bins (no bias)</span></div>
+</details>
+
+<details id="sec-bridge_config" open>
+  <summary>Java bridge — VWAP / Volume Profile session anchor</summary>
+  <div style="padding:4px 4px 8px; color:#737994; font-size:11px;">
+    <b style="color:#cfd6e4;">RTH open</b> is the shared anchor for both the
+    VWAP RTH calculation AND the Volume Profile session — Java reads them off
+    the same <code>rthAnchorMs()</code>. Default is <b>08:30 CT</b> (CME RTH
+    open); change it here and both shift on the next poll. ETH open anchors
+    the overnight VWAP; <b>value-area %</b> is the VP value-area share (0.70
+    = traditional 70%). The dashboard pushes these to <code>POST /config</code>
+    on every poll (~1s) via <code>_sync_bridge_config()</code>. Requires
+    <b>bookmap-mcp-bridge-v11.jar</b> or newer.
+  </div>
+  <div class="row"><label>bridge_rth_open_hhmm_ct</label>
+    <input id="f_bridge_rth_open_hhmm_ct" class="input-num" type="time" data-kind="hhmm">
+    <span class="doc">RTH anchor for VWAP RTH + Volume Profile (default 08:30 CT)</span></div>
+  <div class="row"><label>bridge_rth_close_hhmm_ct</label>
+    <input id="f_bridge_rth_close_hhmm_ct" class="input-num" type="time" data-kind="hhmm">
+    <span class="doc">RTH close — gates the in-RTH window check (default 15:00 CT)</span></div>
+  <div class="row"><label>bridge_eth_open_hhmm_ct</label>
+    <input id="f_bridge_eth_open_hhmm_ct" class="input-num" type="time" data-kind="hhmm">
+    <span class="doc">VWAP ETH session anchor (default 17:00 CT)</span></div>
+  <div class="row"><label>bridge_vp_value_area_pct</label>
+    <input id="f_bridge_vp_value_area_pct" class="input-num" type="number" step="0.01" min="0.01" max="1" data-kind="float">
+    <span class="doc">Volume Profile value-area share (default 0.70 = traditional 70%)</span></div>
+</details>
+
+<details id="sec-or_strategy_pointer">
+  <summary>OR window (read this)</summary>
+  <div style="padding:6px 4px; color:#cfd6e4;">
+    The OR window (start time, duration, line end) is owned by the
+    <span style="color:#7aa2f7;">OR-Strategy</span> Bookmap addon, not by this
+    dashboard. To change OR start time:
+    <ol style="margin:6px 0 6px 18px; color:#cfd6e4;">
+      <li>In Bookmap, open the <b>OR Strategy</b> settings panel.</li>
+      <li>Edit <b>OR start hour</b>, <b>OR start minute</b>, <b>OR seconds</b>, or <b>Line end hour/minute</b>.</li>
+      <li>Click <b>Apply and reload</b> — Bookmap persists via @StrategySettingsVersion.</li>
+    </ol>
+    The dashboard reads the resulting CSV at
+    <code style="color:#9ece6a;">D:\BookmapLogs\openrange-signals-*.csv</code>.
+    No restart of the dashboard or daemon is needed; the next poll picks up
+    whatever the OR-Strategy emits.
+  </div>
+</details>
+
+<details id="sec-audit">
+  <summary>Audit history</summary>
+  <div id="audit-box" style="margin-top:6px;"></div>
+</details>
+
+<div class="footer">
+  <button class="btn-apply"  id="btn-apply">apply</button>
+  <button class="btn-revert" id="btn-restore-lkg">restore LKG</button>
+  <button class="btn-reset"  id="btn-reset-defaults">restore defaults</button>
+</div>
+
+<script>
+// Collapsible state persistence (mirrors overview_ui.py pattern)
+document.querySelectorAll('details').forEach(el => {
+  const key = 'pax-settings:' + el.id;
+  const saved = localStorage.getItem(key);
+  if (saved === 'closed') el.open = false;
+  else if (saved === 'open') el.open = true;
+  el.addEventListener('toggle', () => {
+    localStorage.setItem(key, el.open ? 'open' : 'closed');
+  });
+});
+
+let CURRENT = null;
+let DEFAULTS = null;
+
+const SCALAR_FIELDS = [
+  'magnet_refresh_secs','eod_close_hour_ct',
+  'pax_confidence_floor','pax_confidence_full','pax_min_or_width_pts',
+  'pax_max_or_width_pts','pax_bias_agreement_boost',
+  'level_directional_threshold','level_thin_coverage_frac',
+  'tape_thin_floor_prints','tape_thin_hedge_prints',
+  'tape_align_bonus','tape_align_threshold',
+  'vwap_stretch_penalty_1_2sigma','vwap_stretch_penalty_2_3sigma','vwap_stretch_penalty_3sigma_plus',
+  // V2: VWAP mean-revert
+  'vwap_inside_band_reliability',
+  'vwap_mean_revert_1_2sigma_score','vwap_mean_revert_1_2sigma_reliability',
+  'vwap_mean_revert_2_3sigma_score','vwap_mean_revert_2_3sigma_reliability',
+  'vwap_mean_revert_3sigma_plus_score','vwap_composite_stretch_weight',
+  // V2: Volume profile
+  'vp_context_proximity_ticks','vp_bin_proximity_ticks','vp_hvn_score',
+  'vp_far_reliability','vp_lvn_reliability','vp_neutral_reliability',
+  // V3: Java bridge runtime config
+  'bridge_rth_open_hhmm_ct','bridge_rth_close_hhmm_ct','bridge_eth_open_hhmm_ct',
+  'bridge_vp_value_area_pct'
+];
+
+function showBanner(kind, msg) {
+  const el = document.getElementById('banner');
+  el.className = 'banner ' + (kind === 'ok' ? 'b-ok' : 'b-block');
+  el.textContent = msg;
+  el.style.display = 'block';
+  if (kind === 'ok') setTimeout(() => { el.style.display = 'none'; }, 5000);
+}
+
+function buildSubgrid(boxId, key) {
+  const box = document.getElementById(boxId);
+  box.innerHTML = '';
+  const obj = CURRENT[key] || {};
+  Object.keys(obj).forEach(k => {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `<label>${key}.${k}</label>` +
+      `<input class="input-num" type="number" step="0.01" data-key="${key}" data-subkey="${k}" data-kind="float">` +
+      `<span class="doc"></span>`;
+    box.appendChild(row);
+  });
+}
+
+function loadInto(values) {
+  CURRENT = values;
+  SCALAR_FIELDS.forEach(f => {
+    const el = document.getElementById('f_' + f);
+    if (!el) return;
+    const v = values[f];
+    el.value = (v === null || v === undefined) ? '' : v;
+    el.dataset.original = el.value;
+  });
+  buildSubgrid('level_weights_box', 'level_weights');
+  buildSubgrid('tape_bucket_weights_box', 'tape_bucket_weights');
+  document.querySelectorAll('[data-key="level_weights"]').forEach(el => {
+    el.value = CURRENT.level_weights[el.dataset.subkey];
+    el.dataset.original = el.value;
+  });
+  document.querySelectorAll('[data-key="tape_bucket_weights"]').forEach(el => {
+    el.value = CURRENT.tape_bucket_weights[el.dataset.subkey];
+    el.dataset.original = el.value;
+  });
+}
+
+function renderStatus(st) {
+  const html = `
+    <div class="status-line"><span class="k">source</span><span class="v">${st.source}</span></div>
+    <div class="status-line"><span class="k">last applied (ms)</span><span class="v">${st.last_applied_ms}</span></div>
+    <div class="status-line"><span class="k">settings_path</span><span class="v">${st.settings_path}</span></div>
+    <div class="status-line"><span class="k">LKG present</span><span class="v">${st.lkg_present}</span></div>
+    <div class="status-line"><span class="k">mtime</span><span class="v">${st.mtime}</span></div>`;
+  document.getElementById('status-box').innerHTML = html;
+}
+
+function renderAudit(rows) {
+  if (!rows || !rows.length) {
+    document.getElementById('audit-box').textContent = '(no audit rows yet)';
+    return;
+  }
+  const html = rows.map(r => {
+    const t = new Date(r.ts_ms).toISOString().replace('T',' ').slice(0,19);
+    return `<div class="audit-row">` +
+      `<span class="meta">${t} · ${r.source}${r.user ? '/' + r.user : ''} · ${r.reason || ''}</span> · ` +
+      `<span class="field">${r.field}</span> ` +
+      `<span class="v">${r.old_value_json} → ${r.new_value_json}</span></div>`;
+  }).join('');
+  document.getElementById('audit-box').innerHTML = html;
+}
+
+function collectDirty() {
+  const updates = {};
+  SCALAR_FIELDS.forEach(f => {
+    const el = document.getElementById('f_' + f);
+    if (!el) return;
+    const v = el.value.trim();
+    const kind = el.dataset.kind || 'float';
+    const allowNull = el.dataset.allowNull === '1';
+    if (v === '') {
+      if (allowNull) updates[f] = null;
+      return;
+    }
+    if (kind === 'hhmm') {
+      updates[f] = v;       // browser <input type="time"> emits "HH:MM"
+    } else if (kind === 'int') {
+      updates[f] = parseInt(v, 10);
+    } else {
+      updates[f] = parseFloat(v);
+    }
+  });
+  ['level_weights','tape_bucket_weights'].forEach(key => {
+    const sub = {};
+    document.querySelectorAll('[data-key="' + key + '"]').forEach(el => {
+      sub[el.dataset.subkey] = parseFloat(el.value);
+    });
+    updates[key] = sub;
+  });
+  return updates;
+}
+
+async function refresh() {
+  const r = await fetch('/api/settings');
+  const j = await r.json();
+  DEFAULTS = j.defaults;
+  loadInto(j.current);
+  renderStatus(j.status);
+  renderAudit(j.audit || []);
+}
+
+document.getElementById('btn-apply').addEventListener('click', async () => {
+  const updates = collectDirty();
+  const r = await fetch('/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({updates: updates, source: 'ui'})
+  });
+  const j = await r.json();
+  if (j.ok) {
+    showBanner('ok', `applied: ${(j.audit_rows||[]).length} field(s) changed`);
+    refresh();
+  } else {
+    showBanner('err', 'rejected: ' + (j.errors || []).join('; '));
+  }
+});
+
+document.getElementById('btn-restore-lkg').addEventListener('click', async () => {
+  const r = await fetch('/api/settings/restore_lkg', {method:'POST'});
+  const j = await r.json();
+  if (j.ok) { showBanner('ok', 'restored last-known-good'); refresh(); }
+  else      { showBanner('err', 'restore failed: ' + (j.errors||[]).join('; ')); }
+});
+
+document.getElementById('btn-reset-defaults').addEventListener('click', async () => {
+  if (!confirm('Reset every setting to coded defaults?')) return;
+  const r = await fetch('/api/settings/reset', {method:'POST'});
+  const j = await r.json();
+  if (j.ok) { showBanner('ok', 'restored coded defaults'); refresh(); }
+  else      { showBanner('err', 'reset failed: ' + (j.errors||[]).join('; ')); }
+});
+
+refresh();
+</script>
+</body></html>"""
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
+
+    # Optional reference to a live Journal for settings-audit history.
+    # Wired by ``DashboardHandler.set_audit_journal(j)`` at daemon startup;
+    # ``None`` means audits go nowhere (settings.py's apply still succeeds).
+    audit_journal = None
+
+    @classmethod
+    def set_audit_journal(cls, journal) -> None:
+        cls.audit_journal = journal
+        if journal is not None:
+            _settings.set_audit_sink(journal.write_settings_audit)
+        else:
+            _settings.set_audit_sink(None)
+
+    def _send_json(self, status: int, payload: Dict[str, Any]) -> None:
+        body = safe_json(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, status: int, html: str) -> None:
+        body = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _settings_payload(self) -> Dict[str, Any]:
+        audit_rows: List[Dict[str, Any]] = []
+        if self.audit_journal is not None:
+            try:
+                audit_rows = self.audit_journal.read_settings_audit(limit=50)
+            except Exception:
+                audit_rows = []
+        return {
+            "current":  _settings.current(),
+            "defaults": dict(_settings.SETTINGS_DEFAULTS),
+            "status":   _settings.status(),
+            "audit":    audit_rows,
+        }
 
     def do_GET(self):
         path = urlparse(self.path).path
         try:
             if path == "/" or path == "/index.html":
-                body = INDEX_HTML.encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._send_html(200, INDEX_HTML)
+                return
+            if path == "/settings":
+                self._send_html(200, SETTINGS_HTML)
+                return
+            if path == "/api/settings":
+                self._send_json(200, self._settings_payload())
                 return
             if path == "/api/snapshot":
                 try: snap = fetch_snapshot()
@@ -4696,10 +5225,93 @@ class DashboardHandler(BaseHTTPRequestHandler):
             try: self.send_response(500); self.end_headers()
             except Exception: pass
 
+    def do_POST(self):
+        path = urlparse(self.path).path
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw_body = self.rfile.read(length) if length > 0 else b""
+            if path == "/api/settings":
+                try:
+                    payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+                except json.JSONDecodeError as e:
+                    self._send_json(400, {"ok": False,
+                                           "errors": [f"invalid JSON: {e}"],
+                                           "audit_rows": []})
+                    return
+                updates = payload.get("updates")
+                if not isinstance(updates, dict):
+                    self._send_json(400, {"ok": False,
+                                           "errors": ["body must contain 'updates' object"],
+                                           "audit_rows": []})
+                    return
+                source = str(payload.get("source") or "ui")
+                user = payload.get("user")
+                result = _settings.apply_settings(updates, source=source, user=user)
+                status = 200 if result.ok else 400
+                self._send_json(status, {
+                    "ok":         result.ok,
+                    "errors":     result.errors,
+                    "audit_rows": result.audit_rows,
+                    "applied":    result.applied,
+                })
+                return
+            if path == "/api/settings/reset":
+                result = _settings.restore_defaults(source="reset")
+                self._send_json(200 if result.ok else 400, {
+                    "ok": result.ok, "errors": result.errors,
+                    "audit_rows": result.audit_rows, "applied": result.applied,
+                })
+                return
+            if path == "/api/settings/restore_lkg":
+                result = _settings.restore_last_known_good(source="lkg")
+                self._send_json(200 if result.ok else 400, {
+                    "ok": result.ok, "errors": result.errors,
+                    "audit_rows": result.audit_rows, "applied": result.applied,
+                })
+                return
+            self.send_response(405); self.end_headers()
+            self.wfile.write(b"method not allowed")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            sys.stderr.write("[dashboard] POST handler crash:\n" + traceback.format_exc() + "\n")
+            try: self._send_json(500, {"ok": False, "errors": ["internal error"], "audit_rows": []})
+            except Exception: pass
 
-def main(port: int = 18888) -> None:
+
+def main(port: int = 18888, journal_path: Optional[str] = None) -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(message)s")
+
+    # Load settings up-front so the cache is warm before the first request.
+    try:
+        _settings.load_settings()
+    except Exception:
+        sys.stderr.write("[dashboard] settings.load_settings warmup failed:\n"
+                         + traceback.format_exc() + "\n")
+
+    # Optionally wire the journal so the Settings page can show audit history
+    # and apply-events get persisted. Without this the dashboard still works
+    # — settings just don't show a history panel.
+    audit_journal = None
+    if journal_path is None:
+        # Default: D:\BookmapLogs\pax-journal.db if it exists. The daemon may
+        # have created it already; opening read-write is safe under WAL.
+        default = Path(os.environ.get("PAX_LOG_DIR", r"D:\BookmapLogs")) / "pax-journal.db"
+        if default.exists():
+            journal_path = str(default)
+    if journal_path:
+        try:
+            from .journal import Journal
+            audit_journal = Journal(Path(journal_path))
+            audit_journal.open()
+            DashboardHandler.set_audit_journal(audit_journal)
+            sys.stderr.write(f"[dashboard] settings-audit journal: {journal_path}\n")
+        except Exception:
+            sys.stderr.write("[dashboard] failed to open journal for audit:\n"
+                             + traceback.format_exc() + "\n")
+            audit_journal = None
+
     server = ThreadingHTTPServer(("127.0.0.1", port), DashboardHandler)
     print(f"Bookmap HUD on http://localhost:{port}", flush=True)
     sys.stderr.write(f"[dashboard] serve_forever starting (pid={os.getpid()})\n")
@@ -4710,7 +5322,17 @@ def main(port: int = 18888) -> None:
         sys.stderr.write("[dashboard] serve_forever crashed:\n" + traceback.format_exc() + "\n")
     finally:
         sys.stderr.write("[dashboard] serve_forever returned\n"); sys.stderr.flush()
+        if audit_journal is not None:
+            try: audit_journal.close()
+            except Exception: pass
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    p = argparse.ArgumentParser(description="Bookmap live HUD + settings UI")
+    p.add_argument("--port", type=int, default=18888)
+    p.add_argument("--journal", default=None,
+                   help="Path to pax-journal.db for settings-audit persistence "
+                        "(default: D:\\BookmapLogs\\pax-journal.db if present)")
+    args = p.parse_args()
+    main(port=args.port, journal_path=args.journal)

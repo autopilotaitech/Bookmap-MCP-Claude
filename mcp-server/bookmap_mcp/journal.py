@@ -170,6 +170,21 @@ CREATE TABLE IF NOT EXISTS outcomes (
 );
 CREATE INDEX IF NOT EXISTS idx_outcomes_decision_level
   ON outcomes(decision, level_label);
+
+-- Settings audit. Append-only history of every dashboard-side settings
+-- mutation (UI POST, file edit, restore-defaults, restore-LKG).
+CREATE TABLE IF NOT EXISTS settings_audit (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts_ms           INTEGER NOT NULL,
+  source          TEXT NOT NULL,          -- 'ui' / 'file' / 'cli' / 'reset' / 'lkg'
+  user            TEXT,
+  field           TEXT NOT NULL,
+  old_value_json  TEXT,
+  new_value_json  TEXT,
+  run_id          TEXT,
+  reason          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_settings_audit_ts ON settings_audit(ts_ms);
 """
 
 
@@ -236,8 +251,13 @@ class Journal:
                 "notes=COALESCE(notes,'') || ' | unclean-shutdown-recovered' "
                 "WHERE run_id=?",
                 (now, prev["run_id"]))
-            # Log a RUN_CRASHED event in the OLD run.
+            # Log a RUN_CRASHED event in the OLD run. Seed _event_seq
+            # from MAX(seq) — a new process inherits 0 from __init__,
+            # which would collide with the prev run's existing seqs.
             self.run_id = prev["run_id"]
+            self._event_seq = int(self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS m FROM events "
+                "WHERE run_id=?", (prev["run_id"],)).fetchone()["m"])
             self.write_event("RUN_CRASHED", "daemon",
                               "previous run did not end gracefully")
         # Open new run.
@@ -355,6 +375,41 @@ class Journal:
             "payload_json) VALUES(?,?,?,?,?,?,?)",
             (self.run_id, self._event_seq, _now_ms(), kind, source, message,
              json.dumps(payload) if payload is not None else None))
+
+    def write_settings_audit(self, rows: list) -> None:
+        """Append one row per changed field. Each row is the dict shape
+        produced by ``settings._diff_audit_rows``. The current run_id is
+        attached automatically; ts_ms / source / user / field /
+        old_value_json / new_value_json / reason come from the caller."""
+        assert self._conn is not None
+        if not rows:
+            return
+        run_id = self.run_id
+        self._conn.executemany(
+            "INSERT INTO settings_audit(ts_ms, source, user, field, "
+            "old_value_json, new_value_json, run_id, reason) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            [
+                (r.get("ts_ms") or _now_ms(),
+                 r.get("source") or "ui",
+                 r.get("user"),
+                 r["field"],
+                 r.get("old_value_json"),
+                 r.get("new_value_json"),
+                 run_id,
+                 r.get("reason"))
+                for r in rows
+            ])
+
+    def read_settings_audit(self, limit: int = 50) -> list:
+        """Return the latest ``limit`` audit rows, newest first."""
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT ts_ms, source, user, field, old_value_json, "
+            "new_value_json, run_id, reason FROM settings_audit "
+            "ORDER BY ts_ms DESC, id DESC LIMIT ?",
+            (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
 
     def commit(self) -> None:
         if self._conn is not None:

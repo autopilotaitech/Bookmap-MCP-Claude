@@ -169,6 +169,16 @@ the launcher defaults to the Rithmic NQ alias.
 - `mcp-server/bookmap_mcp/journal.py` — SQLite journal (runs,
   snapshots, signals, orders, fills, positions, daily_stats,
   adapter_health, events, outcomes). WAL mode; daemon writes, UI reads.
+  `_event_seq` is process-local and resets to 0 in `__init__`. When
+  `begin_run` recovers an unended prior run (cross-process crash
+  recovery), it MUST reseed `_event_seq` from
+  `COALESCE(MAX(seq), 0)` for that run_id before writing the
+  `RUN_CRASHED` event — otherwise the insert collides on `(run_id,
+  seq)`, the implicit sqlite3 transaction rolls back the
+  `UPDATE runs SET ended_ms=…`, and every subsequent daemon restart
+  hits the same row → permanent deadlock. Pinned by
+  `test_crash_recovery_across_process_restart` (close + reopen the
+  Journal between runs; reusing one instance hides the bug).
 - `mcp-server/bookmap_mcp/overview_ui.py` — read-only HTTP dashboard
   at `:18890` with 9 collapsible `<details>` sections (state persisted
   in localStorage).

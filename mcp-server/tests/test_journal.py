@@ -83,6 +83,35 @@ def test_crash_recovery_logs_run_crashed_event(journal):
     assert ev["n"] == 1
 
 
+def test_crash_recovery_across_process_restart(tmp_path):
+    """Daemon crashes mid-run; the next *process* gets a fresh Journal
+    instance with _event_seq=0. begin_run must still recover without
+    colliding on (run_id, seq) when it appends RUN_CRASHED into the
+    prior run's existing event sequence."""
+    db = tmp_path / "restart.db"
+    j1 = Journal(db); j1.open()
+    rid1 = j1.begin_run("a")
+    j1.write_event("INFO", "test", "e1")
+    j1.write_event("INFO", "test", "e2")
+    j1.commit()
+    j1.close()                       # simulate ungraceful exit
+
+    j2 = Journal(db); j2.open()
+    rid2 = j2.begin_run("b")         # must not raise IntegrityError
+    assert rid2 != rid1
+
+    rows = j2._conn.execute(
+        "SELECT seq, kind FROM events WHERE run_id=? ORDER BY seq",
+        (rid1,)).fetchall()
+    assert [r["seq"]  for r in rows] == [1, 2, 3]
+    assert [r["kind"] for r in rows] == ["INFO", "INFO", "RUN_CRASHED"]
+
+    old = j2._conn.execute(
+        "SELECT ended_ms FROM runs WHERE run_id=?", (rid1,)).fetchone()
+    assert old["ended_ms"] is not None
+    j2.close()
+
+
 def test_write_snapshot_populates_row(journal):
     journal.begin_run("test")
     snap = {

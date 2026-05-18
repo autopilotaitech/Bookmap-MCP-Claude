@@ -17,6 +17,7 @@ import com.sun.net.httpserver.HttpServer;
 
 import com.bookmapmcp.handlers.BalanceHandler;
 import com.bookmapmcp.handlers.BookDynamicsHandler;
+import com.bookmapmcp.handlers.ConfigHandler;
 import com.bookmapmcp.handlers.InstrumentsHandler;
 import com.bookmapmcp.handlers.LtLiquidityHandler;
 import com.bookmapmcp.handlers.MagnetLevelsHandler;
@@ -75,6 +76,7 @@ public final class BridgeServer {
             http.createContext("/pull_stack",      auth.guard(new PullStackHandler()));
             http.createContext("/microstructure_events", auth.guard(new MicrostructureEventsHandler()));
             http.createContext("/magnet_levels",   auth.guard(new MagnetLevelsHandler()));
+            http.createContext("/config",          auth.guard(new ConfigHandler()));
             http.createContext("/screenshot",      auth.guard(new ScreenshotHandler()));
             http.createContext("/place_limit_order", auth.guard(new TradingHandler(TradingHandler.Op.PLACE_LIMIT)));
             http.createContext("/cancel_order",    auth.guard(new TradingHandler(TradingHandler.Op.CANCEL)));
