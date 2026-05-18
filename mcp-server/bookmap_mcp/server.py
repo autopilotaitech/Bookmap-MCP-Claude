@@ -9,12 +9,38 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 from typing import Any, Dict, Mapping, Optional
 
 from mcp.server.fastmcp import FastMCP
 
 from .bridge_client import BridgeClient, BridgeError
 from .config import BridgeConfig, MissingTokenError
+
+
+def _require_live_trade_allowed(confirm: bool, op: str) -> None:
+    """Belt-and-suspenders gate on live broker calls. Two independent checks:
+
+    1. Caller must pass `confirm=True` explicitly — a typo or accidental
+       autocomplete cannot fire a real order.
+    2. The Bookmap process environment must have `BOOKMAP_ALLOW_TRADING=1`.
+       The Java bridge has its own check on this var; we replicate it here in
+       Python so a hypothetical bridge regression cannot silently route an
+       order through.
+
+    Raises RuntimeError if either gate fails. Both gates must be open for the
+    tool to call through to /place_limit_order or /cancel_order.
+    """
+    if not confirm:
+        raise RuntimeError(
+            f"{op} requires confirm=True. This is a LIVE broker action — "
+            "verify alias, side, size, price/orderId before calling."
+        )
+    if os.environ.get("BOOKMAP_ALLOW_TRADING") != "1":
+        raise RuntimeError(
+            f"BOOKMAP_ALLOW_TRADING is not set to '1' in the Bookmap process "
+            f"environment. Live {op} is disabled."
+        )
 
 log = logging.getLogger("bookmap_mcp")
 
@@ -194,22 +220,31 @@ def build_server() -> FastMCP:
         size: int,
         price: float,
         duration: str = "DAY",
+        confirm: bool = False,
     ) -> Dict[str, Any]:
         """Place a LIMIT order on the broker Bookmap is connected to.
 
-        DANGEROUS — sends a real order. Gated behind the
-        BOOKMAP_ALLOW_TRADING=1 environment variable on the Bookmap process.
-        Whether the order is paper or live depends on the broker login used at
-        Bookmap startup. Always confirm with the user before calling.
+        DANGEROUS — sends a real order. TWO independent gates must be open:
+          1. `confirm=True` must be passed explicitly.
+          2. `BOOKMAP_ALLOW_TRADING=1` must be set in the Bookmap process
+             environment.
+
+        Whether the order is paper or live depends on the broker login used
+        at Bookmap startup. Always confirm with the user before calling.
         """
+        _require_live_trade_allowed(confirm, "place_limit_order")
         return _post("/place_limit_order", {
             "alias": alias, "side": side, "size": size,
             "price": price, "duration": duration,
         })
 
     @server.tool()
-    def bookmap_cancel_order(alias: str, orderId: str) -> Dict[str, Any]:
-        """Cancel a working order by orderId. Same gating as place_limit_order."""
+    def bookmap_cancel_order(alias: str, orderId: str,
+                              confirm: bool = False) -> Dict[str, Any]:
+        """Cancel a working order by orderId. Same two-gate guard as
+        place_limit_order: requires `confirm=True` AND
+        `BOOKMAP_ALLOW_TRADING=1`."""
+        _require_live_trade_allowed(confirm, "cancel_order")
         return _post("/cancel_order", {"alias": alias, "orderId": orderId})
 
     return server
