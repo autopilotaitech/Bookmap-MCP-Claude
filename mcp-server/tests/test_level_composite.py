@@ -286,15 +286,95 @@ def test_vwap_or_gate_contributes_directionally():
 # ──────────────────────────────────────────────────────────────────────
 
 def test_conviction_reliability_is_zero_in_first_5_minutes():
-    early = {"score": 0.6, "trend": "BULLISH_TREND", "durationSec": 60}
+    early = {"score": 0.6, "trend": "BULLISH_TREND",
+              "trajectory": "FLAT", "durationSec": 60}
     s, r, _ = dash._conviction_at_level(early, "above")
     assert r == 0.0
-    mature = {"score": 0.6, "trend": "BULLISH_TREND", "durationSec": 1800}
+    mature = {"score": 0.6, "trend": "BULLISH_TREND",
+               "trajectory": "FLAT", "durationSec": 1800}
     s, r, _ = dash._conviction_at_level(mature, "above")
     assert r == 1.0
-    chop = {"score": 0.6, "trend": "CHOP", "durationSec": 1800}
+    chop = {"score": 0.6, "trend": "CHOP",
+             "trajectory": "FLAT", "durationSec": 1800}
     s, r, _ = dash._conviction_at_level(chop, "above")
     assert r <= 0.3
+
+
+# ──────────────────────────────────────────────────────────────────────
+# V8: trajectory-aware conviction modulation
+# ──────────────────────────────────────────────────────────────────────
+
+def test_conviction_trajectory_rising_strong_nudges_score_higher():
+    base = {"score": 0.5, "trend": "BULLISH_TREND",
+             "trajectory": "FLAT", "durationSec": 1800}
+    rising = dict(base, trajectory="RISING_STRONG")
+    base_s, _, _ = dash._conviction_at_level(base, "above")
+    rs_s, _, rs_r = dash._conviction_at_level(rising, "above")
+    assert rs_s > base_s, f"RISING_STRONG should add a positive nudge"
+    assert rs_s == pytest.approx(base_s + 0.10, abs=1e-9)
+    assert "nudge=+0.10" in rs_r
+
+
+def test_conviction_trajectory_falling_strong_nudges_score_lower():
+    base = {"score": -0.5, "trend": "BEARISH_TREND",
+             "trajectory": "FLAT", "durationSec": 1800}
+    falling = dict(base, trajectory="FALLING_STRONG")
+    base_s, _, _ = dash._conviction_at_level(base, "below")
+    fs_s, _, _ = dash._conviction_at_level(falling, "below")
+    assert fs_s < base_s
+    assert fs_s == pytest.approx(base_s - 0.10, abs=1e-9)
+
+
+def test_conviction_trajectory_can_lift_near_zero_score_off_zero():
+    """A near-zero score paired with RISING_STRONG should still register
+    a directional read at the level — that's the whole point of the nudge."""
+    flat = {"score": 0.02, "trend": "MIXED",
+             "trajectory": "RISING_STRONG", "durationSec": 1800}
+    s, r, _ = dash._conviction_at_level(flat, "above")
+    assert s > 0.05
+
+
+def test_conviction_divergence_cuts_reliability_strongly():
+    """Positive score + FALLING_STRONG trajectory = classic top-out
+    exhaustion. Reliability cut to 0.5 of normal."""
+    diverged = {"score": 0.6, "trend": "BULLISH_TREND",
+                 "trajectory": "FALLING_STRONG", "durationSec": 1800}
+    confirmed = dict(diverged, trajectory="RISING")
+    _, rel_div, reason_div = dash._conviction_at_level(diverged, "above")
+    _, rel_conf, _ = dash._conviction_at_level(confirmed, "above")
+    assert rel_div < rel_conf
+    assert rel_div == pytest.approx(0.5, abs=1e-9)
+    assert "DIVERGED" in reason_div
+
+
+def test_conviction_mild_divergence_cuts_reliability_partially():
+    """Score positive but RISING flipped to FALLING (not _STRONG) →
+    0.75× reliability, not 0.5×."""
+    mild = {"score": 0.6, "trend": "BULLISH_TREND",
+             "trajectory": "FALLING", "durationSec": 1800}
+    _, rel, reason = dash._conviction_at_level(mild, "above")
+    assert rel == pytest.approx(0.75, abs=1e-9)
+    assert "DIVERGED" in reason
+
+
+def test_conviction_flat_trajectory_is_neutral():
+    flat = {"score": 0.4, "trend": "BULLISH_TREND",
+             "trajectory": "FLAT", "durationSec": 1800}
+    s, rel, reason = dash._conviction_at_level(flat, "above")
+    assert s == pytest.approx(0.4, abs=1e-9)
+    assert rel == 1.0
+    assert "DIVERGED" not in reason
+
+
+def test_conviction_missing_trajectory_field_no_crash():
+    """Older conviction payloads may not have trajectory yet — must default
+    to no nudge / no divergence cut, never crash."""
+    legacy = {"score": 0.6, "trend": "BULLISH_TREND", "durationSec": 1800}
+    s, rel, reason = dash._conviction_at_level(legacy, "above")
+    assert s == pytest.approx(0.6, abs=1e-9)
+    assert rel == 1.0
+    assert "nudge" not in reason
+    assert "DIVERGED" not in reason
 
 
 def test_conviction_slow_prior_uses_last_poll_cache():

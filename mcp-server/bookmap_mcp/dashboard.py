@@ -457,18 +457,43 @@ def _vp_at_level(vp_obj: Optional[Dict[str, Any]], price: float,
     return 0.0, 0.5, f"vp neutral (vol={int(bin_vol)})"
 
 
+_CONVICTION_TRAJ_NUDGE = {
+    "RISING_STRONG":  +0.10,
+    "RISING":         +0.05,
+    "FLAT":            0.00,
+    "FALLING":        -0.05,
+    "FALLING_STRONG": -0.10,
+}
+
+
 def _conviction_at_level(conv_obj: Optional[Dict[str, Any]],
                           side: str) -> Tuple[float, float, str]:
-    """Slow prior. Reliability ramps in over the first 30 min of the session;
-    CHOP / MIXED / WARMUP regimes are capped at 0.3 reliability so they cannot
-    override fast at-level evidence."""
+    """Slow prior with trajectory modulation.
+
+    Reliability:
+    - Ramps in linearly over the first 30 min (0 for first 5 min, full at 30 min).
+    - CHOP / MIXED / WARMUP regimes capped at 0.3 so the slow prior can never
+      override fast at-level evidence in chop.
+    - Divergence cut: when score sign disagrees with trajectory direction
+      (e.g. positive score + FALLING trajectory = exhausting bullish run),
+      reliability is cut to 0.5 (mild divergence) or 0.5 of normal (strong
+      divergence with RISING_STRONG / FALLING_STRONG). This expresses
+      "the slow score is losing coherence — weight it less."
+
+    Score:
+    - Trajectory adds a small additive nudge (±0.10 max) so a near-zero
+      score can still register a directional read when momentum is strong.
+    - Final score is clamped to [-1,+1].
+    """
     if not conv_obj or not isinstance(conv_obj, dict) or "_error" in conv_obj:
         return 0.0, 0.0, "no conviction (cold start)"
-    score = conv_obj.get("score")
-    if not isinstance(score, (int, float)):
+    raw = conv_obj.get("score")
+    if not isinstance(raw, (int, float)):
         return 0.0, 0.0, "conviction missing score"
     trend = conv_obj.get("trend", "?")
+    traj = (conv_obj.get("trajectory") or "").upper()
     duration_sec = conv_obj.get("durationSec", 0) or 0
+
     if duration_sec < 300:
         rel = 0.0
     elif duration_sec < 1800:
@@ -477,7 +502,30 @@ def _conviction_at_level(conv_obj: Optional[Dict[str, Any]],
         rel = 1.0
     if trend in ("CHOP", "MIXED", "WARMUP"):
         rel = min(rel, 0.3)
-    return _clip(float(score)), rel, f"conviction {trend} score={float(score):+.2f}"
+
+    nudge = _CONVICTION_TRAJ_NUDGE.get(traj, 0.0)
+    final_score = _clip(float(raw) + nudge)
+
+    # Divergence: score sign vs trajectory sign. A persistent bullish score
+    # paired with a falling trajectory is the classic top-out tell — slow
+    # prior was right, but momentum is rolling over. Cut reliability.
+    score_sign = 1 if float(raw) > 0.05 else (-1 if float(raw) < -0.05 else 0)
+    traj_sign = (1 if traj in ("RISING", "RISING_STRONG")
+                  else -1 if traj in ("FALLING", "FALLING_STRONG")
+                  else 0)
+    diverged = (score_sign != 0 and traj_sign != 0 and score_sign != traj_sign)
+    if diverged:
+        if traj in ("RISING_STRONG", "FALLING_STRONG"):
+            rel *= 0.5     # strong divergence: momentum is hard against the score
+        else:
+            rel *= 0.75    # mild divergence
+
+    reason = f"conviction {trend} score={float(raw):+.2f} traj={traj or '?'}"
+    if abs(nudge) > 0:
+        reason += f" nudge={nudge:+.2f}"
+    if diverged:
+        reason += " (DIVERGED)"
+    return final_score, rel, reason
 
 
 def _vwap_stretch_directional(vwap_obj: Optional[Dict[str, Any]],
