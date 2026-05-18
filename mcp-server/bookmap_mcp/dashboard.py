@@ -1634,14 +1634,77 @@ def _source_regime(snap: Dict[str, Any]) -> Dict[str, Any]:
             "reason": f"{regime} conf={conf:.2f}" if conf_ok else regime}
 
 
+# V10: bias_score trajectory cache. Same shape as V9's level_reaction cache.
+# bias_score rolls every 30s when FlowRegime closes a window, so most polls
+# see delta=0 and trajectory FLAT — meaningful trajectory fires precisely
+# when the FlowRegime window rolls with a different bias.
+_LAST_BIAS_SCORE: Dict[str, Tuple[float, float]] = {}
+_BIAS_SCORE_TRAJ_NUDGE = {
+    "RISING_STRONG":  +0.10,
+    "RISING":         +0.05,
+    "FLAT":            0.00,
+    "FALLING":        -0.05,
+    "FALLING_STRONG": -0.10,
+}
+_BIAS_SCORE_TRAJ_STRONG_DELTA = 0.10
+_BIAS_SCORE_TRAJ_NORMAL_DELTA = 0.03
+_BIAS_SCORE_MAX_DT_SEC = 60.0
+
+
 def _source_bias_score(snap: Dict[str, Any]) -> Dict[str, Any]:
     flow = snap.get("flow") or {}
     bs, ok = _as_float(flow.get("biasScore"))
     if not ok:
         return {"score": 0.0, "reliability": 0.0,
                 "raw": {"biasScore": flow.get("biasScore")}, "reason": "no biasScore"}
-    return {"score": _clip(bs), "reliability": 1.0,
-            "raw": {"biasScore": bs}, "reason": f"bias={bs:+.2f}"}
+
+    raw_score = _clip(bs)
+    reliability = 1.0
+
+    # ----- trajectory awareness (V10) -----
+    alias = snap.get("alias")
+    now_ts = time.monotonic()
+    traj = "FLAT"
+    delta = 0.0
+    if alias:
+        prev = _LAST_BIAS_SCORE.get(alias)
+        if prev is not None:
+            prev_score, prev_ts = prev
+            dt_sec = now_ts - prev_ts
+            if 0 < dt_sec <= _BIAS_SCORE_MAX_DT_SEC:
+                delta = raw_score - prev_score
+                a = abs(delta)
+                if a > _BIAS_SCORE_TRAJ_STRONG_DELTA:
+                    traj = "RISING_STRONG" if delta > 0 else "FALLING_STRONG"
+                elif a > _BIAS_SCORE_TRAJ_NORMAL_DELTA:
+                    traj = "RISING" if delta > 0 else "FALLING"
+        _LAST_BIAS_SCORE[alias] = (raw_score, now_ts)
+
+    nudge = _BIAS_SCORE_TRAJ_NUDGE.get(traj, 0.0)
+    final_score = _clip(raw_score + nudge)
+
+    score_sign = 1 if raw_score > 0.05 else (-1 if raw_score < -0.05 else 0)
+    traj_sign = (1 if traj in ("RISING", "RISING_STRONG")
+                  else -1 if traj in ("FALLING", "FALLING_STRONG")
+                  else 0)
+    diverged = (score_sign != 0 and traj_sign != 0 and score_sign != traj_sign)
+    if diverged:
+        if traj in ("RISING_STRONG", "FALLING_STRONG"):
+            reliability *= 0.5
+        else:
+            reliability *= 0.75
+
+    reason = f"bias={bs:+.2f} traj={traj}"
+    if abs(nudge) > 0:
+        reason += f" nudge={nudge:+.2f}"
+    if diverged:
+        reason += " (DIVERGED)"
+
+    return {"score": final_score,
+            "reliability": reliability,
+            "raw": {"biasScore": bs, "trajectory": traj,
+                    "delta": round(delta, 3)},
+            "reason": reason}
 
 
 def _source_vwap_dislocation(snap: Dict[str, Any]) -> Dict[str, Any]:

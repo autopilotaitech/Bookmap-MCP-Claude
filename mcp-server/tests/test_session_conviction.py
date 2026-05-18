@@ -609,6 +609,84 @@ def test_level_reaction_confirming_trajectory_keeps_full_reliability():
     assert out["reliability"] == 1.0
 
 
+# ─── V10: bias_score trajectory awareness ───────────────────────────────────
+
+def _seed_bias_score_cache(alias: str, score: float, age_sec: float = 1.0):
+    import time as _t
+    d._LAST_BIAS_SCORE[alias] = (score, _t.monotonic() - age_sec)
+
+
+def test_bias_score_first_call_is_flat_no_nudge():
+    d._LAST_BIAS_SCORE.clear()
+    out = d._source_bias_score({"alias": "NQM6", "flow": {"biasScore": 0.5}})
+    assert out["raw"]["trajectory"] == "FLAT"
+    assert out["score"] == pytest.approx(0.5, abs=1e-6)
+
+
+def test_bias_score_rising_strong_adds_nudge():
+    d._LAST_BIAS_SCORE.clear()
+    _seed_bias_score_cache("NQM6", score=0.3)
+    out = d._source_bias_score({"alias": "NQM6", "flow": {"biasScore": 0.5}})
+    # delta = +0.20 → RISING_STRONG → nudge +0.10
+    assert out["raw"]["trajectory"] == "RISING_STRONG"
+    assert out["score"] == pytest.approx(0.60, abs=1e-9)
+    assert "nudge=+0.10" in out["reason"]
+
+
+def test_bias_score_falling_strong_with_positive_score_diverges():
+    d._LAST_BIAS_SCORE.clear()
+    _seed_bias_score_cache("NQM6", score=0.7)
+    out = d._source_bias_score({"alias": "NQM6", "flow": {"biasScore": 0.3}})
+    # delta = -0.40 → FALLING_STRONG; raw 0.3 > 0 → diverged
+    assert out["raw"]["trajectory"] == "FALLING_STRONG"
+    assert "DIVERGED" in out["reason"]
+    assert out["reliability"] == pytest.approx(0.5, abs=1e-9)
+
+
+def test_bias_score_mild_divergence_cuts_reliability_partially():
+    d._LAST_BIAS_SCORE.clear()
+    _seed_bias_score_cache("NQM6", score=0.55)
+    out = d._source_bias_score({"alias": "NQM6", "flow": {"biasScore": 0.5}})
+    # delta = -0.05 → FALLING; raw 0.5 > 0 → mild divergence
+    assert out["raw"]["trajectory"] == "FALLING"
+    assert out["reliability"] == pytest.approx(0.75, abs=1e-9)
+
+
+def test_bias_score_stale_cache_resets_to_flat():
+    d._LAST_BIAS_SCORE.clear()
+    _seed_bias_score_cache("NQM6", score=0.0, age_sec=120.0)   # > 60s
+    out = d._source_bias_score({"alias": "NQM6", "flow": {"biasScore": 0.8}})
+    assert out["raw"]["trajectory"] == "FLAT"
+    assert "nudge" not in out["reason"]
+
+
+def test_bias_score_missing_alias_no_crash_no_trajectory():
+    d._LAST_BIAS_SCORE.clear()
+    out = d._source_bias_score({"flow": {"biasScore": 0.4}})
+    assert out["raw"]["trajectory"] == "FLAT"
+    assert d._LAST_BIAS_SCORE == {}
+
+
+def test_bias_score_confirming_trajectory_keeps_full_reliability():
+    d._LAST_BIAS_SCORE.clear()
+    _seed_bias_score_cache("NQM6", score=0.3)
+    out = d._source_bias_score({"alias": "NQM6", "flow": {"biasScore": 0.4}})
+    # delta = +0.10 → exactly at strong boundary, falls to RISING.
+    assert out["raw"]["trajectory"] in ("RISING", "RISING_STRONG")
+    assert "DIVERGED" not in out["reason"]
+    assert out["reliability"] == 1.0
+
+
+def test_bias_score_missing_biasscore_returns_zero_reliability():
+    """Sanity: legacy code path (no biasScore field) still works."""
+    d._LAST_BIAS_SCORE.clear()
+    out = d._source_bias_score({"alias": "NQM6", "flow": {}})
+    assert out["score"] == 0.0
+    assert out["reliability"] == 0.0
+    # Cache must not be polluted with a zero entry on the missing path.
+    assert d._LAST_BIAS_SCORE == {}
+
+
 def test_flow_ofi_sign_matches_z():
     assert d._source_flow_ofi({"flow": {"ofiZ": 2.0}})["score"] > 0.0
     assert d._source_flow_ofi({"flow": {"ofiZ": -2.0}})["score"] < 0.0
