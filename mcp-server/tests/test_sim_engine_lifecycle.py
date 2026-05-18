@@ -36,6 +36,14 @@ def db_path(tmp_path):
     return tmp_path / "test-trades.db"
 
 
+def _eng(db_path, **kwargs):
+    """SimEngine factory with auto-flatten disabled by default so tests
+    don't get tripped up by the wall-clock being past 15:00 CT at the
+    moment they happen to run. EOD-specific tests override."""
+    kwargs.setdefault("eod_close_hour_ct", None)
+    return se.SimEngine(alias="TEST", db_path=db_path, **kwargs)
+
+
 def _trade(price, nanos, side="sell", size=1):
     return {"price": price, "nanos": nanos, "size": size, "side": side}
 
@@ -57,7 +65,7 @@ def test_child_does_not_fill_before_parent(db_path):
     """The classic bracket-race bug: BUY STOP entry at 100.50 plus SL at
     99.00. Before the breakout fires, price dips through 99.00. The SL
     must remain WORKING because the parent never filled."""
-    eng = se.SimEngine(alias="TEST", db_path=db_path)
+    eng = _eng(db_path)
     ids = eng.place_bracket(
         side="BUY", qty=1,
         entry_stop=100.50, entry_limit=100.50,
@@ -89,7 +97,7 @@ def test_child_does_not_fill_before_parent(db_path):
 def test_armed_children_fill_normally_after_parent(db_path):
     """Parent fills first, then on a subsequent tick the SL behaves like
     a normal stop-limit and triggers/fills."""
-    eng = se.SimEngine(alias="TEST", db_path=db_path)
+    eng = _eng(db_path)
     ids = eng.place_bracket(
         side="BUY", qty=1,
         entry_stop=100.50, entry_limit=100.50,
@@ -123,7 +131,7 @@ def test_armed_children_fill_normally_after_parent(db_path):
 def test_arm_child_event_logged_on_parent_fill(db_path):
     """Audit trail: every armed child gets an ARM_CHILD event when the
     parent fills, so we can prove the gate fired."""
-    eng = se.SimEngine(alias="TEST", db_path=db_path)
+    eng = _eng(db_path)
     ids = eng.place_bracket(
         side="BUY", qty=2,
         entry_stop=100.50, entry_limit=100.50,
@@ -148,7 +156,7 @@ def test_arm_child_event_logged_on_parent_fill(db_path):
 
 def test_bracket_cleanup_on_parent_cancel(db_path):
     """Canceling the entry must cascade-cancel SL and TP children."""
-    eng = se.SimEngine(alias="TEST", db_path=db_path)
+    eng = _eng(db_path)
     ids = eng.place_bracket(
         side="BUY", qty=1,
         entry_stop=100.50, entry_limit=100.50,
@@ -171,7 +179,7 @@ def test_bracket_cleanup_on_parent_cancel(db_path):
 
 def test_tif_expiry_cascade_cancels_children(db_path):
     """When an ENTRY's TIF expires, the bracket children must also cancel."""
-    eng = se.SimEngine(alias="TEST", db_path=db_path)
+    eng = _eng(db_path)
     ids = eng.place_bracket(
         side="BUY", qty=1,
         entry_stop=100.50, entry_limit=100.50,
@@ -202,14 +210,14 @@ def test_tif_expiry_cascade_cancels_children(db_path):
 
 def test_armed_flag_persists_across_engine_restart(db_path):
     """Schema column survives DB close + re-open."""
-    eng1 = se.SimEngine(alias="TEST", db_path=db_path)
+    eng1 = _eng(db_path)
     ids = eng1.place_bracket(
         side="BUY", qty=1,
         entry_stop=100.50, entry_limit=100.50,
         stop_loss=99.00, take_profits=[102.00])
     del eng1
 
-    eng2 = se.SimEngine(alias="TEST", db_path=db_path)
+    eng2 = _eng(db_path)
     with eng2._conn() as c:
         entry = c.execute(
             "SELECT armed_after_parent_fill FROM orders WHERE id=?",
@@ -236,7 +244,7 @@ def test_armed_flag_persists_across_engine_restart(db_path):
 def test_stale_reset_event_logged_for_old_working_orders(db_path):
     """If a working order pre-dates today's RTH anchor, restart logs a
     STALE_RESET event for the audit trail."""
-    eng1 = se.SimEngine(alias="TEST", db_path=db_path)
+    eng1 = _eng(db_path)
     # Inject an order with placed_ms a week in the past.
     week_ago_ms = se._now_ms() - 7 * 86_400_000
     with eng1._conn() as c:
@@ -252,7 +260,7 @@ def test_stale_reset_event_logged_for_old_working_orders(db_path):
     del eng1
 
     # Restart — should log STALE_RESET.
-    eng2 = se.SimEngine(alias="TEST", db_path=db_path)
+    eng2 = _eng(db_path)
     with eng2._conn() as c:
         events = c.execute(
             "SELECT order_id FROM events WHERE alias=? AND kind=?",
@@ -268,10 +276,24 @@ def test_stale_reset_event_logged_for_old_working_orders(db_path):
 def test_eod_auto_flatten_fires_after_rth_close(db_path):
     """A tick whose wall-clock is past 15:00 CT triggers auto-flatten of
     open position and cancellation of working orders. Logs EOD_AUTO_FLATTEN."""
-    eng = se.SimEngine(alias="TEST", db_path=db_path)
-    # Open a position by filling a normal limit BUY.
+    # This test needs EOD enabled (the default in production), so it
+    # constructs the engine directly with `eod_close_hour_ct=15`.
+    eng = se.SimEngine(alias="TEST", db_path=db_path, eod_close_hour_ct=15)
+    # Use an explicit in-RTH wall-clock so this test is deterministic no
+    # matter what time of day pytest runs.
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+    ct = ZoneInfo("America/Chicago")
+    in_rth_ms = int(dt.datetime.now(ct).replace(
+        hour=11, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    eod_ms = int(dt.datetime.now(ct).replace(
+        hour=16, minute=0, second=0, microsecond=0).timestamp() * 1000)
+
+    # Open a position by filling a normal limit BUY (in-RTH wall-clock so
+    # EOD does NOT fire on this tick).
     eng.place_limit("BUY", qty=1, limit=100.50, role="ENTRY", reason="setup")
-    eng.tick(_snap("TEST", 100.50, nanos=1_000_000_000_000, side="sell"))
+    eng.tick(_snap("TEST", 100.50, nanos=1_000_000_000_000, side="sell"),
+              now_ms=in_rth_ms)
     pos = eng.snapshot()["position"]
     assert pos["size"] == 1
 
@@ -280,17 +302,10 @@ def test_eod_auto_flatten_fires_after_rth_close(db_path):
                                  role="ENTRY", reason="late TP",
                                  tif_sec=24 * 3600)
 
-    # Force wall-clock to 16:00 CT today (past RTH close 15:00).
-    import datetime as dt
-    from zoneinfo import ZoneInfo
-    ct = ZoneInfo("America/Chicago")
-    now_ct = dt.datetime.now(ct).replace(hour=16, minute=0,
-                                            second=0, microsecond=0)
-    fake_now_ms = int(now_ct.timestamp() * 1000)
-
+    # Now tick with wall-clock past RTH close — EOD should fire.
     result = eng.tick(_snap("TEST", 100.75, nanos=2_000_000_000_000,
                               side="buy"),
-                       now_ms=fake_now_ms)
+                       now_ms=eod_ms)
 
     # An EOD_AUTO_FLATTEN action should appear in this tick's result.
     eod_actions = [a for a in result.get("actions", [])
@@ -314,7 +329,7 @@ def test_eod_auto_flatten_fires_after_rth_close(db_path):
 def test_eod_auto_flatten_is_idempotent_within_session(db_path):
     """Once fired for today's session, subsequent ticks past close don't
     re-fire."""
-    eng = se.SimEngine(alias="TEST", db_path=db_path)
+    eng = se.SimEngine(alias="TEST", db_path=db_path, eod_close_hour_ct=15)
     import datetime as dt
     from zoneinfo import ZoneInfo
     ct = ZoneInfo("America/Chicago")
@@ -336,7 +351,7 @@ def test_eod_auto_flatten_is_idempotent_within_session(db_path):
 
 def test_snapshot_includes_armed_flag(db_path):
     """The UI needs to know which working orders are awaiting their parent."""
-    eng = se.SimEngine(alias="TEST", db_path=db_path)
+    eng = _eng(db_path)
     eng.place_bracket(
         side="BUY", qty=1,
         entry_stop=100.50, entry_limit=100.50,

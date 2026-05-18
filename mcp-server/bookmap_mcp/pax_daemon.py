@@ -33,6 +33,7 @@ from . import signal_engine as se
 from .adapters import BookmapLiveAdapter, CsvReplayAdapter, FileTailAdapter
 from .adapters.base import AdapterHealth, DataAdapter
 from .journal import Journal
+from .pax_trader import decide_and_act
 from .sim_engine import SimEngine
 from .snapshot import is_valid
 
@@ -153,12 +154,43 @@ def run_daemon(args: argparse.Namespace) -> int:
             n_snapshots += 1
             sim_result = sim.tick(snap)
 
+            # On ENTER_* decisions, actually place the paper bracket. Without
+            # this the daemon would just log decisions without ever taking
+            # paper trades — exactly the previous bug. decide_and_act handles:
+            #   - bail-out on WAIT/STAND_DOWN/already-positioned/no-level
+            #   - side selection from LONG/SHORT
+            #   - bracket compute (FOLLOW=STOP-LIMIT, FADE=LIMIT) + TPs
+            #   - eng.place_bracket() call
+            # use_claude=False so the daemon never spawns Claude subprocesses.
+            decision_action = decide_and_act(snap, sim, use_claude=False)
+            n_placed = 0
+            if decision_action.get("action") == "placed_bracket":
+                n_placed = 1
+
             if journal is not None:
                 journal.write_snapshot(snap)
                 pax = snap.get("pax") or {}
                 if pax and pax.get("decision"):
                     journal.write_signal(snap, pax)
                     n_signals += 1
+                if decision_action.get("action") == "placed_bracket":
+                    journal.write_event(
+                        "BRACKET_PLACED", "daemon",
+                        f"{decision_action.get('decision')} @ "
+                        f"{decision_action.get('level')} qty="
+                        f"{decision_action.get('qty')}",
+                        {"ids": decision_action.get("ids"),
+                         "entry": decision_action.get("entry_px"),
+                         "stop":  decision_action.get("stop_loss"),
+                         "tps":   decision_action.get("take_profits")})
+                # Tick actions (fills, TIF) also worth journaling at INFO level.
+                for act in (sim_result.get("actions") or []):
+                    if act.get("kind") in ("FILL", "STOP_TRIGGER",
+                                              "TIF_EXPIRE",
+                                              "EOD_AUTO_FLATTEN"):
+                        journal.write_event(
+                            act["kind"], "sim", f"order {act.get('id')}",
+                            act)
                 # Heartbeat every 10s of wall clock.
                 now = time.time()
                 if now - last_heartbeat > 10.0:

@@ -125,8 +125,11 @@ class SimEngine:
     def __init__(self, alias: str, db_path: Optional[Path] = None,
                  tick_size: float = NQ_TICK_PRICE,
                  tick_value_usd: float = NQ_TICK_VALUE_USD,
-                 eod_close_hour_ct: int = 15,
+                 eod_close_hour_ct: Optional[int] = 15,
                  eod_close_minute_ct: int = 0) -> None:
+        """`eod_close_hour_ct=None` disables auto-flatten entirely (useful in
+        tests so the wall-clock at test-run time can never trip the EOD
+        path)."""
         self.alias = alias
         self.tick_size = tick_size
         self.tick_value = tick_value_usd
@@ -560,10 +563,13 @@ class SimEngine:
         }
 
     def _maybe_eod_flatten(self, now_ms: Optional[int]) -> Optional[Dict[str, Any]]:
-        """If the current wall-clock is past RTH close for today's session and
-        we have not already flattened today, flatten the position and cancel
-        working orders. Idempotent — only fires once per session anchor.
-        Returns an action dict on fire, or None."""
+        """If the current wall-clock is past RTH close for today's session
+        and we have not already flattened today, close out the position
+        and cancel working orders. Idempotent — only fires once per
+        session anchor. Returns None when EOD is disabled
+        (`eod_close_hour_ct=None`) or before the close anchor."""
+        if self.eod_close_hour_ct is None:
+            return None
         anchor_ms = _today_rth_anchor_ms()
         if self._eod_flattened_anchor_ms == anchor_ms:
             return None

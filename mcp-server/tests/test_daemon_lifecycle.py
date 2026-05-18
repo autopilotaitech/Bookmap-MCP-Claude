@@ -150,3 +150,53 @@ def test_daemon_records_signal_version_in_run(monkeypatch, daemon_args):
     c.close()
     # CONVICTION_METHOD_VERSION = "anchored_multi_source_v2"
     assert "v2" in sv
+
+
+def test_daemon_places_paper_bracket_on_enter_decision(monkeypatch, daemon_args):
+    """End-to-end proof: when the decision pipeline emits ENTER_*, the
+    daemon calls decide_and_act which places the bracket on the SimEngine,
+    and the journal logs a BRACKET_PLACED event. Without this wiring the
+    daemon would compute decisions but never take paper trades — exactly
+    the bug that prompted this commit."""
+    monkeypatch.delenv("BOOKMAP_ALLOW_TRADING", raising=False)
+
+    captured = []
+    def fake_decide(snap, sim, use_claude=False):
+        # Actually place a bracket via the real sim engine so the order
+        # rows land in pax-daemon-trades.db.
+        ids = sim.place_bracket(
+            side="BUY", qty=1,
+            entry_stop=20100.0, entry_limit=20100.25,
+            stop_loss=19990.0, take_profits=[20150.0],
+            decision_tag="TEST_ENTER", reason="end-to-end test")
+        captured.append(ids)
+        return {
+            "action": "placed_bracket",
+            "decision": "ENTER_LONG_FOLLOW",
+            "size_tier": "FULL", "qty": 1, "side": "BUY",
+            "entry_px": 20100.0, "entry_limit": 20100.25,
+            "stop_loss": 19990.0, "take_profits": [20150.0],
+            "level": "OR-H", "ids": ids,
+        }
+    monkeypatch.setattr("bookmap_mcp.pax_daemon.decide_and_act", fake_decide)
+
+    daemon.run_daemon(daemon_args)
+
+    # 1. Journal has the BRACKET_PLACED event.
+    c = sqlite3.connect(str(daemon_args.journal))
+    kinds = {r[0] for r in c.execute(
+        "SELECT kind FROM events").fetchall()}
+    c.close()
+    assert "BRACKET_PLACED" in kinds
+
+    # 2. SimEngine actually has the working orders (entry + SL + TP).
+    assert captured, "fake_decide should have been called at least once"
+    c = sqlite3.connect(str(daemon_args.sim_db))
+    rows = c.execute(
+        "SELECT role, status FROM orders WHERE alias=?",
+        (daemon_args.alias,)).fetchall()
+    c.close()
+    roles = {r[0] for r in rows}
+    assert "ENTRY" in roles
+    assert "STOP" in roles
+    assert "TP" in roles
