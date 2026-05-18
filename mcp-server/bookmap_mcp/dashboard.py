@@ -1917,17 +1917,79 @@ def _source_micro_events(snap: Dict[str, Any]) -> Dict[str, Any]:
             "reason": ",".join(hits[:5]) if hits else "no signed events"}
 
 
+# V9: level_reaction trajectory cache. Tracks the source's own score delta
+# poll-over-poll so the registry contribution gets the same nudge/divergence
+# treatment as the conviction slow prior in V8.
+_LAST_LEVEL_REACTION: Dict[str, Tuple[float, float]] = {}     # alias → (score, monotonic_ts)
+_LEVEL_REACTION_TRAJ_NUDGE = {
+    "RISING_STRONG":  +0.10,
+    "RISING":         +0.05,
+    "FLAT":            0.00,
+    "FALLING":        -0.05,
+    "FALLING_STRONG": -0.10,
+}
+_LEVEL_REACTION_TRAJ_STRONG_DELTA = 0.10
+_LEVEL_REACTION_TRAJ_NORMAL_DELTA = 0.03
+_LEVEL_REACTION_MAX_DT_SEC = 60.0
+
+
 def _source_level_reaction(snap: Dict[str, Any]) -> Dict[str, Any]:
     or_levels = snap.get("or_levels")
     if not or_levels or (isinstance(or_levels, dict) and "_error" in or_levels):
         return {"score": 0.0, "reliability": 0.0, "raw": {}, "reason": "no or_levels"}
-    score = _level_to_signal(or_levels)
+    raw_score = _level_to_signal(or_levels)
     in_prox = bool(or_levels.get("inProximity"))
     # Without proximity the level model has no edge — keep reliability low.
     reliability = 1.0 if in_prox else 0.3
-    return {"score": _clip(score), "reliability": reliability,
-            "raw": {"inProximity": in_prox, "middleLock": or_levels.get("middleLock")},
-            "reason": f"level reaction={score:+.2f} prox={in_prox}"}
+
+    # ----- trajectory awareness (V9) -----
+    alias = snap.get("alias")
+    now_ts = time.monotonic()
+    traj = "FLAT"
+    delta = 0.0
+    if alias:
+        prev = _LAST_LEVEL_REACTION.get(alias)
+        if prev is not None:
+            prev_score, prev_ts = prev
+            dt_sec = now_ts - prev_ts
+            if 0 < dt_sec <= _LEVEL_REACTION_MAX_DT_SEC:
+                delta = raw_score - prev_score
+                a = abs(delta)
+                if a > _LEVEL_REACTION_TRAJ_STRONG_DELTA:
+                    traj = "RISING_STRONG" if delta > 0 else "FALLING_STRONG"
+                elif a > _LEVEL_REACTION_TRAJ_NORMAL_DELTA:
+                    traj = "RISING" if delta > 0 else "FALLING"
+        _LAST_LEVEL_REACTION[alias] = (raw_score, now_ts)
+
+    nudge = _LEVEL_REACTION_TRAJ_NUDGE.get(traj, 0.0)
+    final_score = _clip(raw_score + nudge)
+
+    # Divergence: raw score sign vs trajectory sign.
+    score_sign = 1 if raw_score > 0.05 else (-1 if raw_score < -0.05 else 0)
+    traj_sign = (1 if traj in ("RISING", "RISING_STRONG")
+                  else -1 if traj in ("FALLING", "FALLING_STRONG")
+                  else 0)
+    diverged = (score_sign != 0 and traj_sign != 0 and score_sign != traj_sign)
+    if diverged:
+        if traj in ("RISING_STRONG", "FALLING_STRONG"):
+            reliability *= 0.5
+        else:
+            reliability *= 0.75
+
+    reason = f"level reaction={raw_score:+.2f} prox={in_prox} traj={traj}"
+    if abs(nudge) > 0:
+        reason += f" nudge={nudge:+.2f}"
+    if diverged:
+        reason += " (DIVERGED)"
+
+    return {"score": final_score,
+            "reliability": reliability,
+            "raw": {"inProximity": in_prox,
+                    "middleLock": or_levels.get("middleLock"),
+                    "trajectory": traj,
+                    "delta": round(delta, 3),
+                    "raw_score": round(raw_score, 3)},
+            "reason": reason}
 
 
 def _source_anchored_vwap_opening_drive(snap: Dict[str, Any]) -> Dict[str, Any]:

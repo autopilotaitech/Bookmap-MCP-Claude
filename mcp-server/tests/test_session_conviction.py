@@ -507,6 +507,108 @@ def test_vwap_or_gate_has_weight_in_vwap_cluster():
         "vwap_or_gate missing from vwap cluster")
 
 
+# ─── V9: level_reaction trajectory awareness ────────────────────────────────
+
+def _proximity_snap(alias: str, decision: str, confidence: float = 0.8) -> dict:
+    """Build a minimal or_levels snap with one in-proximity level voting
+    in the given direction."""
+    return {"alias": alias, "or_levels": {
+        "inProximity": True,
+        "middleLock":  False,
+        "levels": [{"label": "OR-H", "side": "above", "price": 100.0,
+                    "proximity": True, "decision": decision,
+                    "confidence": confidence}],
+    }}
+
+
+def _seed_level_reaction_cache(alias: str, score: float, age_sec: float = 1.0):
+    """Place a synthetic previous-poll entry so the trajectory math can run
+    against a known starting point."""
+    import time as _t
+    d._LAST_LEVEL_REACTION[alias] = (score, _t.monotonic() - age_sec)
+
+
+def test_level_reaction_first_call_is_flat_no_nudge():
+    """No prior reading → trajectory FLAT → no nudge."""
+    d._LAST_LEVEL_REACTION.clear()
+    snap = _proximity_snap("NQM6", "ENTER_LONG_FOLLOW")
+    out = d._source_level_reaction(snap)
+    assert out["raw"]["trajectory"] == "FLAT"
+    # raw_score is 0.8 (one in-prox long vote at confidence 0.8) → final stays 0.8.
+    assert out["score"] == pytest.approx(0.8, abs=1e-6)
+
+
+def test_level_reaction_rising_strong_adds_nudge():
+    d._LAST_LEVEL_REACTION.clear()
+    _seed_level_reaction_cache("NQM6", score=0.5)   # previous raw_score 0.5
+    snap = _proximity_snap("NQM6", "ENTER_LONG_FOLLOW", confidence=0.8)
+    out = d._source_level_reaction(snap)
+    # delta = 0.8 - 0.5 = 0.30 → RISING_STRONG
+    assert out["raw"]["trajectory"] == "RISING_STRONG"
+    # final = clip(0.8 + 0.10) = 0.90
+    assert out["score"] == pytest.approx(0.90, abs=1e-9)
+    assert "nudge=+0.10" in out["reason"]
+
+
+def test_level_reaction_falling_strong_with_positive_score_diverges():
+    """Positive score + sharply falling trajectory = exhaustion → reliability cut."""
+    d._LAST_LEVEL_REACTION.clear()
+    _seed_level_reaction_cache("NQM6", score=0.95)
+    snap = _proximity_snap("NQM6", "ENTER_LONG_FOLLOW", confidence=0.5)
+    out = d._source_level_reaction(snap)
+    # delta = 0.5 - 0.95 = -0.45 → FALLING_STRONG; raw_score 0.5 > 0 → divergence
+    assert out["raw"]["trajectory"] == "FALLING_STRONG"
+    assert "DIVERGED" in out["reason"]
+    # In-prox base reliability is 1.0 × 0.5 (strong divergence) = 0.5.
+    assert out["reliability"] == pytest.approx(0.5, abs=1e-9)
+
+
+def test_level_reaction_mild_divergence_cuts_reliability_partially():
+    d._LAST_LEVEL_REACTION.clear()
+    _seed_level_reaction_cache("NQM6", score=0.85)
+    snap = _proximity_snap("NQM6", "ENTER_LONG_FOLLOW", confidence=0.8)
+    out = d._source_level_reaction(snap)
+    # delta = 0.8 - 0.85 = -0.05 → FALLING (mild); raw_score 0.8 > 0 → diverged
+    assert out["raw"]["trajectory"] == "FALLING"
+    assert out["reliability"] == pytest.approx(0.75, abs=1e-9)
+
+
+def test_level_reaction_stale_cache_resets_to_flat():
+    """Entry older than 60s shouldn't anchor trajectory — fresh polls only."""
+    d._LAST_LEVEL_REACTION.clear()
+    _seed_level_reaction_cache("NQM6", score=0.0, age_sec=120.0)
+    snap = _proximity_snap("NQM6", "ENTER_LONG_FOLLOW", confidence=0.8)
+    out = d._source_level_reaction(snap)
+    assert out["raw"]["trajectory"] == "FLAT"
+    assert "nudge" not in out["reason"]
+
+
+def test_level_reaction_missing_alias_no_crash_no_trajectory():
+    """Without alias in snap we can't key the cache — must still work,
+    just permanently FLAT for that snap."""
+    d._LAST_LEVEL_REACTION.clear()
+    snap = {"or_levels": {
+        "inProximity": True, "middleLock": False,
+        "levels": [{"proximity": True, "decision": "ENTER_LONG_FOLLOW",
+                     "confidence": 0.8}]}}
+    out = d._source_level_reaction(snap)
+    assert out["raw"]["trajectory"] == "FLAT"
+    # No alias → cache untouched.
+    assert d._LAST_LEVEL_REACTION == {}
+
+
+def test_level_reaction_confirming_trajectory_keeps_full_reliability():
+    """Positive score + RISING trajectory: no divergence, full reliability."""
+    d._LAST_LEVEL_REACTION.clear()
+    _seed_level_reaction_cache("NQM6", score=0.6)
+    snap = _proximity_snap("NQM6", "ENTER_LONG_FOLLOW", confidence=0.7)
+    out = d._source_level_reaction(snap)
+    # delta = 0.7 - 0.6 = +0.10 → exactly at strong boundary, falls to RISING.
+    assert out["raw"]["trajectory"] in ("RISING", "RISING_STRONG")
+    assert "DIVERGED" not in out["reason"]
+    assert out["reliability"] == 1.0
+
+
 def test_flow_ofi_sign_matches_z():
     assert d._source_flow_ofi({"flow": {"ofiZ": 2.0}})["score"] > 0.0
     assert d._source_flow_ofi({"flow": {"ofiZ": -2.0}})["score"] < 0.0
