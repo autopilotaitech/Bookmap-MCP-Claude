@@ -1,0 +1,20 @@
+{
+  "_comment": "Macro / earnings blackout calendar. Add entries by hand or via a weekly skill. Times in HH:MM ET.",
+  "_note_on_types": "Common types: FOMC, CPI, PPI, NFP, ISM_MFG, ISM_SVC, GDP, PCE, FOMC_MINUTES, JOBLESS_CLAIMS, NVDA_EARN, AAPL_EARN, MSFT_EARN, GOOGL_EARN, META_EARN, AMZN_EARN. Blackout windows are recommendations, not gospel.",
+  "blackouts": [
+    {
+      "date": "2026-05-18",
+      "type": "EXAMPLE_FOMC_DAY",
+      "blackout_start": "08:30",
+      "blackout_end": "10:00",
+      "notes": "Delete or replace this example. Block first 30 min after macro print so OR has time to re-form."
+    },
+    {
+      "date": "2026-05-18",
+      "type": "EXAMPLE_FOMC_DAY_AFTERNOON",
+      "blackout_start": "13:30",
+      "blackout_end": "15:30",
+      "notes": "Block the actual FOMC statement + presser window."
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+plugins {
+    id "java"
+}
+
+group = "com.bookmapmcp"
+version = "2.0.0"
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+dependencies {
+    compileOnly "com.bookmap.api:api-core:7.4.0.21"
+    compileOnly "com.bookmap.api:api-simplified:7.4.0.21"
+
+    testCompileOnly "com.bookmap.api:api-core:7.4.0.21"
+    testCompileOnly "com.bookmap.api:api-simplified:7.4.0.21"
+    testRuntimeOnly "com.bookmap.api:api-core:7.4.0.21"
+    testRuntimeOnly "com.bookmap.api:api-simplified:7.4.0.21"
+    testImplementation "org.junit.jupiter:junit-jupiter-api:5.10.2"
+    testRuntimeOnly "org.junit.jupiter:junit-jupiter-engine:5.10.2"
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = "UTF-8"
+}
+
+test {
+    useJUnitPlatform()
+}
+
+jar {
+    archiveFileName = "bookmap-mcp-bridge-v2.jar"
+}

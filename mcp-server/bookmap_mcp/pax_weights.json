@@ -1,0 +1,53 @@
+{
+  "_comment": "Pax weight configuration. Updated by reviewing pax_replay output and manually editing this file. Restart dashboard to pick up changes.",
+  "_version": 1,
+  "_last_updated": "2026-05-17",
+
+  "conviction_weights": {
+    "_comment": "ib placeholder returns 0 always — redistributed its 5% to level so book reaction (fast component) gets 0.15. regime kept at 0.25 (top quant signal). bias/vwap/vp/slope/level all at 0.15 for balance.",
+    "regime": 0.25,
+    "bias":   0.15,
+    "vwap":   0.15,
+    "vp":     0.15,
+    "slope":  0.15,
+    "level":  0.15,
+    "ib":     0.00
+  },
+
+  "conviction_halflife_sec": {
+    "_comment": "Tuned for rotations. Old config (vp=600,vwap=420) was too slow — a 5-min rotation up only charged the VP EMA to ~30% of instantaneous, leaving composite stuck in MIXED/CHOP. New halflives let the score climb meaningfully within 2-3 min of a real move.",
+    "regime": 120,
+    "bias":   120,
+    "vwap":   240,
+    "vp":     360,
+    "slope":  180,
+    "level":   90,
+    "ib":    7200
+  },
+
+  "regime_boost": {
+    "TRENDING_UP":     {"long_follow": 1.20, "short_follow": 0.50, "fade": 0.70},
+    "TRENDING_DOWN":   {"long_follow": 0.50, "short_follow": 1.20, "fade": 0.70},
+    "ABSORPTION_BID":  {"long_follow": 0.80, "short_follow": 0.40, "long_fade":  1.30, "short_fade": 0.40},
+    "ABSORPTION_ASK":  {"long_follow": 0.40, "short_follow": 0.80, "short_fade": 1.30, "long_fade":  0.40},
+    "EXHAUSTION_UP":   {"long_follow": 0.20, "short_fade": 1.30, "short_follow": 0.80, "long_fade": 0.40},
+    "EXHAUSTION_DOWN": {"short_follow": 0.20, "long_fade":  1.30, "long_follow":  0.80, "short_fade":0.40},
+    "BALANCED":        {"any": 0.80},
+    "QUIET":           {"any": 0.30},
+    "WARMUP":          {"any": 1.00}
+  },
+
+  "confidence_thresholds": {
+    "floor": 0.35,
+    "full":  0.50,
+    "half":  0.35
+  },
+
+  "subgroup_overrides": {
+    "_comment": "Per-subgroup multipliers applied AFTER regime boost. Populated by pax_replay --recommend after enough sessions of data.",
+    "examples": {
+      "ENTER_LONG_FADE@OR-L|vwapBias=BULLISH":  {"multiplier": 1.30, "reason": "90% winrate in n=10 sessions"},
+      "ENTER_LONG_FADE@OR-L|vwapBias=NEUTRAL":  {"multiplier": 0.50, "reason": "40% winrate in n=5 sessions"}
+    }
+  }
+}
