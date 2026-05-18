@@ -108,12 +108,18 @@ change. `_*`-prefixed keys are metadata comments stripped by
 ## Code layout pointers
 
 - `mcp-server/bookmap_mcp/dashboard.py` — snapshot composer (`fetch_snapshot`),
-  `compute_or_levels`, `compute_vwap_bias`, `compute_vp_bias`, `trade_decision`,
-  `compute_session_conviction`, `_sync_magnet_levels`. ~3000 lines, audited heavily.
+  `compute_or_levels` (per-magnet `composite` via `_level_composite`),
+  `compute_tape_flow`, `compute_vwap_bias`, `compute_vp_bias`, `trade_decision`,
+  `compute_session_conviction`, `_sync_magnet_levels`. ~3500 lines, audited heavily.
+- `_level_composite(side, price, mid, snap)` returns `{score, direction,
+  confidence, drivers[], warnings[]}` per OR / extension magnet. 8 drivers,
+  weights in `_LVL_W`. Direction = FOLLOW_LONG / FOLLOW_SHORT / FADE_LONG /
+  FADE_SHORT / WAIT by row side. Slow-prior conviction comes from
+  `_LAST_CONVICTION[alias]` cache to break the single-poll cycle.
 - Session conviction is the v2 anchored multi-source engine. State per alias
   in `_CONVICTION_STATE`. Source helpers under the `_source_*` prefix return
-  `{score, reliability, raw, reason}`. See `mcp-server/README.md` for the
-  cluster table.
+  `{score, reliability, raw, reason}`. 17 sources after v7. See
+  `mcp-server/README.md` for the cluster table.
 - Legacy `_regime_to_signal`, `_slope_to_signal`, `_level_to_signal` are
   preserved and reused by v2 sources — don't refactor them away without
   updating the pinned helper-signal tests.
@@ -160,6 +166,34 @@ dashboard-driven bridge configuration call. Pattern:
 5. Outer try/except at the call site in `fetch_snapshot` guarantees a sync
    failure can never break snapshot composition.
 
+### Trajectory modulation (V8 / V9 / V10)
+
+Three conviction sources modulate their score+reliability using a trajectory
+label. Same shape everywhere:
+
+```text
+nudge: ±0.10 max additive to score
+       RISING_STRONG +0.10, RISING +0.05, FLAT 0, FALLING -0.05, FALLING_STRONG -0.10
+divergence: when score sign disagrees with trajectory sign,
+            reliability × 0.5 (strong) or × 0.75 (mild)
+```
+
+Where the trajectory comes from per source:
+
+- V8 `_conviction_at_level` — reads `conviction.trajectory` (FlowRegime upstream).
+- V9 `_source_level_reaction` — own poll-to-poll score delta via
+  `_LAST_LEVEL_REACTION[alias]`, 60s stale window. **Source-specific
+  trajectory; no upstream equivalent.**
+- V10 `_source_bias_score` — reads `flow.biasTrajectory` (FlowRegime upstream).
+
+**Don't add trajectory awareness to every source.** Direct-read static
+sources (`orderbook`, `lt_liquidity`, `volume_profile`, `vwap_dislocation`,
+`ib_context`) do not benefit — they're snapshots, not processes. And before
+adding a Python-side delta tracker, check whether the upstream payload
+already includes the classifier (FlowRegime emits `biasTrajectory`,
+`regime`, `regimeConfidence`, z-scores). The V10 fix removed a duplicate
+classifier; net -34 lines, no functionality change.
+
 ## Git etiquette
 
 - Single-line commit subject in conventional style (e.g. `conviction: rebuild
@@ -177,3 +211,11 @@ dashboard-driven bridge configuration call. Pattern:
 - Don't refactor `dashboard.py` without backing up. It's the production hub.
 - Don't reformat or "tidy" Unicode in files that already use it; the user
   diffs these manually.
+- Don't reinvent upstream classifications in Python. If FlowRegime,
+  MomentumSnapshot, or any Java handler already emits the derived field
+  (trajectory, regime, z-score, σ-band), READ it. Python-side caches
+  belong to dashboard-process-local state only.
+- Don't add trajectory modulation to direct-read static sources. The
+  pattern fits slow/anchored signals (`conviction`, `bias_score`,
+  `level_reaction`). Adding it to `orderbook` / `lt_liquidity` /
+  `volume_profile` would be bloat — they're snapshots, not processes.
