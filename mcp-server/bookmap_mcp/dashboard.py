@@ -1361,7 +1361,7 @@ def _load_pax_weights() -> Dict[str, Any]:
     into the conviction math (the weight-dict iteration would otherwise raise
     KeyError on st['ema']['_comment']).
     """
-    global _PAX_WEIGHTS_CACHE, _PAX_WEIGHTS_MTIME
+    global _PAX_WEIGHTS_MTIME
     defaults = {
         "conviction_weights": {"regime":0.25,"bias":0.15,"vwap":0.15,"vp":0.15,
                                 "slope":0.15,"level":0.15,"ib":0.00},
@@ -1377,10 +1377,14 @@ def _load_pax_weights() -> Dict[str, Any]:
             with open(_PAX_WEIGHTS_PATH, "r", encoding="utf-8") as fh:
                 loaded = _strip_meta(json.load(fh))
             for k, v in defaults.items(): loaded.setdefault(k, v)
-            _PAX_WEIGHTS_CACHE = loaded
+            # Mutate in place — preserve dict identity so facade re-exports
+            # (signal_engine._PAX_WEIGHTS_CACHE) see the same updates.
+            _PAX_WEIGHTS_CACHE.clear()
+            _PAX_WEIGHTS_CACHE.update(loaded)
             _PAX_WEIGHTS_MTIME = mt
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        if not _PAX_WEIGHTS_CACHE: _PAX_WEIGHTS_CACHE = defaults
+        if not _PAX_WEIGHTS_CACHE:
+            _PAX_WEIGHTS_CACHE.update(defaults)
     return _PAX_WEIGHTS_CACHE
 
 # Legacy EMA-model constants — kept for backward compatibility with the
