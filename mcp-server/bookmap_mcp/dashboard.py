@@ -1634,11 +1634,11 @@ def _source_regime(snap: Dict[str, Any]) -> Dict[str, Any]:
             "reason": f"{regime} conf={conf:.2f}" if conf_ok else regime}
 
 
-# V10: bias_score trajectory cache. Same shape as V9's level_reaction cache.
-# bias_score rolls every 30s when FlowRegime closes a window, so most polls
-# see delta=0 and trajectory FLAT — meaningful trajectory fires precisely
-# when the FlowRegime window rolls with a different bias.
-_LAST_BIAS_SCORE: Dict[str, Tuple[float, float]] = {}
+# V10 (fixed): bias_score trajectory is read directly from FlowRegime's own
+# 3-bucket SMA-slope classifier (`flow.biasTrajectory`), not recomputed in
+# Python from poll-to-poll deltas. FlowRegime updates every 30s window roll
+# upstream; the dashboard polls at ~1Hz, so a parallel delta tracker would
+# see delta=0 between rolls and reinvent the classifier worse.
 _BIAS_SCORE_TRAJ_NUDGE = {
     "RISING_STRONG":  +0.10,
     "RISING":         +0.05,
@@ -1646,9 +1646,6 @@ _BIAS_SCORE_TRAJ_NUDGE = {
     "FALLING":        -0.05,
     "FALLING_STRONG": -0.10,
 }
-_BIAS_SCORE_TRAJ_STRONG_DELTA = 0.10
-_BIAS_SCORE_TRAJ_NORMAL_DELTA = 0.03
-_BIAS_SCORE_MAX_DT_SEC = 60.0
 
 
 def _source_bias_score(snap: Dict[str, Any]) -> Dict[str, Any]:
@@ -1660,29 +1657,12 @@ def _source_bias_score(snap: Dict[str, Any]) -> Dict[str, Any]:
 
     raw_score = _clip(bs)
     reliability = 1.0
-
-    # ----- trajectory awareness (V10) -----
-    alias = snap.get("alias")
-    now_ts = time.monotonic()
-    traj = "FLAT"
-    delta = 0.0
-    if alias:
-        prev = _LAST_BIAS_SCORE.get(alias)
-        if prev is not None:
-            prev_score, prev_ts = prev
-            dt_sec = now_ts - prev_ts
-            if 0 < dt_sec <= _BIAS_SCORE_MAX_DT_SEC:
-                delta = raw_score - prev_score
-                a = abs(delta)
-                if a > _BIAS_SCORE_TRAJ_STRONG_DELTA:
-                    traj = "RISING_STRONG" if delta > 0 else "FALLING_STRONG"
-                elif a > _BIAS_SCORE_TRAJ_NORMAL_DELTA:
-                    traj = "RISING" if delta > 0 else "FALLING"
-        _LAST_BIAS_SCORE[alias] = (raw_score, now_ts)
+    traj = (flow.get("biasTrajectory") or "FLAT").upper()
 
     nudge = _BIAS_SCORE_TRAJ_NUDGE.get(traj, 0.0)
     final_score = _clip(raw_score + nudge)
 
+    # Divergence: score sign disagrees with trajectory sign (top-out / bottom-out tell).
     score_sign = 1 if raw_score > 0.05 else (-1 if raw_score < -0.05 else 0)
     traj_sign = (1 if traj in ("RISING", "RISING_STRONG")
                   else -1 if traj in ("FALLING", "FALLING_STRONG")
@@ -1702,8 +1682,7 @@ def _source_bias_score(snap: Dict[str, Any]) -> Dict[str, Any]:
 
     return {"score": final_score,
             "reliability": reliability,
-            "raw": {"biasScore": bs, "trajectory": traj,
-                    "delta": round(delta, 3)},
+            "raw": {"biasScore": bs, "trajectory": traj},
             "reason": reason}
 
 
