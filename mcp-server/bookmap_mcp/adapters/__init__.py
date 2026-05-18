@@ -8,9 +8,10 @@ from .base import (
 )
 from .csv_replay import CsvReplayAdapter, csv_row_to_snapshot
 from .file_tail import FileTailAdapter
+from .bookmap_live import BookmapLiveAdapter
 
 __all__ = [
     "AdapterHealth", "DataAdapter", "Snapshot",
-    "CsvReplayAdapter", "FileTailAdapter",
+    "CsvReplayAdapter", "FileTailAdapter", "BookmapLiveAdapter",
     "csv_row_to_snapshot",
 ]
