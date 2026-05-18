@@ -1727,6 +1727,49 @@ def _tape_source_from_flow(tf: Dict[str, Any], *, fallback: bool) -> Dict[str, A
             "reason": tf.get("deltaReason", f"tape delta={score:+.2f}")}
 
 
+def _source_vwap_or_gate(snap: Dict[str, Any]) -> Dict[str, Any]:
+    """Directional gate from the VWAP/OR alignment check. Reads
+    snap['gates']['vwap_or'] computed by vwap_or_gate(): the gate fires
+    ALLOW_LONG when OR center > session VWAP AND mid >= VWAP, ALLOW_SHORT
+    on the symmetric short setup, BLOCKED when they disagree, UNKNOWN when
+    inputs are missing.
+
+    Used here as a context prior — a coarse directional sanity check on
+    the day's regime, not a fast signal. Score magnitude is fixed (±0.5)
+    so it can never dominate continuous signals; cluster cap further
+    normalizes against the other vwap sources.
+    """
+    gates = snap.get("gates")
+    if not isinstance(gates, dict):
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": {}, "reason": "no gates"}
+    gate = gates.get("vwap_or")
+    if not isinstance(gate, dict):
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": {"vwap_or": gate}, "reason": "no vwap_or gate"}
+    state = (gate.get("state") or "UNKNOWN").upper()
+    why = gate.get("reason", "")
+    if state == "ALLOW_LONG":
+        return {"score": 0.5, "reliability": 1.0,
+                "raw": {"state": state, "reason": why},
+                "reason": f"vwap_or ALLOW_LONG ({why})"}
+    if state == "ALLOW_SHORT":
+        return {"score": -0.5, "reliability": 1.0,
+                "raw": {"state": state, "reason": why},
+                "reason": f"vwap_or ALLOW_SHORT ({why})"}
+    if state == "BLOCKED":
+        # Gate has a definite read (data present, OR and mid disagree on the
+        # VWAP side). Reliability stays at 1.0 — but score is 0, no
+        # directional contribution. Communicates "regime is mixed".
+        return {"score": 0.0, "reliability": 1.0,
+                "raw": {"state": state, "reason": why},
+                "reason": f"vwap_or BLOCKED ({why})"}
+    # UNKNOWN: gate inputs are missing (no OR, no VWAP, no live mid).
+    return {"score": 0.0, "reliability": 0.0,
+            "raw": {"state": state, "reason": why},
+            "reason": f"vwap_or {state}"}
+
+
 def _source_orderbook(snap: Dict[str, Any]) -> Dict[str, Any]:
     """Static orderbook depth pressure. Reads bookPressureTop5/25 from the
     /momentum payload — both are (bid_vol - ask_vol) / total in [-1,+1].
@@ -1913,6 +1956,7 @@ _CONVICTION_SOURCES: Dict[str, Any] = {
     "bias_score":                  _source_bias_score,
     "vwap_dislocation":            _source_vwap_dislocation,
     "vwap_slope":                  _source_vwap_slope,
+    "vwap_or_gate":                _source_vwap_or_gate,
     "volume_profile":              _source_volume_profile,
     "pull_stack":                  _source_pull_stack,
     "tape_large_lot":              _source_tape_large_lot,

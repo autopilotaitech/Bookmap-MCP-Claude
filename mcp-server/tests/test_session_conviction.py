@@ -451,6 +451,62 @@ def test_orderbook_has_weight_in_microstructure_cluster():
         "orderbook missing from microstructure cluster")
 
 
+# ─── VWAP/OR gate source (V7) ──────────────────────────────────────────────
+
+def test_source_vwap_or_gate_allow_long_is_bullish():
+    snap = {"gates": {"vwap_or": {
+        "state": "ALLOW_LONG", "reason": "OR > VWAP, mid >= VWAP"}}}
+    out = d._source_vwap_or_gate(snap)
+    assert out["score"] == 0.5
+    assert out["reliability"] == 1.0
+
+
+def test_source_vwap_or_gate_allow_short_is_bearish():
+    snap = {"gates": {"vwap_or": {
+        "state": "ALLOW_SHORT", "reason": "OR < VWAP, mid <= VWAP"}}}
+    out = d._source_vwap_or_gate(snap)
+    assert out["score"] == -0.5
+    assert out["reliability"] == 1.0
+
+
+def test_source_vwap_or_gate_blocked_has_full_reliability_zero_score():
+    """BLOCKED means data is fully present but regime is mixed — the gate
+    has a real read and contributes a directional zero (not 'unknown')."""
+    snap = {"gates": {"vwap_or": {
+        "state": "BLOCKED", "reason": "OR and mid disagree on VWAP side"}}}
+    out = d._source_vwap_or_gate(snap)
+    assert out["score"] == 0.0
+    assert out["reliability"] == 1.0
+
+
+def test_source_vwap_or_gate_unknown_is_zero_reliability():
+    snap = {"gates": {"vwap_or": {"state": "UNKNOWN", "reason": "no live mid"}}}
+    assert d._source_vwap_or_gate(snap)["reliability"] == 0.0
+
+
+def test_source_vwap_or_gate_missing_payload_is_zero_reliability():
+    assert d._source_vwap_or_gate({})["reliability"] == 0.0
+    assert d._source_vwap_or_gate({"gates": {}})["reliability"] == 0.0
+    assert d._source_vwap_or_gate({"gates": {"vwap_or": None}})["reliability"] == 0.0
+
+
+def test_vwap_or_gate_is_registered_in_conviction_registry():
+    assert "vwap_or_gate" in d._CONVICTION_SOURCES
+    out = d._CONVICTION_SOURCES["vwap_or_gate"]({"gates":
+        {"vwap_or": {"state": "ALLOW_LONG", "reason": "test"}}})
+    for k in ("score", "reliability", "raw", "reason"):
+        assert k in out
+
+
+def test_vwap_or_gate_has_weight_in_vwap_cluster():
+    cfg = d._load_pax_weights()
+    sw = cfg.get("conviction_source_weights") or {}
+    clusters = cfg.get("conviction_clusters") or {}
+    assert sw.get("vwap_or_gate", 0.0) > 0.0, "vwap_or_gate missing from source weights"
+    assert "vwap_or_gate" in (clusters.get("vwap") or []), (
+        "vwap_or_gate missing from vwap cluster")
+
+
 def test_flow_ofi_sign_matches_z():
     assert d._source_flow_ofi({"flow": {"ofiZ": 2.0}})["score"] > 0.0
     assert d._source_flow_ofi({"flow": {"ofiZ": -2.0}})["score"] < 0.0

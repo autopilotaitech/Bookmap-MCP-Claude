@@ -14,6 +14,7 @@
     "bias_score":                  0.08,
     "vwap_dislocation":            0.08,
     "vwap_slope":                  0.08,
+    "vwap_or_gate":                0.04,
     "volume_profile":              0.08,
     "pull_stack":                  0.10,
     "tape_large_lot":              0.06,
@@ -28,7 +29,7 @@
   "conviction_clusters": {
     "_comment": "Correlation clusters. Sources not listed here are unclustered (no cap). Effective weights inside a cluster are scaled down proportionally if their absolute sum exceeds the cluster cap.",
     "flow":           ["flow_ofi", "flow_cvd", "bias_score", "regime"],
-    "vwap":           ["vwap_dislocation", "vwap_slope", "anchored_vwap_opening_drive"],
+    "vwap":           ["vwap_dislocation", "vwap_slope", "vwap_or_gate", "anchored_vwap_opening_drive"],
     "structure":      ["volume_profile", "ib_context"],
     "microstructure": ["pull_stack", "tape_large_lot", "orderbook", "lt_liquidity", "micro_events"]
   },
