@@ -145,119 +145,133 @@ class CsvReplayAdapter:
     # ─── row → snapshot ──────────────────────────────────────────────
 
     def _row_to_snapshot(self, row: Dict[str, str]) -> Snapshot:
-        synthetic: List[str] = []
-
-        # ── timestamp ──
-        ts_iso = _row_get(row, "ts_iso", "ts_utc", "ts")
-        ts_ms = _parse_int(_row_get(row, "ts_ms"))
-        if ts_ms is None and ts_iso:
-            try:
-                # Accept ISO with or without timezone.
-                t = dt.datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
-                ts_ms = int(t.timestamp() * 1000)
-            except (ValueError, TypeError):
-                ts_ms = None
-        if ts_ms is not None:
-            self._last_snapshot_ms = ts_ms
-
-        # ── alias ──
-        alias = _row_get(row, "alias", "symbol") or self._alias_default
-
-        # ── book ──
-        mid = _parse_float(_row_get(row, "mid"))
-        bid = _parse_float(_row_get(row, "bid", "best_bid", "bestbid"))
-        ask = _parse_float(_row_get(row, "ask", "best_ask", "bestask"))
-        if mid is None and bid is not None and ask is not None:
-            mid = (bid + ask) / 2.0
-            synthetic.append("book.mid")
-        if bid is None and mid is not None:
-            bid = mid - self.default_tick / 2.0
-            synthetic.append("book.bestBid")
-        if ask is None and mid is not None:
-            ask = mid + self.default_tick / 2.0
-            synthetic.append("book.bestAsk")
-        spread = (ask - bid) if (ask is not None and bid is not None) else None
-        book: Dict[str, Any] = {"bestBid": bid, "bestAsk": ask,
-                                  "mid": mid, "spread": spread}
-
-        # ── trades ──
-        # Prefer an explicit print row if present.
-        trades: List[Dict[str, Any]] = []
-        t_price = _parse_float(_row_get(row, "trade_price", "print_price"))
-        t_size  = _parse_int(_row_get(row, "trade_size", "print_size")) or 1
-        t_side  = (_row_get(row, "trade_side", "print_side") or "").lower()
-        if t_price is not None:
-            trades.append({"price": t_price, "size": t_size,
-                            "side": t_side, "nanos": self._synth_nanos(ts_ms)})
-        elif mid is not None and self._last_mid is not None and mid != self._last_mid:
-            # Synthesize a single print at the new mid, side from direction.
-            side = "buy" if mid > self._last_mid else "sell"
-            trades.append({"price": mid, "size": 1, "side": side,
-                            "nanos": self._synth_nanos(ts_ms)})
-            synthetic.append("trades")
-        if mid is not None:
-            self._last_mid = mid
-
-        # ── OR row ──
-        or_high = _parse_float(_row_get(row, "or_high", "orhigh"))
-        or_low  = _parse_float(_row_get(row, "or_low", "orlow"))
-        or_row: Optional[Dict[str, Any]] = None
-        if or_high is not None and or_low is not None:
-            or_row = {"orHigh": str(or_high), "orLow": str(or_low),
-                       "orWidthPts": or_high - or_low}
-
-        # ── VWAP ──
-        vwap = _parse_float(_row_get(row, "vwap"))
-        vwap_stddev = _parse_float(_row_get(row, "vwap_stddev", "vwap_sigma"))
-        vwap_obj: Optional[Dict[str, Any]] = None
-        if vwap is not None:
-            vwap_obj = {"vwap": vwap, "stddev": vwap_stddev or 0.0,
-                         "lastTradePrice": mid}
-            if vwap_stddev is None:
-                synthetic.append("vwap_obj.stddev")
-
-        # ── flow ──
-        flow: Dict[str, Any] = {}
-        col_map = [
-            ("regime",          "regime",            False),
-            ("regime_conf",     "regimeConfidence",  True),
-            ("bias_score",      "biasScore",         True),
-            ("bias_trajectory", "biasTrajectory",    False),
-            ("ofi_z",           "ofiZ",              True),
-            ("cvd_delta_z",     "cvdDeltaZ",         True),
-            ("vpt_z",           "vptZ",              True),
-        ]
-        for src_col, dst_key, as_float in col_map:
-            raw = _row_get(row, src_col)
-            if raw is None: continue
-            if as_float:
-                v = _parse_float(raw)
-                if v is not None:
-                    flow[dst_key] = v
-            else:
-                flow[dst_key] = raw
-
-        snap: Snapshot = {
-            "alias":       alias,
-            "health":      "ok",
-            "ts":          ts_iso or (
-                dt.datetime.fromtimestamp(ts_ms / 1000, tz=dt.timezone.utc).isoformat()
-                if ts_ms else ""),
-            "book":        book,
-            "trades":      trades,
-            "or_row":      or_row,
-            "vwap_obj":    vwap_obj,
-            "flow":        flow or None,
-            "gates":       {},      # caller (daemon) fills from session_state()
-            "_source":     self.name,
-            "_synthetic":  synthetic,
-        }
+        """Convert one CSV row to a snapshot, threading instance state
+        (last_mid + synth counter) into the shared converter."""
+        state = {"last_mid": self._last_mid,
+                 "synth_nanos": self._synthesized_nanos,
+                 "last_snapshot_ms": self._last_snapshot_ms}
+        snap = csv_row_to_snapshot(row, alias_default=self._alias_default,
+                                     default_tick=self.default_tick,
+                                     state=state, source_name=self.name)
+        # Pull stateful counters back.
+        self._last_mid = state["last_mid"]
+        self._synthesized_nanos = state["synth_nanos"]
+        self._last_snapshot_ms = state["last_snapshot_ms"]
         return snap
 
-    def _synth_nanos(self, ts_ms: Optional[int]) -> int:
-        """Monotonic nanosecond counter for synthetic trades. Uses ts_ms if
-        present so signal-engine windows align with replay wall-clock."""
-        self._synthesized_nanos += 1
-        if ts_ms is not None:
-            return ts_ms * 1_000_000 + self._synthesized_nanos
-        return self._synthesized_nanos
+
+# ─── shared converter (also used by file_tail.py) ────────────────────────
+
+def csv_row_to_snapshot(row: Dict[str, str], *, alias_default: str,
+                          default_tick: float, state: Dict[str, Any],
+                          source_name: str) -> Snapshot:
+    """Pure-ish: convert one CSV row dict to a normalized snapshot. The
+    `state` dict carries the small bits of cross-row memory (last_mid,
+    synth_nanos, last_snapshot_ms) — mutated in place so the caller can
+    reuse it across rows. `source_name` propagates to `_source`."""
+    synthetic: List[str] = []
+
+    # ── timestamp ──
+    ts_iso = _row_get(row, "ts_iso", "ts_utc", "ts")
+    ts_ms = _parse_int(_row_get(row, "ts_ms"))
+    if ts_ms is None and ts_iso:
+        try:
+            t = dt.datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+            ts_ms = int(t.timestamp() * 1000)
+        except (ValueError, TypeError):
+            ts_ms = None
+    if ts_ms is not None:
+        state["last_snapshot_ms"] = ts_ms
+
+    # ── alias ──
+    alias = _row_get(row, "alias", "symbol") or alias_default
+
+    # ── book ──
+    mid = _parse_float(_row_get(row, "mid"))
+    bid = _parse_float(_row_get(row, "bid", "best_bid", "bestbid"))
+    ask = _parse_float(_row_get(row, "ask", "best_ask", "bestask"))
+    if mid is None and bid is not None and ask is not None:
+        mid = (bid + ask) / 2.0
+        synthetic.append("book.mid")
+    if bid is None and mid is not None:
+        bid = mid - default_tick / 2.0
+        synthetic.append("book.bestBid")
+    if ask is None and mid is not None:
+        ask = mid + default_tick / 2.0
+        synthetic.append("book.bestAsk")
+    spread = (ask - bid) if (ask is not None and bid is not None) else None
+    book: Dict[str, Any] = {"bestBid": bid, "bestAsk": ask,
+                              "mid": mid, "spread": spread}
+
+    # ── trades ──
+    trades: List[Dict[str, Any]] = []
+    t_price = _parse_float(_row_get(row, "trade_price", "print_price"))
+    t_size  = _parse_int(_row_get(row, "trade_size", "print_size")) or 1
+    t_side  = (_row_get(row, "trade_side", "print_side") or "").lower()
+    last_mid = state.get("last_mid")
+    state["synth_nanos"] = state.get("synth_nanos", 0) + 1
+    nanos = (ts_ms * 1_000_000 + state["synth_nanos"]) if ts_ms else state["synth_nanos"]
+    if t_price is not None:
+        trades.append({"price": t_price, "size": t_size,
+                        "side": t_side, "nanos": nanos})
+    elif mid is not None and last_mid is not None and mid != last_mid:
+        side = "buy" if mid > last_mid else "sell"
+        trades.append({"price": mid, "size": 1, "side": side, "nanos": nanos})
+        synthetic.append("trades")
+    if mid is not None:
+        state["last_mid"] = mid
+
+    # ── OR row ──
+    or_high = _parse_float(_row_get(row, "or_high", "orhigh"))
+    or_low  = _parse_float(_row_get(row, "or_low", "orlow"))
+    or_row_obj: Optional[Dict[str, Any]] = None
+    if or_high is not None and or_low is not None:
+        or_row_obj = {"orHigh": str(or_high), "orLow": str(or_low),
+                       "orWidthPts": or_high - or_low}
+
+    # ── VWAP ──
+    vwap = _parse_float(_row_get(row, "vwap"))
+    vwap_stddev = _parse_float(_row_get(row, "vwap_stddev", "vwap_sigma"))
+    vwap_obj: Optional[Dict[str, Any]] = None
+    if vwap is not None:
+        vwap_obj = {"vwap": vwap, "stddev": vwap_stddev or 0.0,
+                     "lastTradePrice": mid}
+        if vwap_stddev is None:
+            synthetic.append("vwap_obj.stddev")
+
+    # ── flow ──
+    flow: Dict[str, Any] = {}
+    col_map = [
+        ("regime",          "regime",            False),
+        ("regime_conf",     "regimeConfidence",  True),
+        ("bias_score",      "biasScore",         True),
+        ("bias_trajectory", "biasTrajectory",    False),
+        ("ofi_z",           "ofiZ",              True),
+        ("cvd_delta_z",     "cvdDeltaZ",         True),
+        ("vpt_z",           "vptZ",              True),
+    ]
+    for src_col, dst_key, as_float in col_map:
+        raw = _row_get(row, src_col)
+        if raw is None: continue
+        if as_float:
+            v = _parse_float(raw)
+            if v is not None:
+                flow[dst_key] = v
+        else:
+            flow[dst_key] = raw
+
+    return {
+        "alias":       alias,
+        "health":      "ok",
+        "ts":          ts_iso or (
+            dt.datetime.fromtimestamp(ts_ms / 1000, tz=dt.timezone.utc).isoformat()
+            if ts_ms else ""),
+        "book":        book,
+        "trades":      trades,
+        "or_row":      or_row_obj,
+        "vwap_obj":    vwap_obj,
+        "flow":        flow or None,
+        "gates":       {},
+        "_source":     source_name,
+        "_synthetic":  synthetic,
+    }

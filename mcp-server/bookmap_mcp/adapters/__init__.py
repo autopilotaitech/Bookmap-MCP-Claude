@@ -6,6 +6,11 @@ from .base import (
     DataAdapter,
     Snapshot,
 )
-from .csv_replay import CsvReplayAdapter
+from .csv_replay import CsvReplayAdapter, csv_row_to_snapshot
+from .file_tail import FileTailAdapter
 
-__all__ = ["AdapterHealth", "DataAdapter", "Snapshot", "CsvReplayAdapter"]
+__all__ = [
+    "AdapterHealth", "DataAdapter", "Snapshot",
+    "CsvReplayAdapter", "FileTailAdapter",
+    "csv_row_to_snapshot",
+]
