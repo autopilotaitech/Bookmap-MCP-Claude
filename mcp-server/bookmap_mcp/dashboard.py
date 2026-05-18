@@ -313,6 +313,341 @@ def _vp_context(vp_obj: Optional[Dict[str, Any]], price: float) -> str:
     return ""
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-level composite — V5.
+#
+# At each OR/extension magnet, every conviction source contributes a per-level
+# directional score. Composite = sum(score × base_weight × reliability) / sum
+# (|effective_weight|), clipped to [-1,+1]. Positive = bullish pressure;
+# negative = bearish pressure. Direction map by row side:
+#   above-side magnets (OR-H, +1/+2/+3):
+#     positive → FOLLOW_LONG    negative → FADE_SHORT
+#   below-side magnets (OR-L, -1/-2/-3):
+#     negative → FOLLOW_SHORT   positive → FADE_LONG
+# Composite is ADDITIVE to existing level fields — `score`/`decision`/
+# `components`/`reasons` from `_score_level` are NOT removed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Slow-prior cache: previous poll's conviction per alias. compute_or_levels
+# runs before compute_session_conviction in a single fetch_snapshot pass, so
+# the composite reads conviction from this cache (populated at the end of the
+# prior poll). First-poll-after-startup → reliability 0 for the conviction
+# driver, which is correct.
+_LAST_CONVICTION: Dict[str, Dict[str, Any]] = {}
+
+# Base weights for the per-magnet composite. Effective = base × reliability.
+_LVL_W = {
+    "pull_stack":          0.22,
+    "tape":                0.18,
+    "micro":               0.16,
+    "lt_liquidity":        0.12,
+    "orderbook":           0.12,
+    "vwap":                0.08,    # vwap_stretch + vwap_or gate combined
+    "volume_profile":      0.07,
+    "session_conviction":  0.05,
+}
+_LVL_THR_DIRECTIONAL = 0.20   # |composite_score| below this → WAIT
+_LVL_THIN_COVERAGE_FRAC = 0.30   # eff_weight/base_weight ratio below this → warn
+
+
+def _book_at_level(book: Optional[Dict[str, Any]], price: float,
+                   side: str) -> Tuple[float, float, str]:
+    """Net bid/ask imbalance within ±5 ticks of the level price. Positive =
+    bid pressure dominates near the level (bullish); negative = ask pressure
+    dominates (bearish). `side` is used only in the reason string."""
+    if not book or not isinstance(book, dict) or "_error" in book:
+        return 0.0, 0.0, "no book"
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
+    if not bids and not asks:
+        return 0.0, 0.0, "empty book"
+    NEAR = 5 * NQ_TICK
+    bid_vol = 0
+    for b in bids:
+        if not isinstance(b, dict):
+            continue
+        try:
+            bp = float(b.get("price"))
+        except (TypeError, ValueError):
+            continue
+        if abs(bp - price) <= NEAR:
+            bid_vol += int(b.get("size") or 0)
+    ask_vol = 0
+    for a in asks:
+        if not isinstance(a, dict):
+            continue
+        try:
+            ap = float(a.get("price"))
+        except (TypeError, ValueError):
+            continue
+        if abs(ap - price) <= NEAR:
+            ask_vol += int(a.get("size") or 0)
+    total = bid_vol + ask_vol
+    if total <= 0:
+        return 0.0, 0.2, f"no depth ±{NEAR:.2f}pts of {price:.2f}"
+    imb = (bid_vol - ask_vol) / total
+    score = _clip(_tanh(imb * 1.5))
+    return score, 1.0, f"near-level imb={imb:+.2f} (bid={bid_vol}/ask={ask_vol}, {side})"
+
+
+def _vwap_or_at_level(gate: Optional[Dict[str, Any]],
+                       side: str) -> Tuple[float, float, str]:
+    """vwap_or gate is global directional context, not price-specific.
+    ALLOW_LONG → +0.5; ALLOW_SHORT → -0.5; BLOCKED → 0; UNKNOWN → reliability 0."""
+    if not gate or not isinstance(gate, dict):
+        return 0.0, 0.0, "no vwap_or gate"
+    state = gate.get("state", "UNKNOWN")
+    reason = gate.get("reason", "")
+    if state == "ALLOW_LONG":
+        return +0.5, 1.0, f"vwap_or ALLOW_LONG ({reason})"
+    if state == "ALLOW_SHORT":
+        return -0.5, 1.0, f"vwap_or ALLOW_SHORT ({reason})"
+    if state == "BLOCKED":
+        return 0.0, 1.0, f"vwap_or BLOCKED ({reason})"
+    return 0.0, 0.0, f"vwap_or {state}"
+
+
+def _vp_at_level(vp_obj: Optional[Dict[str, Any]], price: float,
+                  side: str) -> Tuple[float, float, str]:
+    """Volume profile context as a directional score.
+    HVN near the level (top-quartile bin within 5 ticks):
+      above-side → mild bearish (resistance is real, fade favored)
+      below-side → mild bullish (support is real, fade favored)
+    LVN near the level (bottom-quartile bin): direction-neutral, lower reliability
+      (signals fast-continuation potential but no inherent bias).
+    Far from any node → 0 score, reduced reliability."""
+    if not vp_obj or not isinstance(vp_obj, dict) or "_error" in vp_obj:
+        return 0.0, 0.0, "no volume_profile"
+    levels = vp_obj.get("levels") or []
+    if not levels:
+        return 0.0, 0.0, "vp empty"
+    total = vp_obj.get("totalVolume") or 0
+    if total <= 0:
+        return 0.0, 0.0, "vp no volume"
+    nearest = None
+    nearest_dist = float("inf")
+    for l in levels:
+        if not isinstance(l, dict):
+            continue
+        try:
+            lp = float(l.get("price"))
+        except (TypeError, ValueError):
+            continue
+        d = abs(lp - price)
+        if d < nearest_dist:
+            nearest_dist = d
+            nearest = l
+    if nearest is None:
+        return 0.0, 0.0, "vp no levels"
+    if nearest_dist > 5 * NQ_TICK:
+        return 0.0, 0.3, f"vp far from nodes (Δ={nearest_dist:.2f}pts)"
+    bin_vol = float(nearest.get("volume", 0))
+    vols = sorted([float(l.get("volume", 0))
+                   for l in levels if isinstance(l, dict)])
+    n = len(vols)
+    if n < 4:
+        return 0.0, 0.3, "vp too few bins"
+    p75 = vols[min(n - 1, int(n * 0.75))]
+    p25 = vols[max(0, int(n * 0.25))]
+    if bin_vol >= p75 and p75 > 0:
+        bias = -0.2 if side == "above" else +0.2
+        return bias, 1.0, f"HVN at level (vol={int(bin_vol)}, p75={int(p75)})"
+    if bin_vol <= p25:
+        return 0.0, 0.5, f"LVN at level (vol={int(bin_vol)}, p25={int(p25)})"
+    return 0.0, 0.5, f"vp neutral (vol={int(bin_vol)})"
+
+
+def _conviction_at_level(conv_obj: Optional[Dict[str, Any]],
+                          side: str) -> Tuple[float, float, str]:
+    """Slow prior. Reliability ramps in over the first 30 min of the session;
+    CHOP / MIXED / WARMUP regimes are capped at 0.3 reliability so they cannot
+    override fast at-level evidence."""
+    if not conv_obj or not isinstance(conv_obj, dict) or "_error" in conv_obj:
+        return 0.0, 0.0, "no conviction (cold start)"
+    score = conv_obj.get("score")
+    if not isinstance(score, (int, float)):
+        return 0.0, 0.0, "conviction missing score"
+    trend = conv_obj.get("trend", "?")
+    duration_sec = conv_obj.get("durationSec", 0) or 0
+    if duration_sec < 300:
+        rel = 0.0
+    elif duration_sec < 1800:
+        rel = (duration_sec - 300) / 1500.0
+    else:
+        rel = 1.0
+    if trend in ("CHOP", "MIXED", "WARMUP"):
+        rel = min(rel, 0.3)
+    return _clip(float(score)), rel, f"conviction {trend} score={float(score):+.2f}"
+
+
+def _vwap_stretch_directional(vwap_obj: Optional[Dict[str, Any]],
+                              price: float) -> Tuple[float, float, str]:
+    """Mean-reversion bias at the LEVEL's price. >+2σ above VWAP → bearish
+    (fade short favored); <-2σ → bullish (fade long favored). Near fair value
+    → 0. Replaces the FOLLOW-penalty-only legacy helper for composite use."""
+    if not vwap_obj or not isinstance(vwap_obj, dict) or "_error" in vwap_obj:
+        return 0.0, 0.0, "no vwap"
+    vwap = vwap_obj.get("vwap")
+    stddev = vwap_obj.get("stddev")
+    if vwap is None or stddev is None:
+        return 0.0, 0.0, "vwap no σ"
+    try:
+        sigma = float(stddev)
+        if sigma <= 0:
+            return 0.0, 0.0, "vwap σ=0"
+        dev = (price - float(vwap)) / sigma
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0, 0.0, "vwap bad"
+    a = abs(dev)
+    if a < 1.0:
+        return 0.0, 0.3, f"VWAP {dev:+.1f}σ (fair)"
+    sign = -1.0 if dev > 0 else +1.0   # mean-revert direction
+    if a < 2.0:
+        return _clip(sign * 0.2), 0.7, f"VWAP {dev:+.1f}σ (stretched)"
+    if a < 3.0:
+        return _clip(sign * 0.5), 1.0, f"VWAP {dev:+.1f}σ (extreme)"
+    return _clip(sign * 0.8), 1.0, f"VWAP {dev:+.1f}σ (blowoff)"
+
+
+def _level_composite(side: str, price: float, mid: float,
+                      snap: Dict[str, Any]) -> Dict[str, Any]:
+    """Per-magnet composite. Returns the composite block per V5 spec."""
+    drivers: List[Dict[str, Any]] = []
+
+    # ----- pull_stack: BBO bias + rotation combined -----
+    ps_obj = snap.get("pull_stack")
+    ps_bbo_s, ps_bbo_r = _ps_bbo_bias(ps_obj)
+    rot_dir, rot_mag = _ps_rotation(ps_obj)
+    rot_score = (rot_mag if rot_dir == "ROTATION_UP"
+                 else -rot_mag if rot_dir == "ROTATION_DN" else 0.0)
+    ps_score = _clip(0.7 * ps_bbo_s + 0.3 * rot_score)
+    ps_rel = 1.0 if (isinstance(ps_obj, dict) and "_error" not in ps_obj
+                     and "no ps" not in ps_bbo_r) else 0.0
+    drivers.append({"name": "pull_stack", "_base_weight": _LVL_W["pull_stack"],
+                    "score": ps_score, "reliability": ps_rel,
+                    "reason": f"bbo={ps_bbo_s:+.2f} rot={rot_dir}({rot_mag:.2f})"})
+
+    # ----- institutional tape (prefers tape_flow) -----
+    tape_obj = snap.get("tape_flow") or snap.get("tape_buckets")
+    tape_s, tape_reason = _tape_bias(tape_obj)
+    if not tape_obj or (isinstance(tape_obj, dict) and "_error" in tape_obj):
+        tape_rel = 0.0
+    elif "THIN" in tape_reason:
+        tape_rel = 0.2
+    elif "no tape" in tape_reason:
+        tape_rel = 0.0
+    else:
+        tape_rel = 1.0
+    drivers.append({"name": "tape", "_base_weight": _LVL_W["tape"],
+                    "score": tape_s, "reliability": tape_rel, "reason": tape_reason})
+
+    # ----- micro events at level -----
+    me_obj = snap.get("micro_events")
+    micro_s, micro_reason = _micro_at_level(me_obj, price)
+    if not me_obj or (isinstance(me_obj, dict) and "_error" in me_obj):
+        micro_rel = 0.0
+    elif "no events at level" in micro_reason:
+        micro_rel = 0.3
+    else:
+        micro_rel = 1.0
+    drivers.append({"name": "micro", "_base_weight": _LVL_W["micro"],
+                    "score": micro_s, "reliability": micro_rel, "reason": micro_reason})
+
+    # ----- LT liquidity -----
+    lt_obj = snap.get("lt_liquidity")
+    lt_s, lt_reason = _lt_lean(lt_obj)
+    lt_rel = 0.8 if (isinstance(lt_obj, dict) and "_error" not in lt_obj
+                     and "lt empty" not in lt_reason) else 0.0
+    drivers.append({"name": "lt_liquidity", "_base_weight": _LVL_W["lt_liquidity"],
+                    "score": lt_s, "reliability": lt_rel, "reason": lt_reason})
+
+    # ----- orderbook at level (new) -----
+    book = snap.get("book")
+    bk_s, bk_rel, bk_reason = _book_at_level(book, price, side)
+    drivers.append({"name": "orderbook", "_base_weight": _LVL_W["orderbook"],
+                    "score": bk_s, "reliability": bk_rel, "reason": bk_reason})
+
+    # ----- vwap: stretch + or-gate combined -----
+    vwap_obj = snap.get("vwap_obj")
+    vw_s, vw_rel, vw_reason = _vwap_stretch_directional(vwap_obj, price)
+    gate = (snap.get("gates") or {}).get("vwap_or") if isinstance(snap.get("gates"), dict) else None
+    gate_s, gate_rel, gate_reason = _vwap_or_at_level(gate, side)
+    vwap_combined = _clip(0.6 * vw_s + 0.4 * gate_s)
+    vwap_rel = max(vw_rel, gate_rel)
+    drivers.append({"name": "vwap", "_base_weight": _LVL_W["vwap"],
+                    "score": vwap_combined, "reliability": vwap_rel,
+                    "reason": f"{vw_reason}; {gate_reason}"})
+
+    # ----- volume profile at level (new) -----
+    vp_obj = snap.get("volume_profile")
+    vp_s, vp_rel, vp_reason = _vp_at_level(vp_obj, price, side)
+    drivers.append({"name": "volume_profile", "_base_weight": _LVL_W["volume_profile"],
+                    "score": vp_s, "reliability": vp_rel, "reason": vp_reason})
+
+    # ----- session conviction (slow prior, last-poll cache) -----
+    alias = snap.get("alias")
+    conv_obj = snap.get("conviction")
+    if (not conv_obj or (isinstance(conv_obj, dict) and "_error" in conv_obj)) and alias:
+        conv_obj = _LAST_CONVICTION.get(alias)
+    conv_s, conv_rel, conv_reason = _conviction_at_level(conv_obj, side)
+    drivers.append({"name": "session_conviction",
+                    "_base_weight": _LVL_W["session_conviction"],
+                    "score": conv_s, "reliability": conv_rel, "reason": conv_reason})
+
+    # ----- aggregate -----
+    num = 0.0
+    eff_total = 0.0
+    base_total = 0.0
+    for d in drivers:
+        bw = d["_base_weight"]
+        eff = bw * d["reliability"]
+        num += d["score"] * eff
+        eff_total += eff
+        base_total += bw
+    composite_score = _clip(num / eff_total) if eff_total > 0 else 0.0
+    # Confidence: signal magnitude × coverage fraction, both in [0,1].
+    coverage = (eff_total / base_total) if base_total > 0 else 0.0
+    confidence = _clip(abs(composite_score) * coverage, 0.0, 1.0)
+
+    # ----- direction mapping by row side -----
+    warnings: List[str] = []
+    if abs(composite_score) < _LVL_THR_DIRECTIONAL:
+        direction = "WAIT"
+    elif side == "above":
+        direction = "FOLLOW_LONG" if composite_score > 0 else "FADE_SHORT"
+    else:
+        direction = "FOLLOW_SHORT" if composite_score < 0 else "FADE_LONG"
+
+    # Gate-conflict warning: directional gate disagrees with composite direction.
+    if gate_rel > 0 and gate_s != 0:
+        if direction.endswith("_LONG") and gate_s < 0:
+            warnings.append(f"vwap_or gate prefers short — {gate_reason}")
+        elif direction.endswith("_SHORT") and gate_s > 0:
+            warnings.append(f"vwap_or gate prefers long — {gate_reason}")
+    # Coverage warning: too many sources missing.
+    if coverage < _LVL_THIN_COVERAGE_FRAC:
+        warnings.append(
+            f"thin coverage: eff_weight={eff_total:.2f}/{base_total:.2f}")
+    # Per-driver low-reliability hints (not full warnings; debugging aid).
+    missing = [d["name"] for d in drivers if d["reliability"] <= 0.05]
+    if len(missing) >= 4:
+        warnings.append(f"sources unavailable: {','.join(missing)}")
+
+    return {
+        "score":      round(composite_score, 3),
+        "direction":  direction,
+        "confidence": round(confidence, 3),
+        "drivers": [
+            {"name": d["name"],
+             "score": round(d["score"], 3),
+             "weight": round(d["_base_weight"] * d["reliability"], 4),
+             "reason": d["reason"]}
+            for d in drivers
+        ],
+        "warnings": warnings,
+    }
+
+
 def _score_level(side: str, price: float, mid: float,
                  ps_obj, lt_obj, tape_obj, me_obj, vwap_obj, vp_obj) -> Dict[str, Any]:
     """Compute FOLLOW vs FADE bias at one level.
@@ -458,6 +793,7 @@ def compute_or_levels(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         proximity = abs(dist_pts) <= prox_pts
         reaction = _score_level(side, price, mid,
                                 ps_obj, lt_obj, tape_obj, me_obj, vwap_obj, vp_obj)
+        composite = _level_composite(side, price, mid, snap)
         levels.append({
             "label":     lbl,
             "price":     round(price, 2),
@@ -465,6 +801,7 @@ def compute_or_levels(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "distance":  round(dist_pts, 2),
             "proximity": proximity,
             **reaction,
+            "composite": composite,
         })
 
     # Pax discipline check: is price currently in the middle (i.e., not in proximity
@@ -1769,7 +2106,7 @@ def compute_session_conviction(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]
     }
 
     duration_sec = (now_ms - anchor_ms) // 1000
-    return {
+    result = {
         "score":             round(score, 3),
         "trajectory":        traj,
         "trend":             trend,
@@ -1787,6 +2124,13 @@ def compute_session_conviction(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]
         "reasons":           reasons,
         "method":            CONVICTION_METHOD_VERSION,
     }
+    # Cache for the NEXT poll's _level_composite slow-prior read. or_levels
+    # runs before conviction in a single fetch_snapshot pass, so the composite
+    # cannot see this poll's conviction — it reads the previous poll's from here.
+    alias_key = snap.get("alias")
+    if alias_key:
+        _LAST_CONVICTION[alias_key] = result
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
