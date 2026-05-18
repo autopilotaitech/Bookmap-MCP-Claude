@@ -48,7 +48,7 @@ public final class RecentTradesHandler implements HttpHandler {
             arr.append(new JsonWriter().beginObject()
                     .prop("price", t.price())
                     .prop("size", t.size())
-                    .prop("side", t.bidAggressor() ? "sell" : "buy")
+                    .prop("side", t.bidAggressor() ? "buy" : "sell")
                     .prop("nanos", t.nanos())
                     .endObject().build());
         }

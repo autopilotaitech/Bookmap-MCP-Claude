@@ -95,8 +95,10 @@ def _full_bull_snap(alias: str = "NQM6") -> dict:
         "tape_buckets": {"biasScore": 0.7, "bias": "BULLISH"},
         "lt_liquidity": {"bidSize": 1000.0, "askSize": 200.0},
         "micro_events": {"events": [
+            # Bull cluster: bid-defended icebergs + an ASK-swept (isBid=False)
+            # STOP_SWEEP. Under canonical convention asks-swept = buy pressure.
             {"kind": "ICEBERG",   "isBid": True,  "price": 20005.0, "timeMs": 0},
-            {"kind": "STOP_SWEEP","isBid": True,  "price": 20006.0, "timeMs": 0},
+            {"kind": "STOP_SWEEP","isBid": False, "price": 20006.0, "timeMs": 0},
             {"kind": "ICEBERG",   "isBid": True,  "price": 20004.0, "timeMs": 0},
             {"kind": "ICEBERG",   "isBid": True,  "price": 20003.0, "timeMs": 0},
             {"kind": "ICEBERG",   "isBid": True,  "price": 20002.0, "timeMs": 0},
@@ -131,8 +133,10 @@ def _full_bear_snap(alias: str = "NQM6") -> dict:
     bull["tape_buckets"]   = {"biasScore": -0.7, "bias": "BEARISH"}
     bull["lt_liquidity"]   = {"bidSize": 200.0, "askSize": 1000.0}
     bull["micro_events"]   = {"events": [
+        # Bear cluster: ask-defended icebergs + a BID-swept (isBid=True)
+        # STOP_SWEEP. Under canonical convention bids-swept = sell pressure.
         {"kind": "ICEBERG",   "isBid": False, "price": 19995.0, "timeMs": 0},
-        {"kind": "STOP_SWEEP","isBid": False, "price": 19994.0, "timeMs": 0},
+        {"kind": "STOP_SWEEP","isBid": True,  "price": 19994.0, "timeMs": 0},
         {"kind": "ICEBERG",   "isBid": False, "price": 19996.0, "timeMs": 0},
         {"kind": "ICEBERG",   "isBid": False, "price": 19997.0, "timeMs": 0},
         {"kind": "ICEBERG",   "isBid": False, "price": 19998.0, "timeMs": 0},
@@ -362,12 +366,34 @@ def test_micro_events_spoof_is_contrarian():
 
 
 def test_micro_events_stop_sweep_directional():
+    # Canonical: STOP_SWEEP isBid=True means bids were swept (sell pressure, bearish).
     bid_sweep = d._source_micro_events({"micro_events":
         {"events": [{"kind": "STOP_SWEEP", "isBid": True, "price": 100.0}]}})
     ask_sweep = d._source_micro_events({"micro_events":
         {"events": [{"kind": "STOP_SWEEP", "isBid": False, "price": 100.0}]}})
-    assert bid_sweep["score"] > 0.0
-    assert ask_sweep["score"] < 0.0
+    assert bid_sweep["score"] < 0.0, f"bids swept must score bearish, got {bid_sweep['score']}"
+    assert ask_sweep["score"] > 0.0, f"asks swept must score bullish, got {ask_sweep['score']}"
+
+
+def test_source_micro_events_stop_sweep_matches_micro_at_level():
+    """_source_micro_events and _micro_at_level must agree on STOP_SWEEP
+    direction. Regression: _source_micro_events previously inverted the sign."""
+    bid_evt = {"micro_events":
+        {"events": [{"kind": "STOP_SWEEP", "isBid": True,
+                     "price": 100.0, "timeMs": 0}]}}
+    src = d._source_micro_events(bid_evt)["score"]
+    lvl, _ = d._micro_at_level(bid_evt["micro_events"], 100.0)
+    assert src < 0 and lvl < 0, (
+        f"bids swept must be bearish from both sources; "
+        f"_source_micro_events={src:+.2f}, _micro_at_level={lvl:+.2f}")
+    ask_evt = {"micro_events":
+        {"events": [{"kind": "STOP_SWEEP", "isBid": False,
+                     "price": 100.0, "timeMs": 0}]}}
+    src = d._source_micro_events(ask_evt)["score"]
+    lvl, _ = d._micro_at_level(ask_evt["micro_events"], 100.0)
+    assert src > 0 and lvl > 0, (
+        f"asks swept must be bullish from both sources; "
+        f"_source_micro_events={src:+.2f}, _micro_at_level={lvl:+.2f}")
 
 
 def test_flow_ofi_sign_matches_z():

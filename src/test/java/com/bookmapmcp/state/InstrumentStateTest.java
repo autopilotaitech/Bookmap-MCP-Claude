@@ -1,6 +1,7 @@
 package com.bookmapmcp.state;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -170,5 +171,152 @@ class InstrumentStateTest {
         s.accumulateVwap(100.0, 0, nanosAt(t));
         s.accumulateVwap(100.0, -5, nanosAt(t));
         assertEquals(0L, s.vwapSnapshot().samples());
+    }
+
+    // --- Aggressor-side semantics (Bookmap TradeInfo.isBidAggressor) ---
+    // Spec: isBidAggressor == true means the BID was the aggressor (buy aggressor /
+    // lifted offer); false means SELL aggressor (hit bid). The tests below pin every
+    // direct downstream consumer so the inversion cannot regress silently.
+
+    @Test
+    void momentumBuyAggressorIsCountedAsBuy() {
+        InstrumentState s = newState();
+        // momentumSnapshot uses TradeRecord.nanos() against a horizon derived from
+        // lastSeenNanos; both must be > 0 for the trades to fall inside the window.
+        s.onTimestamp(System.nanoTime());
+        for (int i = 0; i < 5; i++) s.onTrade(100, 3, true);   // buy aggressors
+        for (int i = 0; i < 2; i++) s.onTrade(100, 4, false);  // sell aggressors
+        // Refresh lastSeenNanos so the window's "now" is past the trade timestamps.
+        s.onTimestamp(System.nanoTime());
+        MomentumSnapshot mo = s.momentumSnapshot(new int[]{600});
+        MomentumSnapshot.Window w = mo.windows.get(0);
+        assertEquals(15L, w.buyVolume,  "buy aggressor (isBidAggressor=true) must accumulate to buyVolume");
+        assertEquals(8L,  w.sellVolume, "sell aggressor (isBidAggressor=false) must accumulate to sellVolume");
+    }
+
+    @Test
+    void volumeProfileBuyAggressorPopulatesBuyVolume() {
+        InstrumentState s = newState();
+        s.onTimestamp(System.nanoTime());
+        s.onTrade(100, 7, true);   // buy aggressor
+        s.onTrade(100, 4, false);  // sell aggressor at same price
+        VolumeProfileSnapshot vp = s.volumeProfileEthSnapshot();
+        assertEquals(1, vp.levels.size(), "single price should produce one VP level");
+        VolumeProfileSnapshot.Level l = vp.levels.get(0);
+        assertEquals(7L, l.buyVolume,  "buy aggressor must populate buyVolume");
+        assertEquals(4L, l.sellVolume, "sell aggressor must populate sellVolume");
+    }
+
+    @Test
+    void tapeBucketsBuyAggressorPopulatesBuyVolume() {
+        InstrumentState s = newState();
+        s.onTimestamp(System.nanoTime());
+        for (int i = 0; i < 5; i++) s.onTrade(100, 3, true);   // buy aggressors, sizes inside 1-10 bucket
+        for (int i = 0; i < 2; i++) s.onTrade(100, 4, false);  // sell aggressors, same bucket
+        s.onTimestamp(System.nanoTime());
+        TapeBucketsSnapshot tb = s.tapeBucketsSnapshot();
+        TapeBucketsSnapshot.Bucket b = tb.buckets.get(0);
+        assertEquals("1-10", b.label);
+        assertEquals(15L, b.buyVol5m,  "buy aggressor must accumulate to buyVol5m");
+        assertEquals(8L,  b.sellVol5m, "sell aggressor must accumulate to sellVol5m");
+    }
+
+    @Test
+    void recentTradesPreserveAggressorFlag() {
+        // The handler's JSON ternary is covered by RecentTradesHandler at runtime;
+        // here we verify the underlying TradeRecord boolean lines up with the input.
+        InstrumentState s = newState();
+        s.onTrade(101.5,  2, true);   // buy aggressor
+        s.onTrade(101.75, 1, false);  // sell aggressor
+        List<TradeRecord> trades = s.recentTradesSnapshot(2);
+        // recentTradesSnapshot returns newest-first
+        assertFalse(trades.get(0).bidAggressor(), "newest trade was sell aggressor");
+        assertTrue(trades.get(1).bidAggressor(),  "second-newest trade was buy aggressor");
+    }
+
+    // --- Stop-sweep side emission (canonical: isBid=true means BIDS swept = bearish) ---
+
+    @Test
+    void stopSweepIsBidIsTrueWhenSellersSweepBids() {
+        InstrumentState s = newState();
+        s.onTimestamp(System.nanoTime());
+        // pips=0.25, raw tick 100 → display price 25.0. Magnet must lie inside
+        // the 5s window's [minPx,maxPx] range for the sweep to fire.
+        s.setMagnetLevels(new double[]{25.0});
+        // detectStopSweep's adaptive threshold = max(STOP_FLOOR=80, μ+2σ). On the
+        // first sample μ=σ=0 so a single trade of size > 80 trips the detector
+        // before the EWMA catches up.
+        s.onTrade(100, 200, false);   // false = sell aggressor (hit bid)
+        MicrostructureEvent sweep = s.microstructureEvents(50).stream()
+                .filter(e -> e.kind == MicrostructureEvent.Kind.STOP_SWEEP)
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("STOP_SWEEP did not fire"));
+        assertTrue(sweep.isBid, "sell-aggressor sweep should emit isBid=true (bids swept = bearish)");
+    }
+
+    @Test
+    void stopSweepIsBidIsFalseWhenBuyersSweepAsks() {
+        InstrumentState s = newState();
+        s.onTimestamp(System.nanoTime());
+        s.setMagnetLevels(new double[]{25.0});
+        s.onTrade(100, 200, true);    // true = buy aggressor (lifted offer)
+        MicrostructureEvent sweep = s.microstructureEvents(50).stream()
+                .filter(e -> e.kind == MicrostructureEvent.Kind.STOP_SWEEP)
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("STOP_SWEEP did not fire"));
+        assertFalse(sweep.isBid, "buy-aggressor sweep should emit isBid=false (asks swept = bullish)");
+    }
+
+    // --- MBO replace price-move semantics ---
+
+    @Test
+    void mboReplacePriceMoveEmitsPullAtOldAndStackAtNew() {
+        // Send a 10-lot bid at tick 100, then move it to tick 99 keeping size.
+        // BookDynamics should show a SEND-credited stack at tick 100, a REPLACE-
+        // negative (pull) at tick 100, and a REPLACE-positive (stack) at tick 99 —
+        // i.e. the move is modeled as a full pull + a full stack, not a delta.
+        InstrumentState s = newState();
+        s.onTimestamp(System.nanoTime());
+        s.onMboSend("X1", true, 100, 10);
+        s.onMboReplace("X1", 99, 10);
+        BookDynamicsSnapshot bd = s.bookDynamicsSnapshot(64);
+        long stackedAtNew = 0, pulledAtOld = 0, stackedAtOld = 0;
+        double pips = 0.25;  // matches newState() factory
+        for (BookDynamicsSnapshot.Level l : bd.topActiveLevels) {
+            if (!l.isBid) continue;
+            if (Math.abs(l.price - 99 * pips)  < 1e-9) stackedAtNew = l.stacked1m;
+            if (Math.abs(l.price - 100 * pips) < 1e-9) {
+                pulledAtOld  = l.pulled1m;
+                stackedAtOld = l.stacked1m;
+            }
+        }
+        assertEquals(10L, stackedAtNew, "new level should be credited as a full stack");
+        assertEquals(10L, pulledAtOld,  "old level should be credited as a full pull");
+        assertEquals(10L, stackedAtOld, "original SEND stack at old tick must NOT be double-counted");
+    }
+
+    @Test
+    void mboReplaceSizeOnlyPreservesSizeDeltaSemantics() {
+        // Same-price replace: a size increase emits a positive REPLACE delta
+        // (stack contribution = delta); a size decrease emits a negative
+        // REPLACE delta (pull contribution = delta). Pull/stack stays additive.
+        InstrumentState s = newState();
+        s.onTimestamp(System.nanoTime());
+        s.onMboSend("Y1", false, 200, 20);   // ask, size 20
+        s.onMboReplace("Y1", 200, 25);       // grow to 25 → +5 stack
+        s.onMboReplace("Y1", 200, 22);       // shrink to 22 → -3 pull
+        BookDynamicsSnapshot bd = s.bookDynamicsSnapshot(64);
+        long stacked = 0, pulled = 0;
+        double pips = 0.25;
+        for (BookDynamicsSnapshot.Level l : bd.topActiveLevels) {
+            if (l.isBid) continue;
+            if (Math.abs(l.price - 200 * pips) < 1e-9) {
+                stacked = l.stacked1m;
+                pulled  = l.pulled1m;
+            }
+        }
+        // SEND(20) + REPLACE(+5) = 25 stacked; REPLACE(-3) = 3 pulled.
+        assertEquals(25L, stacked, "same-price grow should add size delta to stacked");
+        assertEquals(3L,  pulled,  "same-price shrink should add size delta to pulled");
     }
 }

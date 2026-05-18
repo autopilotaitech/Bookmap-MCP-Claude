@@ -52,7 +52,12 @@ def build_server() -> FastMCP:
 
     @server.tool()
     def bookmap_recent_trades(alias: str, count: int = 20) -> Dict[str, Any]:
-        """Last `count` printed trades, newest first. Side: 'buy' = ask aggressor."""
+        """Last `count` printed trades, newest first.
+
+        Side convention matches Bookmap's TradeInfo.isBidAggressor:
+        'buy'  = the bid was the aggressor (lifted offer);
+        'sell' = the ask was the aggressor (hit bid).
+        """
         return _call("/recent_trades", {"alias": alias, "count": count})
 
     @server.tool()
@@ -146,6 +151,20 @@ def build_server() -> FastMCP:
         etc.) detected by the bridge, newest first, capped at `max`.
         """
         return _call("/microstructure_events", {"alias": alias, "max": max})
+
+    @server.tool()
+    def bookmap_set_magnet_levels(alias: str, levels: str = "") -> Dict[str, Any]:
+        """Configure stop-sweep magnet levels for one alias.
+
+        `levels` is a comma-separated string of display-currency prices, e.g.
+        "20100.25,20123.50". Pass an empty string to clear all levels.
+
+        Required before STOP_SWEEP microstructure events can fire: the bridge
+        only emits a sweep when an aggressor-volume burst crosses one of these
+        configured levels. Typical inputs are OR-H/OR-L, prior-day H/L, or
+        VWAP +/- 2 sigma — caller is responsible for picking levels.
+        """
+        return _post("/magnet_levels", {"alias": alias, "levels": levels})
 
     if _HAS_IMAGE:
         @server.tool()

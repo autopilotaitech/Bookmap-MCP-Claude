@@ -504,14 +504,15 @@ public final class InstrumentState {
                 cvdValue = 0L;
             }
             if (isInRthWindow(nowMsForSession())) {
-                if (bidAggressor) cvdValue -= size;  // sell aggressor
-                else              cvdValue += size;  // buy aggressor
+                if (bidAggressor) cvdValue += size;  // buy aggressor (bid was aggressor / lifted offer)
+                else              cvdValue -= size;  // sell aggressor (ask was aggressor / hit bid)
             }
         }
         // Flow-regime tracker — feed every print so it can build per-window
-        // OFI/CVD/VPT and roll the 30s window when ready. !bidAggressor = buy
-        // (lift offer); bidAggressor = sell (hit bid).
-        flowRegime.onTrade(price, size, !bidAggressor, nowMs);
+        // FlowRegime.onTrade's third arg is `buyAggressor`. Bookmap's bidAggressor
+        // == true means the bid was the aggressor (buy aggressor / lifted offer),
+        // so pass it through directly.
+        flowRegime.onTrade(price, size, bidAggressor, nowMs);
         // Tier 2 trackers
         ibTracker.onTrade(price, nowMs);
         avwapTracker.onTrade(price, size, nowMs);
@@ -556,23 +557,46 @@ public final class InstrumentState {
         mboAvailable = true;
         long nowMs = nowMs();
         MboOrder o = mboOrders.get(orderId);
-        if (o != null) {
-            int sizeDelta = newSize - o.currentSize;
-            boolean isBid = o.isBid;
-            o.priceTick = newPriceTick;
-            o.currentSize = newSize;
-            if (newSize > o.peakSize) o.peakSize = newSize;
+        if (o == null) return;
+        boolean isBid = o.isBid;
+        int oldPriceTick = o.priceTick;
+        int oldSize      = o.currentSize;
+
+        if (newPriceTick != oldPriceTick) {
+            // Price move: model as a full pull at the old level and a full stack
+            // at the new level. Two MBO deltas, two pull/stack credits — accounted
+            // independently so there's no sizeDelta double-counting.
+            synchronized (mboLock) {
+                if (mboDeltas.size() == MBO_DELTA_CAPACITY) mboDeltas.pollFirst();
+                mboDeltas.addLast(new MboDelta(nowMs, isBid, oldPriceTick, (byte)2, -oldSize));
+                if (mboDeltas.size() == MBO_DELTA_CAPACITY) mboDeltas.pollFirst();
+                mboDeltas.addLast(new MboDelta(nowMs, isBid, newPriceTick, (byte)2,  newSize));
+            }
+            if (oldSize > 0) {
+                creditPullStackFromMbo(isBid, oldPriceTick, (byte)(isBid ? 1 : 3), oldSize, nowMs);
+            }
+            if (newSize > 0) {
+                creditPullStackFromMbo(isBid, newPriceTick, (byte)(isBid ? 0 : 2), newSize, nowMs);
+            }
+        } else {
+            // Same price → size-only change. Preserve existing size-delta behavior.
+            int sizeDelta = newSize - oldSize;
             synchronized (mboLock) {
                 if (mboDeltas.size() == MBO_DELTA_CAPACITY) mboDeltas.pollFirst();
                 mboDeltas.addLast(new MboDelta(nowMs, isBid, newPriceTick, (byte)2, sizeDelta));
             }
-            // Pull/Stack: replace with a size change → STACK (size grew) or PULL (shrank).
             if (sizeDelta > 0) {
-                creditPullStackFromMbo(isBid, newPriceTick, (byte)(isBid ? 0 : 2), sizeDelta, nowMs);
+                creditPullStackFromMbo(isBid, newPriceTick, (byte)(isBid ? 0 : 2),  sizeDelta, nowMs);
             } else if (sizeDelta < 0) {
                 creditPullStackFromMbo(isBid, newPriceTick, (byte)(isBid ? 1 : 3), -sizeDelta, nowMs);
             }
         }
+
+        // Update tracked order state. peakSize is a high-water mark across the
+        // order's life regardless of price moves — preserves spoof-detector behavior.
+        o.priceTick   = newPriceTick;
+        o.currentSize = newSize;
+        if (newSize > o.peakSize) o.peakSize = newSize;
     }
 
     public void onMboCancel(String orderId) {
@@ -886,11 +910,12 @@ public final class InstrumentState {
                 boolean is5m = true, is30s = tMs >= w30s;
                 int base = bi * 3;
                 if (is30s) {
-                    if (t.bidAggressor()) b30s[base+1] += t.size(); else b30s[base] += t.size();
+                    // base+0 = buyVol, base+1 = sellVol, base+2 = count (see TapeBucketsSnapshot.Bucket).
+                    if (t.bidAggressor()) b30s[base] += t.size(); else b30s[base+1] += t.size();
                     b30s[base+2]++;
                 }
                 if (is5m) {
-                    if (t.bidAggressor()) b5m[base+1] += t.size(); else b5m[base] += t.size();
+                    if (t.bidAggressor()) b5m[base] += t.size(); else b5m[base+1] += t.size();
                     b5m[base+2]++;
                 }
             }
@@ -1417,8 +1442,8 @@ public final class InstrumentState {
                 TradeRecord t = tradesCopy.get(i);
                 if (t.nanos() < horizonNanos) break;
                 count++;
-                if (t.bidAggressor()) sell += t.size();
-                else                  buy  += t.size();
+                if (t.bidAggressor()) buy  += t.size();   // buy aggressor (bid was aggressor / lifted offer)
+                else                  sell += t.size();   // sell aggressor (hit bid)
             }
             String label = (sec < 60) ? (sec + "s") : ((sec / 60) + "m");
             windows.add(new MomentumSnapshot.Window(label, sec, count, buy, sell));
@@ -1532,7 +1557,8 @@ public final class InstrumentState {
             if (anchorMs != sessionStartMs) reset(anchorMs);
             long[] entry = byTick.get(tick);
             if (entry == null) { entry = new long[2]; byTick.put(tick, entry); }
-            if (bidAggressor) entry[1] += size; else entry[0] += size;
+            // entry[0] = buyVolume, entry[1] = sellVolume (see VolumeProfileSnapshot.Level ctor below).
+            if (bidAggressor) entry[0] += size; else entry[1] += size;
             total += size; samples++;
         }
         void maybeRoll(long anchorMs) { if (anchorMs != sessionStartMs) reset(anchorMs); }

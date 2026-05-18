@@ -14,6 +14,8 @@ import logging
 import math
 import os
 import sys
+import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -37,6 +39,14 @@ OR_SIGNAL_GLOBS = [
     r"C:\Bookmap\addons\OR-Strategy\Reference-Indicators\OpenRange\build\logs\openrange-signals-*.csv",
     r"C:\Bookmap\build\logs\openrange-signals-*.csv",
 ]
+
+# Magnet-levels sync cache.
+# Value: (sorted tuple of rounded prices, monotonic seconds of last 2xx post).
+# Refresh TTL bounds the "Bookmap restart wiped magnets but dashboard cache
+# still thinks they're set" failure mode to _MAGNET_REFRESH_SECS.
+_LAST_MAGNETS: Dict[str, Tuple[Tuple[float, ...], float]] = {}
+_LAST_MAGNETS_LOCK = threading.Lock()
+_MAGNET_REFRESH_SECS = 60.0
 
 
 def session_state(now_et: dt.datetime) -> Tuple[str, str]:
@@ -1253,7 +1263,9 @@ def _source_micro_events(snap: Dict[str, Any]) -> Dict[str, Any]:
             score += (+0.4 if bid_like else -0.4) * decay
             hits.append(f"ICE{'B' if bid_like else 'A'}")
         elif kind == "STOP_SWEEP":
-            score += (+0.5 if bid_like else -0.5) * decay
+            # Canonical: isBid=True = bids were swept = sell pressure / bearish.
+            # Matches _micro_at_level (above) and the browser micro badge.
+            score += (-0.5 if bid_like else +0.5) * decay
             hits.append(f"SWEEP{'B' if bid_like else 'A'}")
         elif kind == "SPOOF":
             # Spoof is contrarian: bid spoof bearish, ask spoof bullish.
@@ -1981,6 +1993,68 @@ def _get_pax_collector():
     return _PAX_COLLECTOR if _PAX_COLLECTOR is not False else None
 
 
+def _sync_magnet_levels(cfg: BridgeConfig, alias: Optional[str],
+                        or_levels: Optional[Dict[str, Any]]) -> None:
+    """Push the OR-Strategy level grid to the bridge as stop-sweep magnets.
+
+    Idempotent across snapshots: only posts when the level set changes OR the
+    cached set is older than _MAGNET_REFRESH_SECS. Catches every exception so a
+    transient bridge failure cannot break fetch_snapshot.
+    """
+    if not alias:
+        return
+    if not isinstance(or_levels, dict) or "_error" in or_levels:
+        return
+    raw_levels = or_levels.get("levels")
+    if not isinstance(raw_levels, list) or not raw_levels:
+        return
+
+    prices: List[float] = []
+    for entry in raw_levels:
+        if not isinstance(entry, dict):
+            continue
+        p = entry.get("price")
+        if isinstance(p, bool):
+            # bool is an int subclass — exclude explicitly to avoid silently coercing True/False.
+            continue
+        if not isinstance(p, (int, float)):
+            continue
+        try:
+            fp = float(p)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(fp):
+            continue
+        prices.append(round(fp, 2))
+    if not prices:
+        return
+
+    new_tuple: Tuple[float, ...] = tuple(sorted(prices))
+    now_mono = time.monotonic()
+
+    with _LAST_MAGNETS_LOCK:
+        cached = _LAST_MAGNETS.get(alias)
+        if cached is not None:
+            cached_tuple, cached_ts = cached
+            if cached_tuple == new_tuple and (now_mono - cached_ts) < _MAGNET_REFRESH_SECS:
+                return
+
+    payload = ",".join(f"{p:g}" for p in new_tuple)
+    try:
+        with BridgeClient(cfg, timeout_s=2.0) as client:
+            client.post_json("/magnet_levels", {"alias": alias, "levels": payload})
+    except BridgeError as exc:
+        sys.stderr.write(f"[dashboard] magnet_levels POST failed: {exc}\n")
+        return
+    except Exception as exc:
+        sys.stderr.write(f"[dashboard] magnet_levels POST crashed: "
+                         f"{type(exc).__name__}: {exc}\n")
+        return
+
+    with _LAST_MAGNETS_LOCK:
+        _LAST_MAGNETS[alias] = (new_tuple, time.monotonic())
+
+
 def fetch_snapshot() -> Dict[str, Any]:
     try:
         cfg = BridgeConfig.load()
@@ -2064,6 +2138,14 @@ def fetch_snapshot() -> Dict[str, Any]:
                              + traceback.format_exc() + "\n")
             return {"_error": f"{name}: {type(e).__name__}: {e}"}
     snap["or_levels"] = _safe_call(compute_or_levels, "compute_or_levels")
+    # Push the OR grid to the bridge as STOP_SWEEP magnets. Failure is logged
+    # but never propagates — magnet sync is best-effort, snapshot composition
+    # is critical-path.
+    try:
+        _sync_magnet_levels(cfg, alias, snap["or_levels"])
+    except Exception as exc:
+        sys.stderr.write(f"[dashboard] _sync_magnet_levels outer guard: "
+                         f"{type(exc).__name__}: {exc}\n")
     snap["vwap_bias"] = _safe_call(compute_vwap_bias, "compute_vwap_bias")
     snap["vp_bias"]   = _safe_call(compute_vp_bias,   "compute_vp_bias")
     snap["decision"]  = _safe_call(trade_decision,    "trade_decision")

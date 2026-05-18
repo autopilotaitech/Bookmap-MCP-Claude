@@ -69,6 +69,36 @@ Pyproject sets `testpaths: tests`. If `pytest` is missing:
 cd /c/Bookmap/addons/MCP/Bookmap/mcp-server && python -m compileall -q bookmap_mcp
 ```
 
+### Java tests + addon jar build
+
+`java` is usually NOT on PATH. Bookmap ships a full Temurin JDK 17 at
+`C:\Program Files\Bookmap\jre\` — point `JAVA_HOME` there. In PowerShell:
+
+```powershell
+$env:JAVA_HOME = 'C:\Program Files\Bookmap\jre'
+$env:Path = "$env:JAVA_HOME\bin;$env:Path"
+.\gradlew.bat test           # JUnit 5 tests
+.\gradlew.bat build          # produces build/libs/bookmap-mcp-bridge-v<N>.jar
+```
+
+If `gradlew clean` fails with "Unable to delete ... bookmap-mcp-bridge-v<N>.jar",
+Bookmap has the file open. Either close Bookmap, or skip `clean` — the jar
+name is keyed to `version` in `build.gradle` so a new version produces a new
+file alongside the old one.
+
+### Version + build policy
+
+Every commit that changes Java source bumps `version` in `build.gradle` AND
+the `archiveFileName` to `bookmap-mcp-bridge-v<N>.jar`, then rebuilds. Reasons:
+
+- Bookmap loads addons by filename. Same filename = stale cache risk.
+- Version bump is a hard audit trail for which jar shipped which fix.
+- Tested-and-built artifact lives at `build/libs/bookmap-mcp-bridge-v<N>.jar`.
+
+Deploy by copying that jar into the addons folder Bookmap reads from and
+restarting Bookmap. Confirm via the startup line:
+`Bookmap MCP bridge listening on http://127.0.0.1:18888`.
+
 ### Hot-loaded config
 
 `mcp-server/bookmap_mcp/pax_weights.json` reloads automatically on mtime
@@ -79,7 +109,7 @@ change. `_*`-prefixed keys are metadata comments stripped by
 
 - `mcp-server/bookmap_mcp/dashboard.py` — snapshot composer (`fetch_snapshot`),
   `compute_or_levels`, `compute_vwap_bias`, `compute_vp_bias`, `trade_decision`,
-  `compute_session_conviction`. ~3000 lines, audited heavily.
+  `compute_session_conviction`, `_sync_magnet_levels`. ~3000 lines, audited heavily.
 - Session conviction is the v2 anchored multi-source engine. State per alias
   in `_CONVICTION_STATE`. Source helpers under the `_source_*` prefix return
   `{score, reliability, raw, reason}`. See `mcp-server/README.md` for the
@@ -87,6 +117,48 @@ change. `_*`-prefixed keys are metadata comments stripped by
 - Legacy `_regime_to_signal`, `_slope_to_signal`, `_level_to_signal` are
   preserved and reused by v2 sources — don't refactor them away without
   updating the pinned helper-signal tests.
+
+### Bridge HTTP endpoints
+
+All endpoints are guarded by `BridgeAuth` (token from `bridge.properties`).
+Read endpoints are GET; state-changing endpoints are POST.
+
+- `GET  /ping`, `/instruments`
+- `GET  /orderbook`, `/recent_trades`, `/recent_fills`, `/working_orders`,
+       `/position`, `/balance`
+- `GET  /vwap`, `/momentum`, `/volume_profile`, `/tape_buckets`,
+       `/lt_liquidity`, `/book_dynamics`, `/pull_stack`,
+       `/microstructure_events`
+- `POST /magnet_levels` — configures stop-sweep magnet prices.
+       Query params: `alias`, `levels` (comma-separated display prices, empty
+       string clears). Returns `{alias, count, levels}`. Required for
+       `STOP_SWEEP` events to fire — without magnets, `detectStopSweep`
+       early-returns.
+- `POST /place_limit_order`, `/cancel_order` — gated by
+       `BOOKMAP_ALLOW_TRADING=1` in Bookmap's environment.
+- `GET  /screenshot`
+
+Trade `side` follows `TradeInfo.isBidAggressor`: `true` = bid was the
+aggressor (buy aggressor / lifted offer) → `"side":"buy"`. `false` = sell
+aggressor / hit bid → `"side":"sell"`. CVD = buy − sell.
+
+### Dashboard → bridge state sync pattern
+
+`_sync_magnet_levels` in `dashboard.py` is the template for any future
+dashboard-driven bridge configuration call. Pattern:
+
+1. Module-level cache keyed by `alias`, value = `(sorted_payload_tuple,
+   last_post_monotonic_secs)`.
+2. Lock-guarded read/write of the cache.
+3. Short-circuit when the tuple is identical AND the timestamp is younger
+   than a refresh TTL (`_MAGNET_REFRESH_SECS = 60.0`). TTL bounds the
+   "Bookmap restart wiped state, dashboard cache thinks it's still set"
+   failure mode.
+4. Short-lived `BridgeClient(cfg, timeout_s=2.0)`. Cache updated ONLY on
+   successful 2xx; failures log one stderr line and leave the cache empty
+   so the next snapshot retries.
+5. Outer try/except at the call site in `fetch_snapshot` guarantees a sync
+   failure can never break snapshot composition.
 
 ## Git etiquette
 
