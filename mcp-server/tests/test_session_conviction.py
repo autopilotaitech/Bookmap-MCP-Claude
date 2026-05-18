@@ -396,6 +396,61 @@ def test_source_micro_events_stop_sweep_matches_micro_at_level():
         f"_source_micro_events={src:+.2f}, _micro_at_level={lvl:+.2f}")
 
 
+# ─── Orderbook source (V6) ──────────────────────────────────────────────────
+
+def test_source_orderbook_positive_when_bid_heavier():
+    out = d._source_orderbook({"flow":
+        {"bookPressureTop5": 0.6, "bookPressureTop25": 0.4}})
+    # 0.6 * 0.6 + 0.4 * 0.4 = 0.36 + 0.16 = 0.52
+    assert out["score"] == pytest.approx(0.52, abs=1e-6)
+    assert out["reliability"] == 1.0
+
+
+def test_source_orderbook_negative_when_ask_heavier():
+    out = d._source_orderbook({"flow":
+        {"bookPressureTop5": -0.7, "bookPressureTop25": -0.3}})
+    assert out["score"] < 0
+    assert out["reliability"] == 1.0
+
+
+def test_source_orderbook_partial_reliability_when_only_top5():
+    out = d._source_orderbook({"flow":
+        {"bookPressureTop5": 0.5}})
+    assert out["score"] == pytest.approx(0.5, abs=1e-6)
+    assert out["reliability"] == 0.5
+
+
+def test_source_orderbook_zero_reliability_when_missing():
+    assert d._source_orderbook({})["reliability"] == 0.0
+    assert d._source_orderbook({"flow": {}})["reliability"] == 0.0
+    assert d._source_orderbook({"flow": {"_error": "boom"}})["reliability"] == 0.0
+
+
+def test_source_orderbook_score_is_clamped():
+    # Synthetic out-of-band input should still clamp to [-1, +1].
+    out = d._source_orderbook({"flow":
+        {"bookPressureTop5": 5.0, "bookPressureTop25": 5.0}})
+    assert -1.0 <= out["score"] <= 1.0
+
+
+def test_orderbook_is_registered_in_conviction_registry():
+    assert "orderbook" in d._CONVICTION_SOURCES
+    # Must be callable and obey the source contract.
+    out = d._CONVICTION_SOURCES["orderbook"]({"flow":
+        {"bookPressureTop5": 0.3, "bookPressureTop25": 0.2}})
+    for k in ("score", "reliability", "raw", "reason"):
+        assert k in out
+
+
+def test_orderbook_has_weight_in_microstructure_cluster():
+    cfg = d._load_pax_weights()
+    sw = cfg.get("conviction_source_weights") or {}
+    clusters = cfg.get("conviction_clusters") or {}
+    assert sw.get("orderbook", 0.0) > 0.0, "orderbook missing from source weights"
+    assert "orderbook" in (clusters.get("microstructure") or []), (
+        "orderbook missing from microstructure cluster")
+
+
 def test_flow_ofi_sign_matches_z():
     assert d._source_flow_ofi({"flow": {"ofiZ": 2.0}})["score"] > 0.0
     assert d._source_flow_ofi({"flow": {"ofiZ": -2.0}})["score"] < 0.0

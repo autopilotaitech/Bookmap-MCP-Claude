@@ -766,10 +766,19 @@ def compute_or_levels(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     ps_obj   = snap.get("pull_stack")
     lt_obj   = snap.get("lt_liquidity")
-    # Prefer the institutional-flow delta (size-weighted, time-windowed) from
-    # compute_tape_flow. Falls back to the raw /tape_buckets payload only when
-    # tape_flow hasn't been produced yet (cold start, error path).
-    tape_obj = snap.get("tape_flow") or snap.get("tape_buckets")
+    # Per-level tape must use the same institutional-flow delta that the tape
+    # panel and conviction registry use. fetch_snapshot computes tape_flow
+    # before OR levels, but this fallback keeps direct compute_or_levels tests
+    # and older snapshot callers from silently reading raw bucket arrays as
+    # neutral tape.
+    tape_obj = snap.get("tape_flow")
+    if not isinstance(tape_obj, dict) or "_error" in tape_obj or "deltaScore" not in tape_obj:
+        computed_tape = compute_tape_flow(snap)
+        if computed_tape is not None:
+            snap["tape_flow"] = computed_tape
+            tape_obj = computed_tape
+        else:
+            tape_obj = snap.get("tape_buckets")
     me_obj   = snap.get("micro_events")
     vwap_obj = snap.get("vwap_obj")
     vp_obj   = snap.get("volume_profile")
@@ -1718,6 +1727,42 @@ def _tape_source_from_flow(tf: Dict[str, Any], *, fallback: bool) -> Dict[str, A
             "reason": tf.get("deltaReason", f"tape delta={score:+.2f}")}
 
 
+def _source_orderbook(snap: Dict[str, Any]) -> Dict[str, Any]:
+    """Static orderbook depth pressure. Reads bookPressureTop5/25 from the
+    /momentum payload — both are (bid_vol - ask_vol) / total in [-1,+1].
+    Positive = bid side heavier near BBO → bullish.
+
+    Distinct from `flow_ofi` (Cont/Kukanov/Stoikov event-driven OFI delta)
+    and `lt_liquidity` (slow EWMA of resting top-25 liquidity). Captures
+    the instantaneous depth posture at the moment of the snapshot.
+    """
+    flow = snap.get("flow") or {}
+    if "_error" in flow:
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": {"_error": flow.get("_error")},
+                "reason": "flow error"}
+    p5, p5_ok   = _as_float(flow.get("bookPressureTop5"))
+    p25, p25_ok = _as_float(flow.get("bookPressureTop25"))
+    if not p5_ok and not p25_ok:
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": {"bookPressureTop5": None, "bookPressureTop25": None},
+                "reason": "no book pressure"}
+    if p5_ok and p25_ok:
+        # 0.6 fast (top 5) + 0.4 slow (top 25) — close-in matters more for
+        # short-horizon direction, but the wider read stabilizes against
+        # spoof/flicker right at the inside.
+        score = _clip(0.6 * p5 + 0.4 * p25)
+        return {"score": score, "reliability": 1.0,
+                "raw": {"bookPressureTop5": p5, "bookPressureTop25": p25},
+                "reason": f"book p5={p5:+.2f} p25={p25:+.2f}"}
+    # Partial data: one band missing.
+    score = _clip(p5 if p5_ok else p25)
+    return {"score": score, "reliability": 0.5,
+            "raw": {"bookPressureTop5":  p5  if p5_ok  else None,
+                    "bookPressureTop25": p25 if p25_ok else None},
+            "reason": f"book p{'5' if p5_ok else '25'}={score:+.2f} (partial)"}
+
+
 def _source_lt_liquidity(snap: Dict[str, Any]) -> Dict[str, Any]:
     lt = snap.get("lt_liquidity") or {}
     if not lt or "_error" in lt:
@@ -1871,6 +1916,7 @@ _CONVICTION_SOURCES: Dict[str, Any] = {
     "volume_profile":              _source_volume_profile,
     "pull_stack":                  _source_pull_stack,
     "tape_large_lot":              _source_tape_large_lot,
+    "orderbook":                   _source_orderbook,
     "lt_liquidity":                _source_lt_liquidity,
     "micro_events":                _source_micro_events,
     "level_reaction":              _source_level_reaction,
@@ -2649,6 +2695,7 @@ def fetch_snapshot() -> Dict[str, Any]:
             sys.stderr.write(f"[dashboard] {name} crashed: {type(e).__name__}: {e}\n"
                              + traceback.format_exc() + "\n")
             return {"_error": f"{name}: {type(e).__name__}: {e}"}
+    snap["tape_flow"] = _safe_call(compute_tape_flow, "compute_tape_flow")
     snap["or_levels"] = _safe_call(compute_or_levels, "compute_or_levels")
     # Push the OR grid to the bridge as STOP_SWEEP magnets. Failure is logged
     # but never propagates — magnet sync is best-effort, snapshot composition
@@ -2658,7 +2705,6 @@ def fetch_snapshot() -> Dict[str, Any]:
     except Exception as exc:
         sys.stderr.write(f"[dashboard] _sync_magnet_levels outer guard: "
                          f"{type(exc).__name__}: {exc}\n")
-    snap["tape_flow"] = _safe_call(compute_tape_flow, "compute_tape_flow")
     snap["vwap_bias"] = _safe_call(compute_vwap_bias, "compute_vwap_bias")
     snap["vp_bias"]   = _safe_call(compute_vp_bias,   "compute_vp_bias")
     snap["decision"]  = _safe_call(trade_decision,    "trade_decision")
@@ -3500,20 +3546,31 @@ async function refresh() {
       `OR ${fmtP(ol.orLow)} ↔ ${fmtP(ol.orHigh)} · width ${ol.orWidthPts.toFixed(2)} pts · mid ${fmtP(ol.mid)} · prox ±${ol.proxPts.toFixed(2)} pts` + proxTag;
 
     const decClass = (d) => {
-      if (d === 'ENTER_LONG_FOLLOW')  return 'follow-bull';
-      if (d === 'ENTER_SHORT_FOLLOW') return 'follow-bear';
-      if (d === 'ENTER_LONG_FADE')    return 'fade-bull';
-      if (d === 'ENTER_SHORT_FADE')   return 'fade-bear';
+      if (d === 'ENTER_LONG_FOLLOW' || d === 'FOLLOW_LONG')   return 'follow-bull';
+      if (d === 'ENTER_SHORT_FOLLOW' || d === 'FOLLOW_SHORT') return 'follow-bear';
+      if (d === 'ENTER_LONG_FADE' || d === 'FADE_LONG')       return 'fade-bull';
+      if (d === 'ENTER_SHORT_FADE' || d === 'FADE_SHORT')     return 'fade-bear';
       return 'wait';
     };
     const lblClass = (lvl) => {
-      if (lvl.decision.startsWith('ENTER_LONG')) return 'bull';
-      if (lvl.decision.startsWith('ENTER_SHORT')) return 'bear';
+      const dir = (lvl.composite && lvl.composite.direction) || lvl.decision || '';
+      if (dir.indexOf('LONG') >= 0) return 'bull';
+      if (dir.indexOf('SHORT') >= 0) return 'bear';
       return 'flat';
     };
     const expanded = (lvl) => {
+      const comp = lvl.composite || {};
+      const drivers = comp.drivers || [];
+      const driverHtml = drivers.length
+        ? drivers.map(d => {
+            const v = Number(d.score || 0);
+            const w = Number(d.weight || 0);
+            return `<div><div class="ck">${d.name}</div><div class="cv" title="${d.reason || ''}">${v>=0?'+':''}${v.toFixed(2)} @ ${w.toFixed(2)}</div></div>`;
+          }).join('')
+        : '';
       const c = lvl.components || {};
       return `<div class="lvl-detail">` +
+        driverHtml +
         `<div><div class="ck">PS BBO z</div><div class="cv">${c.ps_bbo>=0?'+':''}${c.ps_bbo}</div></div>` +
         `<div><div class="ck">PS rot</div><div class="cv">${c.ps_rot} (${c.ps_rot_mag})</div></div>` +
         `<div><div class="ck">LT lean</div><div class="cv">${c.lt>=0?'+':''}${c.lt}</div></div>` +
@@ -3530,33 +3587,26 @@ async function refresh() {
     if (ol.middleLock) {
       html += `<div class="middle-lock">⚠ MIDDLE LOCK — price inside OR, no proximity to any level. STAND DOWN.</div>`;
     }
-    // Max |distance| across rungs — used to normalize per-row intensity
-    const maxDist = (ol.levels || []).reduce(
-        (m, l) => Math.max(m, Math.abs(Number(l.distance) || 0)), 1);
     html += `<div class="lvl-grid">`;
     ol.levels.forEach(lvl => {
       const cls = lvl.proximity ? 'proximity' : '';
       const distSign = lvl.distance >= 0 ? '+' : '';
-      const confPct = Math.round(lvl.confidence * 100);
-      const barW = Math.max(2, Math.round(lvl.confidence * 50));
-      // Heatmap row background — gradient from edge (saturated) toward middle (faded)
-      // aligned levels get trend color; against gets opposite hue, dimmer.
+      const comp = lvl.composite || {};
+      const compScore = (typeof comp.score === 'number') ? comp.score : Number(lvl.score || 0);
+      const compConf = (typeof comp.confidence === 'number') ? comp.confidence : Number(lvl.confidence || 0);
+      const compDir = comp.direction || lvl.decision || 'WAIT';
+      const confPct = Math.round(compConf * 100);
+      const barW = Math.max(2, Math.round(compConf * 50));
+      // Heatmap row background uses the same per-magnet composite as the row text.
       let heatCls = '', heatStyle = '';
-      if (trendDir !== 0 && trendMag > 0.08 && typeof lvl.distance === 'number') {
-        const aligned = (trendDir > 0 && lvl.distance > 0) || (trendDir < 0 && lvl.distance < 0);
-        // Distance-weighted intensity — far rungs in trend direction glow more
-        const distNorm = Math.min(1, Math.abs(lvl.distance) / maxDist);   // 0..1
-        const baseA = trendMag * (aligned ? 0.55 : 0.30);
-        const alphaN = baseA * (0.55 + 0.45 * distNorm);                  // numeric
+      const rowDir = compScore > 0.08 ? 1 : (compScore < -0.08 ? -1 : 0);
+      const rowMag = Math.abs(compScore);
+      if (rowDir !== 0 && rowMag > 0.08) {
+        const alphaN = rowMag * 0.55;
         const a = alphaN.toFixed(2);
         const af = (alphaN * 0.35).toFixed(2);
-        const hue = aligned
-          ? (trendDir > 0 ? '158,206,106' : '247,118,142')
-          : (trendDir > 0 ? '247,118,142' : '158,206,106');
-        // Bull/aligned (level above price, trend up): tint stronger on the LEFT (label side), fades right.
-        // Bear/aligned (level below price, trend down): tint stronger on the RIGHT.
-        const dirFlip = (trendDir > 0) === aligned;
-        const stops = dirFlip
+        const hue = rowDir > 0 ? '158,206,106' : '247,118,142';
+        const stops = rowDir > 0
           ? `rgba(${hue},${a}) 0%, rgba(${hue},${af}) 60%, transparent 100%`
           : `transparent 0%, rgba(${hue},${af}) 40%, rgba(${hue},${a}) 100%`;
         heatCls = 'heat';
@@ -3566,9 +3616,12 @@ async function refresh() {
       html += `<span class="lvl-lbl ${lblClass(lvl)}">${lvl.label}</span>`;
       html += `<span class="lvl-price">${fmtP(lvl.price)}</span>`;
       html += `<span class="lvl-dist">${distSign}${lvl.distance.toFixed(2)} pts</span>`;
-      html += `<span class="lvl-dec ${decClass(lvl.decision)}">${lvl.decisionLabel || lvl.decision.replace('ENTER_','').replace('_',' ')}</span>`;
-      const rsn = (lvl.reasons || []).slice(0,4).join(' · ');
-      html += `<span class="lvl-rsn" title="${(lvl.reasons||[]).join(' | ')}">${rsn}</span>`;
+      html += `<span class="lvl-dec ${decClass(compDir)}">${compDir.replace('ENTER_','').replace('_',' ')}</span>`;
+      const driverReasons = (comp.drivers || []).map(d => `${d.name}: ${d.reason}`);
+      const warnings = comp.warnings || [];
+      const rsnParts = driverReasons.length ? driverReasons : (lvl.reasons || []);
+      const rsn = rsnParts.slice(0,4).join(' · ');
+      html += `<span class="lvl-rsn" title="${rsnParts.concat(warnings).join(' | ')}">${rsn}</span>`;
       html += `<span class="lvl-conf"><span class="bar-fill" style="width:${barW}px;"></span> ${confPct}%</span>`;
       if (lvl.proximity) html += expanded(lvl);
       html += `</div>`;

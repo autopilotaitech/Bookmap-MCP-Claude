@@ -17,6 +17,7 @@
     "volume_profile":              0.08,
     "pull_stack":                  0.10,
     "tape_large_lot":              0.06,
+    "orderbook":                   0.05,
     "lt_liquidity":                0.04,
     "micro_events":                0.04,
     "level_reaction":              0.08,
@@ -29,7 +30,7 @@
     "flow":           ["flow_ofi", "flow_cvd", "bias_score", "regime"],
     "vwap":           ["vwap_dislocation", "vwap_slope", "anchored_vwap_opening_drive"],
     "structure":      ["volume_profile", "ib_context"],
-    "microstructure": ["pull_stack", "tape_large_lot", "lt_liquidity", "micro_events"]
+    "microstructure": ["pull_stack", "tape_large_lot", "orderbook", "lt_liquidity", "micro_events"]
   },
 
   "conviction_cluster_caps": {

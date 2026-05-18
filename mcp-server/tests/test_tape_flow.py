@@ -261,6 +261,36 @@ def test_compute_or_levels_wires_tape_flow_into_levels():
             f"components={lvl['components']}")
 
 
+def test_compute_or_levels_computes_tape_flow_before_scoring_raw_buckets():
+    """Regression: OR rows once saw raw tape_buckets before tape_flow existed,
+    so their tape component stayed neutral while the tape panel showed flow.
+    """
+    snap = {
+        "or_row": {"orHigh": "20100.00", "orLow": "20000.00"},
+        "book": {"mid": 20050.0},
+        "tape_buckets": {"buckets": [
+            _bucket("1-10", buy30=10, sell30=5, prints30=3),
+            _bucket("11-25", buy30=20, sell30=10, prints30=2),
+            _bucket("26-50", buy30=50, sell30=20, prints30=2),
+            _bucket("51-99", buy30=360, sell30=20, prints30=6),
+            _bucket("100+", buy30=300, sell30=0, prints30=3),
+        ]},
+    }
+
+    out = dash.compute_or_levels(snap)
+
+    assert out is not None
+    assert "tape_flow" in snap
+    assert snap["tape_flow"]["deltaScore"] > 0.4
+    for lvl in out["levels"]:
+        assert lvl["components"]["tape"] == pytest.approx(
+            snap["tape_flow"]["deltaScore"], abs=1e-6)
+        tape_driver = next(d for d in lvl["composite"]["drivers"]
+                           if d["name"] == "tape")
+        assert tape_driver["score"] == pytest.approx(
+            snap["tape_flow"]["deltaScore"], abs=1e-6)
+
+
 def test_compute_session_conviction_includes_tape_when_valid():
     # Minimal snap that compute_session_conviction can iterate over without
     # crashing. We only care that tape_large_lot is in the per-source output
