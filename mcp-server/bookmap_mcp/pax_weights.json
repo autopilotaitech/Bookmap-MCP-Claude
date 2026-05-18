@@ -36,7 +36,7 @@
 
   "conviction_cluster_caps": {
     "flow":           0.35,
-    "vwap":           0.25,
+    "vwap":           0.30,
     "structure":      0.20,
     "microstructure": 0.30
   },
