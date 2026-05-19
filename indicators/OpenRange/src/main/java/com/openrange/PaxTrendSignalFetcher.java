@@ -10,7 +10,15 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import velox.api.layer1.common.Log;
 
-final class PaxHeatwaveFetcher {
+/**
+ * Polls {@code /api/snapshot} for {@code trend_signal}. Mirrors
+ * {@link PaxHeatwaveFetcher} exactly: same poll cadence, same timeouts,
+ * same backoff. The worker MUST NOT touch the Bookmap canvas — it only
+ * updates {@link #latest} and fires the repaint callback (which sets a
+ * dirty-bit on the module). All canvas mutations happen on Bookmap
+ * callbacks inside {@code PaxPainter.update()}.
+ */
+final class PaxTrendSignalFetcher {
 
     static final long REQUEST_TIMEOUT_MS = 750L;
     static final long CONNECT_TIMEOUT_MS = 750L;
@@ -27,33 +35,28 @@ final class PaxHeatwaveFetcher {
     private volatile boolean enabled;
     private volatile String url = DEFAULT_URL;
     private volatile int pollMs = 1000;
-    private volatile PaxHeatwaveModel latest;
+    private volatile PaxTrendSignalModel latest;
     private final AtomicInteger consecutiveFailures = new AtomicInteger(0);
     private final AtomicLong lastWarnLogMs = new AtomicLong(0L);
     /** Last failure reason (short, never contains the token) and timestamp.
-     * Used by the painter to render DASHBOARD OFFLINE when the dashboard
-     * HTTP endpoint itself is unreachable. */
+     * Mirrors PaxHeatwaveFetcher so diagnostics see the same surface on both. */
     private volatile String lastFailureReason = "";
     private volatile long lastFailureAtMs = 0L;
 
-    PaxHeatwaveFetcher(Runnable repaintCallback) {
+    PaxTrendSignalFetcher(Runnable repaintCallback) {
         this.repaintCallback = repaintCallback;
     }
 
-    void applySettings(PaxOpeningRangeUiSettings s) {
-        if (s == null) {
-            return;
-        }
-        boolean shouldRun = s.showHeatwaveBox;
-        String newUrl = s.heatwaveUrl == null || s.heatwaveUrl.isBlank() ? DEFAULT_URL : s.heatwaveUrl;
-        int newPoll = Math.max(500, Math.min(3000, s.heatwavePollMs));
+    void applySettings(boolean showTriangles, String settingsUrl, int settingsPollMs) {
+        String newUrl = (settingsUrl == null || settingsUrl.isBlank()) ? DEFAULT_URL : settingsUrl;
+        int newPoll = Math.max(500, Math.min(3000, settingsPollMs));
         synchronized (lifecycleLock) {
             this.url = newUrl;
             this.pollMs = newPoll;
-            this.enabled = shouldRun;
-            if (shouldRun && worker == null) {
+            this.enabled = showTriangles;
+            if (showTriangles && worker == null) {
                 startWorkerLocked();
-            } else if (!shouldRun && worker != null) {
+            } else if (!showTriangles && worker != null) {
                 stopWorkerInternal();
             }
         }
@@ -67,61 +70,9 @@ final class PaxHeatwaveFetcher {
         }
     }
 
-    void stop() {
-        stopWorkerInternal();
-    }
+    void stop() { stopWorkerInternal(); }
 
-    PaxHeatwaveModel snapshot() {
-        return latest;
-    }
-
-    /** Threshold for escalating from "stale live model" to DASHBOARD_OFFLINE.
-     * After this many consecutive HTTP failures we stop trusting the cached
-     * last-success model and synthesize an offline carrier so the painter
-     * tells the operator the dashboard is unreachable, not just stale. */
-    static final int STALE_FAIL_THRESHOLD = 5;
-
-    /** Disposition-aware view used by the painter.
-     *
-     * <p>Decision tree:</p>
-     * <ul>
-     *   <li>{@code latest == null && consecutiveFailures > 0}
-     *       → DASHBOARD_OFFLINE (we never got a single successful response).</li>
-     *   <li>{@code latest == null && consecutiveFailures == 0}
-     *       → null (caller renders NO_DATA — cold start before any tick).</li>
-     *   <li>{@code latest != null && consecutiveFailures >= STALE_FAIL_THRESHOLD}
-     *       → DASHBOARD_OFFLINE (we had a success once but the dashboard has
-     *       been unreachable for at least STALE_FAIL_THRESHOLD ticks; stop
-     *       showing the stale live model).</li>
-     *   <li>otherwise → latest (which may itself be a BRIDGE_OFFLINE carrier
-     *       if the dashboard returned {@code health=offline}; the painter
-     *       handles that via {@code model.state}).</li>
-     * </ul>
-     *
-     * <p>STALE_AGE_MS handling (painter showing "STALE" on a LIVE model with
-     * old fetchedAtMs) is independent of this escalation and continues to
-     * apply: a fresh-success that hasn't been retried yet still ages out
-     * via {@link PaxHeatwaveModel#ageState(long, long, long)}.</p>
-     */
-    PaxHeatwaveModel effectiveModel(long nowMs) {
-        PaxHeatwaveModel cur = latest;
-        int fails = consecutiveFailures.get();
-        if (cur == null) {
-            if (fails > 0) {
-                String reason = lastFailureReason.isEmpty() ? "unreachable" : lastFailureReason;
-                return PaxHeatwaveModel.dashboardOffline(nowMs, url, reason);
-            }
-            return null;
-        }
-        // We had a successful fetch at some point — but if the dashboard has
-        // since been unreachable for a sustained run, escalate so the
-        // operator doesn't keep staring at a frozen "live" overlay.
-        if (fails >= STALE_FAIL_THRESHOLD) {
-            String reason = lastFailureReason.isEmpty() ? "unreachable" : lastFailureReason;
-            return PaxHeatwaveModel.dashboardOffline(nowMs, url, reason);
-        }
-        return cur;
-    }
+    PaxTrendSignalModel snapshot() { return latest; }
 
     String lastFailureReason() { return lastFailureReason; }
     long lastFailureAtMs() { return lastFailureAtMs; }
@@ -132,17 +83,13 @@ final class PaxHeatwaveFetcher {
         return t != null && t.isAlive();
     }
 
-    int consecutiveFailures() {
-        return consecutiveFailures.get();
-    }
+    int consecutiveFailures() { return consecutiveFailures.get(); }
 
-    void tickOnceForTest() {
-        tickOnce(System.currentTimeMillis());
-    }
+    void tickOnceForTest() { tickOnce(System.currentTimeMillis()); }
 
     private void startWorkerLocked() {
         ensureHttpClient();
-        Thread t = new Thread(this::loop, "OpenRange-Heatwave-Fetcher");
+        Thread t = new Thread(this::loop, "OpenRange-TrendSignal-Fetcher");
         t.setDaemon(true);
         worker = t;
         t.start();
@@ -204,12 +151,12 @@ final class PaxHeatwaveFetcher {
                 handleFailure(nowMs, "http " + status);
                 return false;
             }
-            PaxHeatwaveModel parsed = PaxHeatwaveSnapshotParser.parse(resp.body(), nowMs);
+            PaxTrendSignalModel parsed = PaxTrendSignalSnapshotParser.parse(resp.body(), nowMs);
             latest = parsed;
             consecutiveFailures.set(0);
             fireRepaint();
             return true;
-        } catch (PaxHeatwaveSnapshotParser.ParseException pe) {
+        } catch (PaxTrendSignalSnapshotParser.ParseException pe) {
             handleFailure(nowMs, "parse: " + pe.getMessage());
             return false;
         } catch (Exception e) {
@@ -226,9 +173,9 @@ final class PaxHeatwaveFetcher {
         if (fails == 1 || nowMs - last >= LOG_THROTTLE_MS) {
             if (lastWarnLogMs.compareAndSet(last, nowMs)) {
                 try {
-                    Log.warn("OpenRange heatwave fetch failed (" + fails + ") " + reason);
+                    Log.warn("OpenRange trend_signal fetch failed (" + fails + ") " + reason);
                 } catch (Throwable t) {
-                    // Bookmap Log may be unavailable in unit tests; suppress
+                    // Bookmap Log unavailable in unit tests; suppress.
                 }
             }
         }
@@ -239,24 +186,18 @@ final class PaxHeatwaveFetcher {
 
     private void fireRepaint() {
         Runnable cb = repaintCallback;
-        if (cb == null) {
-            return;
-        }
+        if (cb == null) return;
         try {
             cb.run();
         } catch (Throwable t) {
-            // Never let painter exceptions kill the fetch loop
+            // Never let painter exceptions kill the fetch loop.
         }
     }
 
     long computeSleepMs(boolean ok) {
-        if (ok) {
-            return pollMs;
-        }
+        if (ok) return pollMs;
         int fails = consecutiveFailures.get();
-        if (fails < FAIL_BACKOFF_THRESHOLD) {
-            return pollMs;
-        }
+        if (fails < FAIL_BACKOFF_THRESHOLD) return pollMs;
         long shift = Math.min(3, fails - FAIL_BACKOFF_THRESHOLD + 1);
         long backoff = pollMs * (1L << shift);
         return Math.max(500L, Math.min(MAX_BACKOFF_MS, backoff));

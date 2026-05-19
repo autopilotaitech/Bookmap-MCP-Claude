@@ -26,6 +26,11 @@ _phase_backups/
 # Superpowers / skill scratch dirs (workspace-local brainstorming, not source)
 .superpowers/
 
+# Nested worktree of the upstream trendanalyzer-mvp addon. Its calc classes
+# are PORTED into src/main/java/com/bookmapmcp/trend/ — the upstream addon
+# itself must NOT be vendored or submoduled into this repo.
+indicators/trendanalyzer-mvp/
+
 # Runtime auto-saved settings checkpoint (hot-reloaded by dashboard; not config)
 mcp-server/bookmap_mcp/pax_settings.last_good.json
 

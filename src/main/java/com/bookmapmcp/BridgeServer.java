@@ -32,6 +32,7 @@ import com.bookmapmcp.handlers.RecentTradesHandler;
 import com.bookmapmcp.handlers.ScreenshotHandler;
 import com.bookmapmcp.handlers.TapeBucketsHandler;
 import com.bookmapmcp.handlers.TradingHandler;
+import com.bookmapmcp.handlers.TrendAnalyzerHandler;
 import com.bookmapmcp.handlers.VolumeProfileHandler;
 import com.bookmapmcp.handlers.VwapHandler;
 import com.bookmapmcp.handlers.WorkingOrdersHandler;
@@ -75,6 +76,7 @@ public final class BridgeServer {
             http.createContext("/book_dynamics",   auth.guard(new BookDynamicsHandler()));
             http.createContext("/pull_stack",      auth.guard(new PullStackHandler()));
             http.createContext("/microstructure_events", auth.guard(new MicrostructureEventsHandler()));
+            http.createContext("/trend_analyzer",  auth.guard(new TrendAnalyzerHandler()));
             http.createContext("/magnet_levels",   auth.guard(new MagnetLevelsHandler()));
             http.createContext("/config",          auth.guard(new ConfigHandler()));
             http.createContext("/screenshot",      auth.guard(new ScreenshotHandler()));

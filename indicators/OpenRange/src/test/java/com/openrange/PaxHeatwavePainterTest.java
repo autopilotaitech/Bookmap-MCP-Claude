@@ -11,6 +11,11 @@ public class PaxHeatwavePainterTest {
         noDataModelRendersAmberHeader();
         differentTonesProduceDifferentRowTints();
         ageBeyondStaleThresholdShowsStale();
+        System.out.println("PaxHeatwavePainterTest OK");
+        // AWT BufferedImage/Graphics2D can spin up a non-daemon EventQueue
+        // thread under some JVM/OS combos. Force exit so build.ps1 never
+        // hangs waiting for the EDT to die.
+        System.exit(0);
     }
 
     private static void rendersWithinExpectedBox() {

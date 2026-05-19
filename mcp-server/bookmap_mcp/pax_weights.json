@@ -23,7 +23,13 @@
     "micro_events":                0.04,
     "level_reaction":              0.08,
     "anchored_vwap_opening_drive": 0.08,
-    "ib_context":                  0.04
+    "ib_context":                  0.04,
+    "trend_analyzer":              0.06
+  },
+
+  "conviction_source_share_caps": {
+    "_comment": "Per-source ceiling on |effective_w_name| / sum(|effective_w|). Applied AFTER cluster caps. trend_analyzer cap=0.10 means it cannot account for more than 10% of the normalized weighted sum, no matter what the other sources do. When every other source has reliability 0, trend_analyzer's effective weight is zeroed (it cannot single-handedly produce a composite signal).",
+    "trend_analyzer": 0.10
   },
 
   "conviction_clusters": {

@@ -14,8 +14,10 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -89,6 +91,29 @@ public class PaxOpeningRangeModule implements
     private static final long REPAINT_THROTTLE_NANOS = 1_000_000_000L;
     private static final long DEPTH_SIGNAL_THROTTLE_NANOS = 50_000_000L;
     private static final int FEATURE_CACHE_HISTORY_SIZE = 1_024;
+    static final int MAX_LIVE_TRIANGLES = 8;
+    /** Stale-cliff for incoming trend_signal: keep existing triangles drawn,
+     * but do not emit new ones if the fetcher's last successful HTTP receive
+     * is older than this. */
+    static final long TREND_STALE_AGE_MS = 30_000L;
+    /** Triangle anchor offset in ticks. Strong sits further out so the two
+     * sizes are distinguishable at the same price. */
+    static final int TRIANGLE_OFFSET_TICKS_STRONG = 4;
+    static final int TRIANGLE_OFFSET_TICKS_WEAK = 2;
+
+    /** Immutable in-flight triangle event held by PaxPainter for redraw. */
+    static final class TrendTriangleEvent {
+        final PaxTrendSignalModel.Kind kind;
+        final long bucketEnteredMs;
+        final long eventMs;
+        final double mid;
+        TrendTriangleEvent(PaxTrendSignalModel.Kind kind, long bucketEnteredMs, long eventMs, double mid) {
+            this.kind = kind;
+            this.bucketEnteredMs = bucketEnteredMs;
+            this.eventMs = eventMs;
+            this.mid = mid;
+        }
+    }
 
     private final Layer1ApiProvider provider;
     private final Map<String, InstrumentState> instruments = new ConcurrentHashMap<>();
@@ -97,6 +122,8 @@ public class PaxOpeningRangeModule implements
     private final PaxOpeningRangeCrossMarketState crossMarketState = new PaxOpeningRangeCrossMarketState();
     private final PaxHeatwaveFetcher heatwave;
     private final AtomicBoolean heatwaveDirty = new AtomicBoolean(false);
+    private final PaxTrendSignalFetcher trendSignals;
+    private final AtomicBoolean trendSignalDirty = new AtomicBoolean(false);
     private volatile DataStructureInterface dataStructureInterface;
     private volatile SettingsAccess settingsAccess;
     private volatile PaxOpeningRangeUiSettings uiSettings = new PaxOpeningRangeUiSettings();
@@ -104,12 +131,14 @@ public class PaxOpeningRangeModule implements
     public PaxOpeningRangeModule(Layer1ApiProvider provider) {
         this.provider = provider;
         this.heatwave = new PaxHeatwaveFetcher(() -> heatwaveDirty.set(true));
+        this.trendSignals = new PaxTrendSignalFetcher(() -> trendSignalDirty.set(true));
         ListenableHelper.addListeners(provider, this);
     }
 
     @Override
     public void finish() {
         heatwave.stop();
+        trendSignals.stop();
         synchronized (indicatorsFullNameToUserName) {
             for (String userName : indicatorsFullNameToUserName.values()) {
                 provider.sendUserMessage(Layer1ApiUserMessageModifyScreenSpacePainter
@@ -127,6 +156,10 @@ public class PaxOpeningRangeModule implements
 
     boolean consumeHeatwaveDirty() {
         return heatwaveDirty.compareAndSet(true, false);
+    }
+
+    boolean consumeTrendSignalDirty() {
+        return trendSignalDirty.compareAndSet(true, false);
     }
 
     @Override
@@ -354,6 +387,10 @@ public class PaxOpeningRangeModule implements
             uiSettings = stored;
         }
         heatwave.applySettings(uiSettings);
+        // Trend triangles share the dashboard URL with the heatwave box —
+        // single source for the polled /api/snapshot endpoint.
+        trendSignals.applySettings(uiSettings.showTrendTriangles,
+                uiSettings.safeHeatwaveUrl(), uiSettings.clampedHeatwavePollMs());
     }
 
     @Override
@@ -459,6 +496,13 @@ public class PaxOpeningRangeModule implements
         panel.add(showHeatwaveBox, c);
         c.gridwidth = 1;
 
+        JCheckBox showTrendTriangles = new JCheckBox("Show Trend Triangles (conviction)", settings.showTrendTriangles);
+        c.gridx = 0;
+        c.gridy = row++;
+        c.gridwidth = 4;
+        panel.add(showTrendTriangles, c);
+        c.gridwidth = 1;
+
         JSpinner heatwaveBoxX = spinner(settings.clampedHeatwaveBoxX(), 0, 4000, 2);
         row = addRow(panel, c, row, "Heatwave box X", heatwaveBoxX);
 
@@ -506,6 +550,7 @@ public class PaxOpeningRangeModule implements
             settings.heatwaveFontSize = (Integer) heatwaveFontSize.getValue();
             settings.heatwavePollMs = (Integer) heatwavePollMs.getValue();
             settings.heatwaveUrl = heatwaveUrl.getText();
+            settings.showTrendTriangles = showTrendTriangles.isSelected();
             saveSettings(null, settings);
             rebuildCalculators();
         };
@@ -534,6 +579,7 @@ public class PaxOpeningRangeModule implements
         blockCrossDivergence.addActionListener(e -> apply.run());
         showMid.addActionListener(e -> apply.run());
         showHeatwaveBox.addActionListener(e -> apply.run());
+        showTrendTriangles.addActionListener(e -> apply.run());
         heatwaveUrl.addActionListener(e -> apply.run());
 
         return new StrategyPanel[] {panel};
@@ -561,6 +607,8 @@ public class PaxOpeningRangeModule implements
             access.setSettings(alias, SETTINGS_KEY, settings, PaxOpeningRangeUiSettings.class);
         }
         heatwave.applySettings(settings);
+        trendSignals.applySettings(settings.showTrendTriangles,
+                settings.safeHeatwaveUrl(), settings.clampedHeatwavePollMs());
     }
 
     private String diagnosticsText(String alias) {
@@ -637,6 +685,13 @@ public class PaxOpeningRangeModule implements
         LocalDate orderFlowDate;
         long lastRepaintTime;
         long lastDepthSignalTime;
+        // Trend triangle dedup + history. Mutated only by PaxPainter.update()
+        // (Bookmap callback thread). The deque holds visible triangle events
+        // so a full `clear()` + redraw on every repaint preserves the chart
+        // across pans/zooms. Cap at 8 keeps the chart readable.
+        final Deque<TrendTriangleEvent> liveTriangles = new ArrayDeque<>(MAX_LIVE_TRIANGLES + 1);
+        String lastEmittedKind = "";
+        long lastEmittedBucketEnteredMs = 0L;
 
         InstrumentState(InstrumentInfo info, double pips, PaxOpeningRangeSettings settings) {
             this.info = info;
@@ -750,7 +805,7 @@ public class PaxOpeningRangeModule implements
         }
 
         boolean shouldRepaint(long eventTime) {
-            if (consumeHeatwaveDirty()) {
+            if (consumeHeatwaveDirty() || consumeTrendSignalDirty()) {
                 lastRepaintTime = eventTime;
                 return true;
             }
@@ -850,11 +905,80 @@ public class PaxOpeningRangeModule implements
             } else {
                 addSignalStatus(state.featureCache.latest());
             }
+            if (ui.showTrendTriangles) {
+                addTrendTriangles(state);
+            }
+        }
+
+        /**
+         * Dedup + render trend triangles. Runs only on the Bookmap callback
+         * thread (PaxPainter.update is synchronized). Mutates
+         * state.liveTriangles, state.lastEmittedKind, state.lastEmittedBucketEnteredMs.
+         */
+        private void addTrendTriangles(InstrumentState state) {
+            PaxTrendSignalModel signal = trendSignals.snapshot();
+            long nowMs = System.currentTimeMillis();
+            // Emit-new logic: PaxTrendTriangleDedup.shouldEmit applies the
+            // full gate (eligible / fresh / renderable / valid mid / valid
+            // tick / dedup tuple). Centralising the rule there means we
+            // don't duplicate stale/eligibility checks at the call site.
+            if (PaxTrendTriangleDedup.shouldEmit(signal, nowMs, TREND_STALE_AGE_MS,
+                    state.lastEmittedKind, state.lastEmittedBucketEnteredMs,
+                    state.pips)) {
+                TrendTriangleEvent evt = new TrendTriangleEvent(
+                        signal.kind, signal.bucketEnteredMs, signal.eventMs, signal.mid);
+                state.liveTriangles.addLast(evt);
+                while (state.liveTriangles.size() > MAX_LIVE_TRIANGLES) {
+                    state.liveTriangles.pollFirst();
+                }
+                state.lastEmittedKind = signal.kind.name();
+                state.lastEmittedBucketEnteredMs = signal.bucketEnteredMs;
+            }
+            // Redraw every live triangle. update() called clear() at top,
+            // so each refresh re-adds the deque contents.
+            for (TrendTriangleEvent evt : state.liveTriangles) {
+                drawTrendTriangle(state, evt);
+            }
+        }
+
+        private void drawTrendTriangle(InstrumentState state, TrendTriangleEvent evt) {
+            int w = PaxTrendTrianglePainter.pixelWidth(evt.kind);
+            int h = PaxTrendTrianglePainter.pixelHeight(evt.kind);
+            PreparedImage image = PaxTrendTrianglePainter.render(evt.kind);
+            long xNanos = PaxChartTimeCoords.epochMsToChartNanos(evt.eventMs);
+            int offsetTicks = evt.kind.isStrong()
+                    ? TRIANGLE_OFFSET_TICKS_STRONG
+                    : TRIANGLE_OFFSET_TICKS_WEAK;
+            double tickSize = state.pips;
+            double anchorPrice;
+            int yPxTop, yPxBottom;
+            if (evt.kind.isBull()) {
+                // Bullish: triangle BELOW price (anchor offset down).
+                anchorPrice = (evt.mid - offsetTicks * tickSize) / tickSize;
+                // y-pixels: image extends downward from anchor.
+                yPxTop = 0;
+                yPxBottom = h;
+            } else {
+                // Bearish: triangle ABOVE price (anchor offset up).
+                anchorPrice = (evt.mid + offsetTicks * tickSize) / tickSize;
+                // y-pixels: image extends upward from anchor.
+                yPxTop = -h;
+                yPxBottom = 0;
+            }
+            addShape(image,
+                    new CompositeHorizontalCoordinate(CompositeCoordinateBase.DATA_ZERO, -w / 2, xNanos),
+                    new CompositeVerticalCoordinate(CompositeCoordinateBase.DATA_ZERO, yPxTop, anchorPrice),
+                    new CompositeHorizontalCoordinate(CompositeCoordinateBase.DATA_ZERO, w / 2, xNanos),
+                    new CompositeVerticalCoordinate(CompositeCoordinateBase.DATA_ZERO, yPxBottom, anchorPrice));
         }
 
         private void addHeatwaveBox(PaxOpeningRangeUiSettings ui) {
-            PaxHeatwaveModel model = heatwave.snapshot();
             long now = System.currentTimeMillis();
+            // effectiveModel synthesizes a DASHBOARD_OFFLINE carrier when the
+            // fetcher has never had a successful response. Otherwise it
+            // returns the last parsed model (which may itself be a
+            // BRIDGE_OFFLINE carrier if the dashboard said so).
+            PaxHeatwaveModel model = heatwave.effectiveModel(now);
             if (model == null) {
                 model = PaxHeatwaveModel.noData(now);
             }

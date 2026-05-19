@@ -97,7 +97,71 @@ the `archiveFileName` to `bookmap-mcp-bridge-v<N>.jar`, then rebuilds. Reasons:
 
 Deploy by copying that jar into the addons folder Bookmap reads from and
 restarting Bookmap. Confirm via the startup line:
-`Bookmap MCP bridge listening on http://127.0.0.1:18888`.
+`Bookmap MCP bridge listening on http://127.0.0.1:8765` (port from
+`~/.bookmap-mcp/bridge.properties`, not 18888).
+
+### Runtime operator scripts
+
+Three PowerShell entry points at the repo root + `scripts/`:
+
+- `.\build-and-deploy.ps1` — runs `gradlew clean test jar`, locates the
+  newest `bookmap-mcp-bridge-v<N>.jar` in `build/libs/`, installs it as
+  the canonical `C:\Bookmap\addons\bookmap-mcp-bridge.jar`, and
+  **quarantines every other `bookmap-mcp-bridge*.jar` anywhere under
+  `C:\Bookmap\addons` (including this repo's `build/libs/` and
+  `_phase_backups/`)** into `C:\Bookmap\addons-archive\bookmap-mcp-bridge\`.
+  Bookmap scans addons recursively and this repo lives under that tree,
+  so build artefacts left in `build/libs/` are load candidates. Hard
+  invariant at the end: exactly one bridge jar may remain under
+  `C:\Bookmap\addons` and it must be the canonical install — script
+  throws otherwise. Waits for Bookmap to close before the copy.
+- `.\dashboard-start.ps1` — clears stale `__pycache__`, launches
+  `python -B -u -m bookmap_mcp.dashboard --port 18888` in a new window
+  using `mcp-server\.venv\Scripts\python.exe`. **Verifies port owner**:
+  if 18888 is already listening, probes `/api/snapshot`; only continues
+  if the response is valid dashboard JSON. Hard error if some other
+  process owns the port. Prints DASHBOARD ONLINE / DASHBOARD ONLINE -
+  BRIDGE OFFLINE with structured nextSteps after start.
+- `.\scripts\verify-runtime.ps1` — four-layer diagnostic.
+  - Layer -1: **addon jar hygiene** — recursive scan, must be exactly
+    one match at the canonical path.
+  - Layer 0: direct Java bridge probe (`/ping` / `/instruments` /
+    `/trend_analyzer`) using URL + token from `BOOKMAP_BRIDGE_URL/TOKEN`
+    env or `~/.bookmap-mcp/bridge.properties`. Token never printed.
+    Distinguishes refused / timeout / 401 / 404 / no-instruments.
+  - Layer 1: Python dashboard `/api/snapshot` reachable.
+  - Layer 2: dashboard reports `health=ok` (vs structured offline
+    diagnostic).
+  - Layer 3: OpenRange's poll URL matches the dashboard URL.
+  Final summary prints `FULL CHAIN HEALTHY` only when every layer
+  passes.
+
+### Bridge-offline diagnostic shape
+
+When `/api/snapshot` cannot reach the bridge, `fetch_snapshot` returns
+a structured payload (NOT a bare `{"health":"offline"}`):
+```
+{
+  "health": "offline", "bridgeUrl": "http://127.0.0.1:8765",
+  "bridgeReachable": false, "bridgeError": "...",
+  "dashboardPort": 18888,
+  "expectedBridgeConfigPath": "<path to bridge.properties>",
+  "tokenConfigured": true|false,
+  "nextSteps": [ ... actionable steps ... ],
+  "error": "<legacy mirror of bridgeError>",
+}
+```
+First entry of `nextSteps` is failure-class-specific (`"timed out"`,
+`"connection refused"`, `"401 unauthorized"`). The token is NEVER
+included. Pinned by `test_offline_snapshot_shape.py` (5 tests including
+a token-leak guard). OpenRange's `PaxHeatwaveSnapshotParser` detects
+`health=offline` and produces a `PaxHeatwaveModel.State.BRIDGE_OFFLINE`
+carrier so the chart overlay shows `BRIDGE OFFLINE` + reason instead
+of generic `NO DATA`. `PaxHeatwaveFetcher.effectiveModel(nowMs)`
+escalates to `State.DASHBOARD_OFFLINE` when the dashboard HTTP endpoint
+has been unreachable for `STALE_FAIL_THRESHOLD = 5` consecutive ticks
+even after a prior success (so the chart never silently shows a frozen
+"live" overlay).
 
 ### Hot-loaded config
 
@@ -187,6 +251,78 @@ the launcher defaults to the Rithmic NQ alias.
   weights in `_LVL_W`. Direction = FOLLOW_LONG / FOLLOW_SHORT / FADE_LONG /
   FADE_SHORT / WAIT by row side. Slow-prior conviction comes from
   `_LAST_CONVICTION[alias]` cache to break the single-poll cycle.
+
+### TrendAnalyzer port → conviction source + chart triangles
+
+`com.bookmapmcp.trend` is a minimal port of the trendanalyzer-mvp core engine
+(11 classes: Candle, OrderflowSnapshot, TrendDirection, SwitchCondition,
+TrendConfig, RollingAverage, TrendSnapshot, TrendEngine, TrendRegimeFilter,
+StableTrendSnapshot, StableTrendEngine), driven from
+`InstrumentState.onTrade` via `TimeBucketTrendAccumulator`. The upstream
+`BarAggregator` is COUNT-based (expects pre-formed Bookmap bars); the bridge
+gets irregular `onTrade` events, so it uses a time-bucket accumulator with
+bounded gap handling (`MAX_CARRY_FORWARD_BUCKETS = 240` = 1 hour at 15s) so
+overnight resumes never block the callback thread.
+
+`GET /trend_analyzer?alias=...` returns `{eventMs, updatedAtMs, asOfNanos,
+fast, slow, score, reliabilityHint, warmedUp, lastClose}`. **Never conflate
+`eventMs` (market-event time, for chart anchoring) with `updatedAtMs`
+(bridge wall-clock, for staleness).** Under playback they can diverge by
+hours.
+
+Dashboard side: `_source_trend_analyzer(snap)` in `dashboard.py` normalizes
+to `[-1,+1]` (blended `0.4·fast + 0.6·slow` of direction × confidence/100).
+Reliability gating: warmup / stale / chop / disagreement.
+
+**Anti-domination via per-source share cap** (NOT cluster cap). The composite
+normalizes by `sum(|effective|)`, so cluster caps cannot bound a single
+source's *share* when other sources go silent. `_conv_apply_source_share_caps`
+solves for `max |w| ≤ cap × other / (1 - cap)` and zeros `w` entirely when
+`other == 0`. Config in `pax_weights.json::conviction_source_share_caps`,
+with `trend_analyzer: 0.10`. Pinned by `test_source_share_caps.py` and
+`test_trend_analyzer_conviction_integration.py::test_trend_analyzer_alone_cannot_move_composite`.
+
+`compute_trend_signal(snap)` projects the composite `snap["conviction"].trend`
+onto `{STRONG_BULL, WEAK_BULL, STRONG_BEAR, WEAK_BEAR, NONE}` and exposes
+`snap["trend_signal"]`. Fading states map to NONE. Per-alias bucket-entered
+state in `_LAST_TREND_SIGNAL` for dedup.
+
+OpenRange side: `PaxTrendSignalFetcher` (mirrors `PaxHeatwaveFetcher`) polls
+the same `/api/snapshot` endpoint at 1s, parses `snap["trend_signal"]`,
+sets `trendSignalDirty` AtomicBoolean. Same threading rule as Heatwave:
+fetcher NEVER mutates canvas; `PaxPainter.update()` reads the latest model
+on Bookmap callbacks. `PaxTrendTrianglePainter` renders STRONG_BULL/WEAK_BULL
+as green up-triangles below mid, STRONG_BEAR/WEAK_BEAR as red down-triangles
+above mid. Triangles use **DATA_ZERO** x/y with `PaxChartTimeCoords.epochMsToChartNanos`
+(epoch ms → LocalDateTime in CT → chart nanos, same convention as the
+existing OR line `toNanos(LocalDateTime)`). Dedup by `(kind, bucketEnteredMs)`
+via `PaxTrendTriangleDedup.shouldEmit`; max 8 visible triangles in
+`InstrumentState.liveTriangles`. UI toggle `showTrendTriangles` (default ON)
+in settings panel.
+
+**Signal policy (debounce + eligibility gate).** `compute_trend_signal`
+maintains per-alias state with separate raw and renderable tracking:
+`rawKind / renderableKind / renderableBucketEnteredMs / renderableEmittedMs /
+renderableEventMs`. A NONE tick NEVER resets renderable state — it just
+records `rawKind=NONE`. Bucket only advances when:
+(a) renderable kind differs from previous renderable kind (legitimate
+transition: WEAK_BULL → STRONG_BULL, BULL → BEAR — immediate), OR
+(b) same renderable kind returns after `TREND_SIGNAL_REENTRY_COOLDOWN_MS = 15s`
+of non-renderable (genuine re-entry, not flicker spam).
+The signal payload carries `eligible / blockedReason / eventMsSource`:
+- `eligible=true` requires renderable kind AND `book.mid > 0` (finite)
+  AND `eventMs > 0`. Otherwise final kind is downgraded to NONE with
+  `blockedReason` set (`"invalid_mid"` / `"invalid_event_ms"`).
+- `eventMsSource` is `"trend_analyzer"` when `trend_analyzer.eventMs > 0`,
+  else `"wall_clock_fallback"`. Chart anchors use the value as-is.
+OpenRange's `PaxTrendTriangleDedup.shouldEmit` short-circuits on
+`!signal.eligible` first — the dashboard is the authoritative gate; local
+field checks are defense in depth. **Parser defaults missing `eligible` to
+FALSE** for safety; a partial dashboard payload cannot accidentally render.
+Pinned by `test_trend_signal_policy.py` (13 tests) + `PaxTrendSignalSnapshotParserTest`
+(`eligibleFlagParsesTrue` / `…ParsesFalseExplicit` / `missingEligibleFieldDefaultsFalseForSafety` /
+`blockedReasonAndEventMsSourceParse`) + `PaxTrendTriangleDedupTest`
+(`eligibleFalseBlocksEmitEvenWhenStrongBull` / `eligibleTrueWithValidFieldsEmits`).
 - Session conviction is the v2 anchored multi-source engine. State per alias
   in `_CONVICTION_STATE`. Source helpers under the `_source_*` prefix return
   `{score, reliability, raw, reason}`. 17 sources after v7. See

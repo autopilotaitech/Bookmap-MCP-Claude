@@ -31,6 +31,8 @@ import velox.api.layer1.data.TradeInfo;
 import velox.api.layer1.simplified.Api;
 
 import com.bookmapmcp.BridgeRegistry;
+import com.bookmapmcp.trend.TimeBucketTrendAccumulator;
+import com.bookmapmcp.trend.TrendAnalyzerSnapshot;
 
 public final class InstrumentState {
 
@@ -277,6 +279,10 @@ public final class InstrumentState {
     private volatile long lastPositionEventNanos = 0L;
     private volatile long lastExecutionEventNanos= 0L;
 
+    /** Bridge-side trend engine. Fast bucket = 15s; slow = 60s (SLOW_RATIO=4). */
+    private static final long TREND_FAST_BUCKET_MS = 15_000L;
+    private final TimeBucketTrendAccumulator trendAccumulator;
+
     public InstrumentState(String alias, String symbol, String fullName,
                            double pips, double multiplier, Instant attachedAt) {
         this.alias = Objects.requireNonNull(alias, "alias");
@@ -289,6 +295,12 @@ public final class InstrumentState {
         this.vwapSlope = new VwapSlopeTracker();
         this.ibTracker = new InitialBalanceTracker();
         this.avwapTracker = new AnchoredVwapTracker();
+        this.trendAccumulator = new TimeBucketTrendAccumulator(alias, TREND_FAST_BUCKET_MS);
+    }
+
+    /** Build the JSON-shaped trend-analyzer snapshot. Safe to call from any thread. */
+    public TrendAnalyzerSnapshot trendAnalyzerSnapshot() {
+        return trendAccumulator.snapshot();
     }
 
     public String alias() { return alias; }
@@ -566,6 +578,15 @@ public final class InstrumentState {
         }
         // B-stops: check for sweep
         detectStopSweep(price, size, bidAggressor, nowMs);
+        // Trend-engine feed. MUST be a real epoch millisecond — the painter
+        // uses this for chart x-anchoring and a feed-clock counter (Rithmic)
+        // or zero would anchor triangles at 1970. nowMsForTrend() validates
+        // the feed value against a plausible-epoch range [2010, 2100], so
+        // historical replays anchor on the playback date and bogus feed
+        // counters fall back to wall clock.
+        long trendEventMs = nowMsForTrend();
+        trendAccumulator.recordEventNanos(lastSeenNanos);
+        trendAccumulator.onTrade(trendEventMs, price, (long) size, bidAggressor);
     }
 
     // -------- MBO callbacks (per-order book events) --------
@@ -824,6 +845,34 @@ public final class InstrumentState {
         long candidate = n / 1_000_000L;
         if (Math.abs(candidate - wall) < 86_400_000L) return candidate; // within 24h: trust feed
         return wall;
+    }
+
+    /** Plausible-epoch-ms range used to validate feed-clock values for the
+     * trend accumulator. Anything inside this range is treated as a real
+     * Unix epoch ms (current OR historical playback); anything outside is
+     * treated as a feed-specific counter and we fall back to wall clock.
+     *
+     * <p>Bounds chosen to comfortably cover futures market data going back
+     * to the introduction of recorded electronic order flow (2010) and
+     * forward to a far future date. The check is symmetric and does NOT
+     * depend on current wall clock — so a 5-year-old replay still
+     * anchors on the playback date instead of being snapped to now.</p>
+     */
+    static final long TREND_TS_MIN_EPOCH_MS = 1_262_304_000_000L; // 2010-01-01 UTC
+    static final long TREND_TS_MAX_EPOCH_MS = 4_102_444_800_000L; // 2100-01-01 UTC
+
+    /** Trend-accumulator-specific timestamp source. Anchors chart triangles
+     * to feed time when the feed publishes plausible Unix epoch nanos, else
+     * falls back to wall clock so the painter never anchors at 1970. */
+    long nowMsForTrend() {
+        long n = lastSeenNanos;
+        if (n > 0L) {
+            long candidate = n / 1_000_000L;
+            if (candidate >= TREND_TS_MIN_EPOCH_MS && candidate <= TREND_TS_MAX_EPOCH_MS) {
+                return candidate;
+            }
+        }
+        return System.currentTimeMillis();
     }
 
     /** EWMA update for LT liquidity. Sums the top {@link #LT_DEPTH_LEVELS}

@@ -25,7 +25,34 @@ from zoneinfo import ZoneInfo
 
 from . import settings as _settings
 from .bridge_client import BridgeClient, BridgeError
-from .config import BridgeConfig, MissingTokenError
+from .config import BridgeConfig, MissingTokenError, _config_path as _bridge_config_path
+
+# Set by main() at startup so /api/snapshot offline payloads can report
+# which port the operator hit. None until the HTTP server has bound.
+_DASHBOARD_PORT: Optional[int] = None
+
+
+def _build_offline_snapshot(*, bridge_url: Optional[str], bridge_error: str,
+                              token_configured: bool, next_steps: List[str]
+                              ) -> Dict[str, Any]:
+    """Structured offline payload for /api/snapshot.
+
+    Used both by the bridge-unreachable path AND by the no-token path so the
+    chart and operator both get actionable diagnostics instead of a bare
+    ``{"health":"offline"}``.
+    """
+    return {
+        "health":                  "offline",
+        "bridgeUrl":               bridge_url,
+        "bridgeReachable":         False,
+        "bridgeError":             bridge_error,
+        "dashboardPort":           _DASHBOARD_PORT,
+        "expectedBridgeConfigPath": str(_bridge_config_path()),
+        "tokenConfigured":         token_configured,
+        "nextSteps":               next_steps,
+        # Legacy key — overview_ui.py + older code paths still read snap["error"].
+        "error":                   bridge_error,
+    }
 
 log = logging.getLogger("bookmap_dashboard")
 
@@ -1378,6 +1405,19 @@ def _load_pax_weights() -> Dict[str, Any]:
     """
     global _PAX_WEIGHTS_MTIME
     defaults = {
+        # v2 anchored multi-source engine — these MUST mirror the module
+        # constants so a missing or corrupted pax_weights.json never silently
+        # drops a source. trend_analyzer in particular needs to keep its
+        # base weight (0.06) and share cap (0.10) even on the fallback path.
+        "conviction_source_weights":     dict(CONVICTION_SOURCE_WEIGHTS),
+        "conviction_clusters":           {k: list(v) for k, v in CONVICTION_CLUSTERS.items()},
+        "conviction_cluster_caps":       dict(CONVICTION_CLUSTER_CAPS),
+        "conviction_source_share_caps":  dict(CONVICTION_SOURCE_SHARE_CAPS),
+        "conviction_windows_sec":        dict(CONVICTION_WINDOWS_SEC),
+        "conviction_aggregation_weights":dict(CONVICTION_AGG_WEIGHTS),
+        "conviction_thresholds":         dict(CONVICTION_THRESHOLDS),
+        # Legacy EMA-model fields — kept for backward compatibility with the
+        # _regime_to_signal / _slope_to_signal / _level_to_signal pinned tests.
         "conviction_weights": {"regime":0.25,"bias":0.15,"vwap":0.15,"vp":0.15,
                                 "slope":0.15,"level":0.15,"ib":0.00},
         "conviction_halflife_sec": {"regime":120,"bias":120,"vwap":240,"vp":360,
@@ -1443,6 +1483,7 @@ CONVICTION_SOURCE_WEIGHTS = {
     "level_reaction":              0.08,
     "anchored_vwap_opening_drive": 0.08,
     "ib_context":                  0.04,
+    "trend_analyzer":              0.06,
 }
 
 CONVICTION_CLUSTERS = {
@@ -1457,6 +1498,17 @@ CONVICTION_CLUSTER_CAPS = {
     "vwap":           0.25,
     "structure":      0.20,
     "microstructure": 0.30,
+}
+
+# Per-source share caps. Applied AFTER cluster caps. Each entry is a hard
+# ceiling on |effective_w_name| / sum(|effective_w|), i.e. that source's
+# share of the normalized weighted sum. Cluster caps alone cannot achieve
+# this guarantee — if every other source has reliability 0, cluster caps
+# scale the lone surviving source's weight down proportionally but the
+# composite still reduces to its own score. A per-source share cap is the
+# correct guard for "this single source can never dominate the composite."
+CONVICTION_SOURCE_SHARE_CAPS = {
+    "trend_analyzer": 0.10,
 }
 
 CONVICTION_WINDOWS_SEC = {
@@ -1491,6 +1543,218 @@ _CONVICTION_LEGACY_KEY_MAP = {
 }
 
 _CONVICTION_STATE: Dict[str, Dict[str, Any]] = {}
+
+# Per-alias cache used by compute_trend_signal. Tracks the raw projected
+# kind AND the renderable history separately so that a brief flicker
+# through NONE does NOT reset the renderable bucket. Keys per alias:
+#   rawKind                     str       — last projected kind (incl. NONE)
+#   renderableKind              str       — last renderable kind, "NONE" if absent
+#   renderableBucketEnteredMs   int       — wall-clock when current renderable bucket began
+#   renderableEmittedMs         int       — wall-clock at last bucket-advance emit
+#   renderableEventMs           int       — eventMs at last bucket-advance emit
+_LAST_TREND_SIGNAL: Dict[str, Dict[str, Any]] = {}
+
+# Quant-quality entry-marker debounce. The dashboard is the single source of
+# truth for these — OpenRange just renders whatever (eligible, bucket) tuple
+# the dashboard publishes.
+#
+#   COOLDOWN  : minimum wall-clock gap between renderable-bucket advances
+#               when re-entering the SAME renderable kind after a NONE
+#               period. Prevents BULL → NONE → BULL flicker spam.
+#   MIN_HOLD  : reserved. Documents a per-kind minimum dwell. Not enforced
+#               in this revision because the user's audit spec requires that
+#               legitimate renderable-kind transitions (WEAK_BULL→STRONG_BULL,
+#               BULL→BEAR) advance the bucket immediately, with no dwell
+#               gate. Kept as a config knob for future tuning.
+TREND_SIGNAL_MIN_HOLD_MS = 5_000
+TREND_SIGNAL_REENTRY_COOLDOWN_MS = 15_000
+
+
+def _kind_from_trend_label(trend: Optional[str]) -> str:
+    """Project a composite conviction trend label onto the triangle vocabulary.
+
+    The fade-states (BULL_FADING, BEAR_FADING) intentionally map to NONE: a
+    fading trend is a "don't add" state, not a fresh entry signal.
+    """
+    if trend == "BULLISH_TREND": return "STRONG_BULL"
+    if trend == "BULL_LEAN":     return "WEAK_BULL"
+    if trend == "BEARISH_TREND": return "STRONG_BEAR"
+    if trend == "BEAR_LEAN":     return "WEAK_BEAR"
+    return "NONE"
+
+
+_RENDERABLE_KINDS = ("STRONG_BULL", "WEAK_BULL", "STRONG_BEAR", "WEAK_BEAR")
+
+
+def compute_trend_signal(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Projection-only signal derived from snap["conviction"]. NEVER reads
+    snap["trend_analyzer"] directly for the kind — that would short-circuit
+    the conviction engine and turn TrendAnalyzer into a decision engine.
+
+    Returns a dict shaped for OpenRange triangle rendering. Returns None
+    only when alias is missing (cannot dedupe across aliases).
+
+    Signal policy (see TREND_SIGNAL_REENTRY_COOLDOWN_MS):
+      * A renderable kind is gated on mid finite-and-positive AND
+        eventMs > 0. Otherwise final kind is NONE with blockedReason set.
+      * Bucket only advances when:
+          - the new renderable kind differs from the previous renderable
+            kind (e.g. WEAK_BULL → STRONG_BULL, BULL → BEAR), OR
+          - re-entering the same renderable kind after the cooldown.
+      * A NONE tick never resets the renderable state — the previous
+        renderable kind, bucket and emit timestamps are preserved so a
+        brief flicker through NONE does not produce a duplicate triangle.
+    """
+    alias = snap.get("alias")
+    if not alias:
+        return None
+    conv = snap.get("conviction")
+    if not isinstance(conv, dict):
+        conv = {}
+    projected_kind = _kind_from_trend_label(conv.get("trend"))
+    now_ms = int(time.time() * 1000)
+
+    book = snap.get("book") or {}
+    mid_val, mid_ok = _as_float(book.get("mid"))
+    mid_valid = bool(mid_ok and math.isfinite(mid_val) and mid_val > 0.0)
+
+    # eventMs source — prefer trend_analyzer.eventMs when it is a positive
+    # epoch ms. Wall-clock fallback is always > 0 so we don't downgrade
+    # eligibility for missing market-event time; we just label the source.
+    ta = snap.get("trend_analyzer")
+    ta_event_ms = 0
+    if isinstance(ta, dict):
+        raw_event = ta.get("eventMs")
+        if isinstance(raw_event, (int, float)) and raw_event > 0:
+            ta_event_ms = int(raw_event)
+    if ta_event_ms > 0:
+        event_ms = ta_event_ms
+        event_ms_source = "trend_analyzer"
+    else:
+        event_ms = now_ms
+        event_ms_source = "wall_clock_fallback"
+    event_ms_valid = event_ms > 0
+
+    # Apply renderable-eligibility gate: a renderable conviction kind is
+    # downgraded to NONE if the plot fields are not valid.
+    blocked_reason: Optional[str] = None
+    final_kind = projected_kind
+    if projected_kind in _RENDERABLE_KINDS and not mid_valid:
+        final_kind = "NONE"
+        blocked_reason = "invalid_mid"
+    elif projected_kind in _RENDERABLE_KINDS and not event_ms_valid:
+        final_kind = "NONE"
+        blocked_reason = "invalid_event_ms"
+
+    eligible = (final_kind in _RENDERABLE_KINDS) and mid_valid and event_ms_valid
+
+    # ─── State machine: bucket / changed-flag ──────────────────────────────
+    prev = _LAST_TREND_SIGNAL.get(alias) or {}
+    prev_raw_kind         = prev.get("rawKind") or "NONE"
+    prev_renderable_kind  = prev.get("renderableKind") or "NONE"
+    prev_renderable_bucket   = int(prev.get("renderableBucketEnteredMs", 0))
+    prev_renderable_emitted  = int(prev.get("renderableEmittedMs", 0))
+    prev_renderable_event_ms = int(prev.get("renderableEventMs", 0))
+
+    cooldown_elapsed = (
+        prev_renderable_emitted <= 0
+        or (now_ms - prev_renderable_emitted) >= TREND_SIGNAL_REENTRY_COOLDOWN_MS
+    )
+
+    if final_kind == "NONE":
+        # Flicker through NONE — preserve renderable tracking so the next
+        # renderable tick can correctly decide same-kind-vs-different.
+        new_raw           = "NONE"
+        new_renderable    = prev_renderable_kind
+        new_bucket        = prev_renderable_bucket
+        new_emitted       = prev_renderable_emitted
+        new_event_ms      = prev_renderable_event_ms
+        bucket_entered_ms = prev_renderable_bucket
+        changed = False
+    else:
+        # final_kind is a renderable kind.
+        if final_kind == prev_renderable_kind:
+            if prev_raw_kind == final_kind:
+                # Pure continuation of the same renderable kind.
+                new_renderable = final_kind
+                new_bucket = prev_renderable_bucket
+                new_emitted = prev_renderable_emitted
+                new_event_ms = prev_renderable_event_ms
+                changed = False
+            elif cooldown_elapsed:
+                # Returning to the same renderable kind after a NONE
+                # period that exceeded the cooldown — genuine re-entry.
+                new_renderable = final_kind
+                new_bucket = now_ms
+                new_emitted = now_ms
+                new_event_ms = event_ms
+                changed = True
+            else:
+                # Flicker: same renderable kind, prior raw was NONE,
+                # cooldown has NOT elapsed. Suppress the new bucket and
+                # keep the old triangle.
+                new_renderable = final_kind
+                new_bucket = prev_renderable_bucket
+                new_emitted = prev_renderable_emitted
+                new_event_ms = prev_renderable_event_ms
+                changed = False
+        else:
+            # Different renderable kind from the previous renderable kind.
+            if prev_renderable_kind == "NONE":
+                # First-ever renderable for this alias, OR coming back
+                # after the renderable history was empty. Cooldown still
+                # applies so that a transient burst right after startup
+                # does not produce spam.
+                if cooldown_elapsed:
+                    new_renderable = final_kind
+                    new_bucket = now_ms
+                    new_emitted = now_ms
+                    new_event_ms = event_ms
+                    changed = True
+                else:
+                    # Within cooldown of some prior emit (rare path).
+                    # Suppress to keep the flicker rule consistent.
+                    new_renderable = prev_renderable_kind
+                    new_bucket = prev_renderable_bucket
+                    new_emitted = prev_renderable_emitted
+                    new_event_ms = prev_renderable_event_ms
+                    changed = False
+            else:
+                # Legitimate renderable-kind transition
+                # (WEAK_BULL → STRONG_BULL, BULL → BEAR, etc.).
+                # Bucket advances immediately per the audit contract —
+                # this is the entry-marker signal we WANT to surface.
+                new_renderable = final_kind
+                new_bucket = now_ms
+                new_emitted = now_ms
+                new_event_ms = event_ms
+                changed = True
+        new_raw = final_kind
+        bucket_entered_ms = new_bucket
+
+    _LAST_TREND_SIGNAL[alias] = {
+        "rawKind":                   new_raw,
+        "renderableKind":            new_renderable,
+        "renderableBucketEnteredMs": new_bucket,
+        "renderableEmittedMs":       new_emitted,
+        "renderableEventMs":         new_event_ms,
+    }
+
+    return {
+        "kind":                  final_kind,
+        "alias":                 alias,
+        "asOfMs":                now_ms,
+        "eventMs":               event_ms,
+        "eventMsSource":         event_ms_source,
+        "mid":                   mid_val if mid_ok else None,
+        "convictionScore":       conv.get("score"),
+        "convictionTrend":       conv.get("trend"),
+        "convictionTrajectory":  conv.get("trajectory"),
+        "changedSinceLastTick":  changed,
+        "bucketEnteredMs":       bucket_entered_ms,
+        "blockedReason":         blocked_reason,
+        "eligible":              eligible,
+    }
 
 
 def _rolling_sma(ring: List[Tuple[int, float]], now_ms: int, window_sec: float
@@ -2119,6 +2383,68 @@ def _source_ib_context(snap: Dict[str, Any]) -> Dict[str, Any]:
             "raw": {"dayType": ib.get("dayType")}, "reason": "ib direction unknown"}
 
 
+def _source_trend_analyzer(snap: Dict[str, Any]) -> Dict[str, Any]:
+    """TrendAnalyzer stable-trend contribution.
+
+    Blends the fast and slow StableTrendEngine outputs from the bridge.
+    Score is the confidence-weighted, signed direction across both engines;
+    reliability is reduced by chop, disagreement, warmup, and staleness.
+
+    Timestamp semantics:
+      - `updatedAtMs` (bridge wall-clock) is used for staleness gating.
+      - `eventMs` is NEVER compared to dashboard wall-clock — it can be
+        hours behind under playback.
+    """
+    ta = snap.get("trend_analyzer")
+    if not isinstance(ta, dict) or "_error" in ta:
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": {"_present": False}, "reason": "no trend_analyzer"}
+    if not ta.get("warmedUp"):
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": {"warmedUp": False}, "reason": "warmup"}
+    updated_at_ms = ta.get("updatedAtMs")
+    if updated_at_ms is None:
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": {"updatedAtMs": None}, "reason": "no updatedAtMs"}
+    age_sec = (int(time.time() * 1000) - int(updated_at_ms)) / 1000.0
+    if age_sec > 30.0:
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": {"ageSec": round(age_sec, 1)}, "reason": "stale"}
+
+    fast = ta.get("fast") or {}
+    slow = ta.get("slow") or {}
+    f_sign, _  = _as_float(fast.get("directionSign"))
+    s_sign, _  = _as_float(slow.get("directionSign"))
+    f_conf, _  = _as_float(fast.get("confidence"))
+    s_conf, _  = _as_float(slow.get("confidence"))
+    f_chop = bool(fast.get("chop"))
+    s_chop = bool(slow.get("chop"))
+
+    score = _clip(0.4 * (f_sign * f_conf / 100.0)
+                + 0.6 * (s_sign * s_conf / 100.0))
+
+    if f_chop and s_chop:
+        reliability = 0.25
+    elif f_chop or s_chop:
+        reliability = 0.5
+    elif f_sign != 0 and s_sign != 0 and (f_sign * s_sign) < 0:
+        reliability = 0.6           # engines disagree
+    else:
+        reliability = 1.0
+
+    return {
+        "score": score,
+        "reliability": reliability,
+        "raw": {"fastSign": f_sign, "fastConf": f_conf,
+                "slowSign": s_sign, "slowConf": s_conf,
+                "fastChop": f_chop, "slowChop": s_chop,
+                "ageSec":   round(age_sec, 1)},
+        "reason": (f"fast {fast.get('direction')} c={int(f_conf)} "
+                   f"slow {slow.get('direction')} c={int(s_conf)}"
+                   + (" CHOP" if (f_chop or s_chop) else "")),
+    }
+
+
 _CONVICTION_SOURCES: Dict[str, Any] = {
     "flow_ofi":                    _source_flow_ofi,
     "flow_cvd":                    _source_flow_cvd,
@@ -2137,6 +2463,7 @@ _CONVICTION_SOURCES: Dict[str, Any] = {
     "level_reaction":              _source_level_reaction,
     "anchored_vwap_opening_drive": _source_anchored_vwap_opening_drive,
     "ib_context":                  _source_ib_context,
+    "trend_analyzer":              _source_trend_analyzer,
 }
 
 
@@ -2201,6 +2528,35 @@ def _conv_apply_cluster_caps(effective: Dict[str, float],
             scale = cap / total
             for m in members:
                 if m in out: out[m] = out[m] * scale
+    return out
+
+
+def _conv_apply_source_share_caps(effective: Dict[str, float],
+                                  share_caps: Dict[str, float]) -> Dict[str, float]:
+    """Hard cap each named source's *share* of the normalized weighted sum.
+
+    For a source with cap c, find max |w| such that |w| / (|w| + other) <= c:
+        |w| (1 - c) <= c * other   =>   |w| <= c * other / (1 - c)
+    Sign is preserved when capped. When `other` is zero, the source's
+    contribution is zeroed entirely — a single-source composite would
+    otherwise reduce to that source's own score regardless of cap.
+    """
+    if not share_caps:
+        return effective
+    out = dict(effective)
+    for name, cap in share_caps.items():
+        if name not in out:
+            continue
+        if cap is None or cap <= 0.0 or cap >= 1.0:
+            continue
+        other = sum(abs(w) for n, w in out.items() if n != name)
+        if other <= 0.0:
+            out[name] = 0.0
+            continue
+        max_abs = cap * other / (1.0 - cap)
+        w = out[name]
+        if abs(w) > max_abs:
+            out[name] = math.copysign(max_abs, w)
     return out
 
 
@@ -2300,12 +2656,18 @@ def compute_session_conviction(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]
         reliability = availability * sample_conf * freshness
         source_reliability[name] = max(0.0, min(1.0, reliability))
 
-    # 2. Effective weights = base × reliability, then apply cluster caps.
+    # 2. Effective weights = base × reliability, then apply cluster caps,
+    #    then apply per-source share caps. Order matters: cluster caps shape
+    #    each *group*, and the share cap then bounds an individual source's
+    #    fraction of the normalized total. Cluster caps alone cannot bound
+    #    share — see _conv_apply_source_share_caps docstring.
     effective: Dict[str, float] = {
         name: base_weights.get(name, 0.0) * source_reliability[name]
         for name in _CONVICTION_SOURCES
     }
     effective = _conv_apply_cluster_caps(effective, clusters, caps)
+    share_caps = cfg.get("conviction_source_share_caps") or CONVICTION_SOURCE_SHARE_CAPS
+    effective = _conv_apply_source_share_caps(effective, share_caps)
 
     # 3. Composite score = normalized weighted sum.
     num = sum(effective[n] * source_scores[n] for n in effective)
@@ -2892,13 +3254,46 @@ def fetch_snapshot() -> Dict[str, Any]:
     try:
         cfg = BridgeConfig.load()
     except MissingTokenError as exc:
-        return {"health": "error", "error": str(exc)}
+        return _build_offline_snapshot(
+            bridge_url=None,
+            bridge_error=str(exc),
+            token_configured=False,
+            next_steps=[
+                "Start Bookmap with the MCP Bridge addon attached at least once "
+                "so ~/.bookmap-mcp/bridge.properties gets written.",
+                "Or set BOOKMAP_BRIDGE_TOKEN environment variable directly.",
+            ],
+        )
     try:
         with BridgeClient(cfg, timeout_s=3.0) as c:
             ping = c.get_json("/ping")
             instruments = c.get_json("/instruments")
     except BridgeError as exc:
-        return {"health": "offline", "error": str(exc)}
+        msg = str(exc)
+        steps = [
+            "Confirm Bookmap is running and the MCP Bridge addon is loaded "
+            "(check Bookmap's addon list — must include 'MCP Bridge').",
+            f"Confirm the canonical bridge jar is deployed at "
+            f"C:\\Bookmap\\addons\\bookmap-mcp-bridge.jar (run .\\build-and-deploy.ps1 "
+            f"to install + quarantine duplicates).",
+            f"Confirm port matches: dashboard expects {cfg.url} — actual port comes "
+            f"from {_bridge_config_path()}.",
+        ]
+        if "timed out" in msg.lower() or "timeout" in msg.lower():
+            steps.insert(0, "Bridge did not respond within 3s — addon likely not loaded.")
+        elif "401" in msg or "unauthor" in msg.lower():
+            steps.insert(0, "401 unauthorized — token in dashboard env / properties does "
+                            "not match what Bookmap wrote on startup. Delete "
+                            "~/.bookmap-mcp/bridge.properties and re-attach the addon.")
+        elif "refused" in msg.lower() or "connectionerror" in msg.lower():
+            steps.insert(0, "Connection refused — nothing is listening on the bridge port. "
+                            "Bookmap is not running OR the bridge addon failed to start.")
+        return _build_offline_snapshot(
+            bridge_url=cfg.url,
+            bridge_error=msg,
+            token_configured=bool(cfg.token),
+            next_steps=steps,
+        )
     insts = instruments.get("instruments", [])
     if not insts:
         return {"health": "ok", "ping": ping, "alias": None, "instruments": instruments,
@@ -2924,6 +3319,7 @@ def fetch_snapshot() -> Dict[str, Any]:
         lt_obj   = safe(lambda: c.get_json("/lt_liquidity",   {"alias": alias}))
         ps_obj   = safe(lambda: c.get_json("/pull_stack",     {"alias": alias}))
         me_obj   = safe(lambda: c.get_json("/microstructure_events", {"alias": alias, "max": 30}))
+        trend_obj = safe(lambda: c.get_json("/trend_analyzer",        {"alias": alias}))
     now_et = dt.datetime.now(ET)
     state, label = session_state(now_et)
     blocked, news_label = news_blackout(now_et)
@@ -2947,6 +3343,7 @@ def fetch_snapshot() -> Dict[str, Any]:
         "lt_liquidity": lt_obj if isinstance(lt_obj, dict) else None,
         "pull_stack": ps_obj if isinstance(ps_obj, dict) else None,
         "micro_events": me_obj if isinstance(me_obj, dict) else None,
+        "trend_analyzer": trend_obj if isinstance(trend_obj, dict) else None,
         "momentum": {
             "i10":  imbalance(trade_list, 10),
             "i50":  imbalance(trade_list, 50),
@@ -2991,6 +3388,7 @@ def fetch_snapshot() -> Dict[str, Any]:
     snap["vp_bias"]   = _safe_call(compute_vp_bias,   "compute_vp_bias")
     snap["decision"]  = _safe_call(trade_decision,    "trade_decision")
     snap["conviction"] = _safe_call(compute_session_conviction, "compute_session_conviction")
+    snap["trend_signal"] = _safe_call(compute_trend_signal, "compute_trend_signal")
     snap["pax"]       = _safe_call(pax_decision,      "pax_decision")
     # SIM trades from local sim engine (read-only — agent process owns writes)
     try:
@@ -5280,6 +5678,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def main(port: int = 18888, journal_path: Optional[str] = None) -> None:
+    global _DASHBOARD_PORT
+    _DASHBOARD_PORT = int(port)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(message)s")
 

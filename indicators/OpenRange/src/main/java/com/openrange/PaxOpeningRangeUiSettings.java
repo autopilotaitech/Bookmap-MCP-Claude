@@ -42,6 +42,12 @@ public class PaxOpeningRangeUiSettings {
     public int heatwavePollMs = 1000;
     public String heatwaveUrl = "http://127.0.0.1:18888/api/snapshot";
 
+    /** Show conviction-driven trend triangles on the chart. Triangles are
+     * derived from snap["trend_signal"] (a projection of the composite
+     * conviction), so they reflect the dashboard's full weighted ensemble,
+     * not TrendAnalyzer alone. */
+    public boolean showTrendTriangles = true;
+
     public PaxOpeningRangeSettings toCalculatorSettings() {
         return new PaxOpeningRangeSettings(
                 LocalTime.of(clamp(startHour, 0, 23), clamp(startMinute, 0, 59), clamp(startSecond, 0, 59)),

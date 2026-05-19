@@ -41,6 +41,16 @@ final class PaxHeatwaveSnapshotParser {
     }
 
     private static PaxHeatwaveModel distill(Map<?, ?> root, long fetchedAtMs) {
+        // health=offline → dashboard reachable, bridge addon unreachable.
+        // Build a structured bridge-offline carrier so the painter shows
+        // "BRIDGE OFFLINE" + the reason, instead of generic NO DATA.
+        String health = asString(root.get("health"));
+        if ("offline".equalsIgnoreCase(health)) {
+            String bridgeUrl = asString(root.get("bridgeUrl"));
+            String reason = asString(root.get("bridgeError"));
+            if (reason == null || reason.isEmpty()) reason = asString(root.get("error"));
+            return PaxHeatwaveModel.bridgeOffline(fetchedAtMs, bridgeUrl, reason);
+        }
         String verdict = pickVerdict(root);
         Tone verdictTone = verdictTone(verdict);
 
