@@ -195,6 +195,63 @@ the launcher defaults to the Rithmic NQ alias.
   preserved and reused by v2 sources — don't refactor them away without
   updating the pinned helper-signal tests.
 
+### Heatwave Quant Box (OpenRange screen-space HUD)
+
+Top-left native Bookmap box that visualizes the live conviction model on one
+screen. Five Java classes under `indicators/OpenRange/src/main/java/com/openrange/`:
+
+- `PaxHeatwaveModel` — immutable carrier (header + 11 rows + `fetchedAtMs`).
+- `PaxHeatwaveSnapshotParser` — recursive-descent JSON parser (no jar deps)
+  + distillation logic. **Paths must match real dashboard shape**:
+  - `pax.decision` -> `decision.decision` -> `"WAIT"` (verdict fallback chain).
+  - `or_levels.levels[]` (not top-level list); pick nearest by `abs(distance)`.
+  - `distance` is in points; render as `+12.50p`.
+  - `vwap_bias.components.{sigma_z, regime}` -> fallback `vwap_bias.{sigma_z, regime}`.
+  - `vp_bias.components.{va_state, hvn_count, lvn_count}` -> fallback
+    `vp_bias.va_state` -> `vp_bias.label`.
+  - `flow.regime` for FLOW hint -> fallback `conviction.trend` -> `.trajectory`.
+  - CVD hint is `buy` / `sell` / `flat` from signed `flow_cvd` score — NEVER
+    `rising` / `falling` (no real per-source trajectory exists).
+  - Grouped rows (FLOW, VWAP, VP, BOOK) use `effectiveWeights`-weighted average
+    with `sourceReliability > 0` filter. Missing source OR zero reliability ->
+    row shows `--` neutral, never invent a score.
+- `PaxHeatwavePainter` — renders the model + `Graphics2D` into a single
+  `BufferedImage` -> `PreparedImage` -> `CanvasIcon` (Bookmap's screen-space
+  pattern). Monospaced font, near-black bg, dark theme, fixed 260-320 px wide.
+- `PaxHeatwaveFetcher` — daemon thread, `java.net.http.HttpClient`, polls
+  `heatwaveUrl` (default `http://127.0.0.1:18888/api/snapshot`, no auth). Default
+  poll 1000 ms clamped to `[500, 3000]`. Backoff 2x after `>=3` consecutive
+  failures, cap 5 s. Last-good model retained on failure; box header shows
+  `STALE` (age ≥30s) or `NO DATA` (no successful fetch yet).
+- `PaxHeatwaveColors` — central dark palette.
+
+**Threading rule (load-bearing).** The fetcher worker thread MUST NOT call
+`canvas.addShape` / `canvas.removeShape` / `PaxPainter.update()`. Canvas
+mutation only happens on Bookmap-driven callbacks (`onTrade`, `onDepth`,
+`onMoveEnd`). The fetcher signals new data via `AtomicBoolean heatwaveDirty`
+on `PaxOpeningRangeModule`. `InstrumentState.shouldRepaint(eventTime)`
+consumes the flag with `compareAndSet(true, false)` and **bypasses the 1 s
+throttle for that one tick** so a fresh snapshot is shown on the very next
+market event. Quiet-market caveat (>30 s of no ticks): age display freezes
+until the next tick — documented, not fixed; Bookmap's addon SDK has no
+documented safe way to enqueue UI work from a foreign thread.
+
+**Freshness** is measured from `fetchedAtMs` (HTTP response receive time),
+not the snapshot's `ts` string. The Java side does not parse `ts`; that
+removes timezone-format risk and measures dashboard availability (which is
+the thing that actually matters).
+
+### OpenRange jar lock
+
+`indicators/OpenRange/build.ps1` writes a fixed-name jar
+`build/libs/openrange-release.jar`. Bookmap holds this file open while the
+addon is loaded. Trying to rebuild while Bookmap is running fails with
+`FileSystemException: ... The process cannot access the file because it is
+being used by another process` at the `jar.exe --create` step (tests still
+pass; only the packaging step fails). **Close Bookmap before rebuilding.**
+This differs from the MCP bridge addon, which uses a versioned jar name
+and so allows a new file to land alongside the old one.
+
 ### Bridge HTTP endpoints
 
 All endpoints are guarded by `BridgeAuth` (token from `bridge.properties`).

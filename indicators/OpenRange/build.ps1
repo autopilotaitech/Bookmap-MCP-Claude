@@ -48,6 +48,12 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & "$javaBin\java.exe" @("-cp", "build\classes;build\test-classes;$classpath", "com.openrange.PaxOpeningRangeModuleConcurrencyTest")
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& "$javaBin\java.exe" @("-cp", "build\classes;build\test-classes;$classpath", "com.openrange.PaxHeatwaveSnapshotParserTest")
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& "$javaBin\java.exe" @("-cp", "build\classes;build\test-classes;$classpath", "com.openrange.PaxHeatwavePainterTest")
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& "$javaBin\java.exe" @("-cp", "build\classes;build\test-classes;$classpath", "com.openrange.PaxHeatwaveFetcherTest")
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $jarPath = "build\libs\openrange-release.jar"
 & "$javaBin\jar.exe" @("--create", "--file", $jarPath, "-C", "build\classes", ".")

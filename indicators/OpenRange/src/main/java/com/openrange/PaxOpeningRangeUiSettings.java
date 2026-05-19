@@ -5,7 +5,7 @@ import java.time.LocalTime;
 
 import velox.api.layer1.settings.StrategySettingsVersion;
 
-@StrategySettingsVersion(currentVersion = 1, compatibleVersions = {})
+@StrategySettingsVersion(currentVersion = 2, compatibleVersions = {1})
 public class PaxOpeningRangeUiSettings {
     public int startHour = 9;
     public int startMinute = 30;
@@ -34,6 +34,14 @@ public class PaxOpeningRangeUiSettings {
     public int normalizationWindowSeconds = 120;
     public String logDirectory = "build\\logs";
 
+    public boolean showHeatwaveBox = true;
+    public int heatwaveBoxX = 12;
+    public int heatwaveBoxY = 14;
+    public int heatwaveFontSize = 11;
+    public boolean heatwaveCompact = true;
+    public int heatwavePollMs = 1000;
+    public String heatwaveUrl = "http://127.0.0.1:18888/api/snapshot";
+
     public PaxOpeningRangeSettings toCalculatorSettings() {
         return new PaxOpeningRangeSettings(
                 LocalTime.of(clamp(startHour, 0, 23), clamp(startMinute, 0, 59), clamp(startSecond, 0, 59)),
@@ -59,6 +67,29 @@ public class PaxOpeningRangeUiSettings {
                 clamp(signalMinCvdPercentile, 0, 100),
                 clamp(signalMinPullingStackingPercentile, 0, 100),
                 signalBlockCrossMarketDivergence);
+    }
+
+    public int clampedHeatwaveFontSize() {
+        return clamp(heatwaveFontSize, 9, 16);
+    }
+
+    public int clampedHeatwavePollMs() {
+        return clamp(heatwavePollMs, 500, 3000);
+    }
+
+    public int clampedHeatwaveBoxX() {
+        return clamp(heatwaveBoxX, 0, 4000);
+    }
+
+    public int clampedHeatwaveBoxY() {
+        return clamp(heatwaveBoxY, 0, 4000);
+    }
+
+    public String safeHeatwaveUrl() {
+        if (heatwaveUrl == null || heatwaveUrl.isBlank()) {
+            return PaxHeatwaveFetcher.DEFAULT_URL;
+        }
+        return heatwaveUrl;
     }
 
     private static int clamp(int value, int min, int max) {

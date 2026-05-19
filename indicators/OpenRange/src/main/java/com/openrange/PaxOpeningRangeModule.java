@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.swing.JCheckBox;
 import javax.swing.JLabel;
@@ -94,17 +95,21 @@ public class PaxOpeningRangeModule implements
     private final Map<String, PaxPainter> painters = new ConcurrentHashMap<>();
     private final Map<String, String> indicatorsFullNameToUserName = new HashMap<>();
     private final PaxOpeningRangeCrossMarketState crossMarketState = new PaxOpeningRangeCrossMarketState();
+    private final PaxHeatwaveFetcher heatwave;
+    private final AtomicBoolean heatwaveDirty = new AtomicBoolean(false);
     private volatile DataStructureInterface dataStructureInterface;
     private volatile SettingsAccess settingsAccess;
     private volatile PaxOpeningRangeUiSettings uiSettings = new PaxOpeningRangeUiSettings();
 
     public PaxOpeningRangeModule(Layer1ApiProvider provider) {
         this.provider = provider;
+        this.heatwave = new PaxHeatwaveFetcher(() -> heatwaveDirty.set(true));
         ListenableHelper.addListeners(provider, this);
     }
 
     @Override
     public void finish() {
+        heatwave.stop();
         synchronized (indicatorsFullNameToUserName) {
             for (String userName : indicatorsFullNameToUserName.values()) {
                 provider.sendUserMessage(Layer1ApiUserMessageModifyScreenSpacePainter
@@ -118,6 +123,10 @@ public class PaxOpeningRangeModule implements
         painters.clear();
         instruments.values().forEach(InstrumentState::dispose);
         instruments.clear();
+    }
+
+    boolean consumeHeatwaveDirty() {
+        return heatwaveDirty.compareAndSet(true, false);
     }
 
     @Override
@@ -344,6 +353,7 @@ public class PaxOpeningRangeModule implements
         if (stored != null) {
             uiSettings = stored;
         }
+        heatwave.applySettings(uiSettings);
     }
 
     @Override
@@ -442,6 +452,28 @@ public class PaxOpeningRangeModule implements
         });
         row = addRow(panel, c, row, "Mid color", midColor);
 
+        JCheckBox showHeatwaveBox = new JCheckBox("Show Heatwave Quant Box", settings.showHeatwaveBox);
+        c.gridx = 0;
+        c.gridy = row++;
+        c.gridwidth = 4;
+        panel.add(showHeatwaveBox, c);
+        c.gridwidth = 1;
+
+        JSpinner heatwaveBoxX = spinner(settings.clampedHeatwaveBoxX(), 0, 4000, 2);
+        row = addRow(panel, c, row, "Heatwave box X", heatwaveBoxX);
+
+        JSpinner heatwaveBoxY = spinner(settings.clampedHeatwaveBoxY(), 0, 4000, 2);
+        row = addRow(panel, c, row, "Heatwave box Y", heatwaveBoxY);
+
+        JSpinner heatwaveFontSize = spinner(settings.clampedHeatwaveFontSize(), 9, 16, 1);
+        row = addRow(panel, c, row, "Heatwave font size", heatwaveFontSize);
+
+        JSpinner heatwavePollMs = spinner(settings.clampedHeatwavePollMs(), 500, 3000, 100);
+        row = addRow(panel, c, row, "Heatwave poll ms", heatwavePollMs);
+
+        JTextField heatwaveUrl = new JTextField(settings.safeHeatwaveUrl());
+        row = addRow(panel, c, row, "Heatwave URL", heatwaveUrl);
+
         JTextArea diagnostics = new JTextArea(diagnosticsText(alias));
         diagnostics.setEditable(false);
         diagnostics.setOpaque(false);
@@ -468,6 +500,12 @@ public class PaxOpeningRangeModule implements
             settings.labelPrefix = prefix.getText();
             settings.signalBlockCrossMarketDivergence = blockCrossDivergence.isSelected();
             settings.showMid = showMid.isSelected();
+            settings.showHeatwaveBox = showHeatwaveBox.isSelected();
+            settings.heatwaveBoxX = (Integer) heatwaveBoxX.getValue();
+            settings.heatwaveBoxY = (Integer) heatwaveBoxY.getValue();
+            settings.heatwaveFontSize = (Integer) heatwaveFontSize.getValue();
+            settings.heatwavePollMs = (Integer) heatwavePollMs.getValue();
+            settings.heatwaveUrl = heatwaveUrl.getText();
             saveSettings(null, settings);
             rebuildCalculators();
         };
@@ -487,10 +525,16 @@ public class PaxOpeningRangeModule implements
         addChange(minCvdPercentile, apply);
         addChange(minPullingStackingPercentile, apply);
         addChange(normalizationWindow, apply);
+        addChange(heatwaveBoxX, apply);
+        addChange(heatwaveBoxY, apply);
+        addChange(heatwaveFontSize, apply);
+        addChange(heatwavePollMs, apply);
         logDirectory.addActionListener(e -> apply.run());
         prefix.addActionListener(e -> apply.run());
         blockCrossDivergence.addActionListener(e -> apply.run());
         showMid.addActionListener(e -> apply.run());
+        showHeatwaveBox.addActionListener(e -> apply.run());
+        heatwaveUrl.addActionListener(e -> apply.run());
 
         return new StrategyPanel[] {panel};
     }
@@ -516,6 +560,7 @@ public class PaxOpeningRangeModule implements
         if (access != null) {
             access.setSettings(alias, SETTINGS_KEY, settings, PaxOpeningRangeUiSettings.class);
         }
+        heatwave.applySettings(settings);
     }
 
     private String diagnosticsText(String alias) {
@@ -705,6 +750,10 @@ public class PaxOpeningRangeModule implements
         }
 
         boolean shouldRepaint(long eventTime) {
+            if (consumeHeatwaveDirty()) {
+                lastRepaintTime = eventTime;
+                return true;
+            }
             if (eventTime - lastRepaintTime < REPAINT_THROTTLE_NANOS) {
                 return false;
             }
@@ -795,7 +844,30 @@ public class PaxOpeningRangeModule implements
                 PaxOpeningRangeSettings settings = getCalculatorSettings();
                 addStatus("OpenRange waiting: no completed OR. Set start time before a live " + settings.rangeSeconds() + "s window.");
             }
-            addSignalStatus(state.featureCache.latest());
+            PaxOpeningRangeUiSettings ui = loadSettings();
+            if (ui.showHeatwaveBox) {
+                addHeatwaveBox(ui);
+            } else {
+                addSignalStatus(state.featureCache.latest());
+            }
+        }
+
+        private void addHeatwaveBox(PaxOpeningRangeUiSettings ui) {
+            PaxHeatwaveModel model = heatwave.snapshot();
+            long now = System.currentTimeMillis();
+            if (model == null) {
+                model = PaxHeatwaveModel.noData(now);
+            }
+            PreparedImage image = PaxHeatwavePainter.render(model, now, ui.clampedHeatwaveFontSize());
+            int x = ui.clampedHeatwaveBoxX();
+            int y = ui.clampedHeatwaveBoxY();
+            int w = image.getReadOnlyImage().getWidth();
+            int h = image.getReadOnlyImage().getHeight();
+            addShape(image,
+                    new CompositeHorizontalCoordinate(CompositeCoordinateBase.PIXEL_ZERO, x, 0),
+                    new CompositeVerticalCoordinate(CompositeCoordinateBase.PIXEL_ZERO, y, 0),
+                    new CompositeHorizontalCoordinate(CompositeCoordinateBase.PIXEL_ZERO, x + w, 0),
+                    new CompositeVerticalCoordinate(CompositeCoordinateBase.PIXEL_ZERO, y + h, 0));
         }
 
         private void drawDay(InstrumentState state, PaxOpeningRangeDayState day) {
