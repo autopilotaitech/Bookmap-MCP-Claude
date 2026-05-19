@@ -74,6 +74,15 @@ OR_SIGNAL_GLOBS = [
 # still thinks they're set" failure mode to _MAGNET_REFRESH_SECS.
 _LAST_MAGNETS: Dict[str, Tuple[Tuple[float, ...], float]] = {}
 _LAST_MAGNETS_LOCK = threading.Lock()
+
+# /api/snapshot is expensive: it fans out to bridge endpoints, computes all
+# derived quant views, and may be polled concurrently by the browser plus
+# Bookmap-side overlay fetchers. Keep a very short whole-snapshot cache and
+# compute under one lock so concurrent consumers share one bridge fanout
+# instead of stampeding the bridge and timing each other out.
+_SNAPSHOT_CACHE_TTL_SECS = 1.0
+_SNAPSHOT_CACHE_LOCK = threading.Lock()
+_SNAPSHOT_CACHE: Optional[Tuple[float, Dict[str, Any]]] = None
 _MAGNET_REFRESH_SECS = 60.0
 
 
@@ -142,23 +151,86 @@ def momentum_flag(i10, i50, i200) -> str:
     return "neutral"
 
 
-def or_latest_row() -> Optional[Dict[str, Any]]:
+def _or_rows_by_symbol() -> Dict[str, Dict[str, Any]]:
+    """Index every OpenRange CSV under OR_SIGNAL_GLOBS by its `symbol` column.
+    Returns {symbol: latest_row}. The OpenRange addon writes one CSV per
+    symbol; the `symbol` column inside the row is the authoritative key —
+    filename safeSymbol normalization is more aggressive than the row's
+    safeSymbol (filename strips [^A-Za-z0-9._-]; row only strips commas),
+    so matching on the column avoids drift."""
     candidates: List[str] = []
     for pat in OR_SIGNAL_GLOBS:
         candidates.extend(glob.glob(pat))
-    if not candidates: return None
-    candidates.sort(key=os.path.getmtime, reverse=True)
-    path = candidates[0]
-    try:
-        with open(path, "r", encoding="utf-8", newline="") as fh:
-            rows = list(csv.DictReader(fh))
-        if not rows: return None
+    out: Dict[str, Dict[str, Any]] = {}
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8", newline="") as fh:
+                rows = list(csv.DictReader(fh))
+        except Exception:
+            continue
+        if not rows:
+            continue
         last = rows[-1]
+        sym = (last.get("symbol") or "").strip()
+        if not sym:
+            continue
         last["_csv_path"] = path
-        last["_csv_mtime"] = dt.datetime.fromtimestamp(os.path.getmtime(path), ET).isoformat()
-        return last
-    except Exception:
+        try:
+            last["_csv_mtime"] = dt.datetime.fromtimestamp(
+                os.path.getmtime(path), ET).isoformat()
+        except OSError:
+            last["_csv_mtime"] = None
+        existing = out.get(sym)
+        if existing is None:
+            out[sym] = last
+        else:
+            try:
+                if os.path.getmtime(path) > os.path.getmtime(existing["_csv_path"]):
+                    out[sym] = last
+            except OSError:
+                pass
+    return out
+
+
+def _resolve_alias_symbol(alias: Optional[str],
+                          instruments: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Look up the `symbol` for a given Bookmap alias from the /instruments
+    payload. Returns None on any mismatch. Bridge to the OpenRange CSV
+    namespace, which is keyed by symbol."""
+    if not alias or not isinstance(instruments, dict):
         return None
+    for entry in instruments.get("instruments", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("alias") == alias:
+            sym = entry.get("symbol")
+            if isinstance(sym, str) and sym.strip():
+                return sym.strip()
+            return None
+    return None
+
+
+def _build_or_rows_by_alias(alias_list: List[str],
+                            instruments: Optional[Dict[str, Any]]
+                            ) -> Dict[str, Optional[Dict[str, Any]]]:
+    """For each alias, find the OR CSV row matching its instrument symbol.
+    Reads CSVs once and reuses the index."""
+    by_symbol = _or_rows_by_symbol()
+    out: Dict[str, Optional[Dict[str, Any]]] = {}
+    for alias in alias_list:
+        sym = _resolve_alias_symbol(alias, instruments)
+        out[alias] = by_symbol.get(sym) if sym else None
+    return out
+
+
+def or_latest_row() -> Optional[Dict[str, Any]]:
+    """Newest row across every OR CSV (back-compat for single-instrument
+    callers and the `or_bias` skill). Multi-alias callers use
+    `_build_or_rows_by_alias()`."""
+    rows = _or_rows_by_symbol()
+    if not rows:
+        return None
+    return max(rows.values(), key=lambda r: r.get("_csv_mtime") or "")
 
 
 def compute_stretch(vwap_obj: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -201,6 +273,8 @@ def _demote(conf: str) -> str:
 NQ_RUNG_PTS = 65.0          # Pax canon NQ extension rung
 NQ_TICK     = 0.25          # NQ tick size
 PROX_TICKS  = 50            # 50 ticks = 12.5 pts proximity zone
+OR_MIN_EXT  = 3             # always render at least ±3 extensions
+OR_MAX_EXT  = 12            # cap so a runaway mid can't fill the page
 
 
 def _safe_num(d: Any, *keys, default=None):
@@ -872,16 +946,23 @@ def compute_or_levels(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     vp_obj   = snap.get("volume_profile")
 
     rung = NQ_RUNG_PTS
-    raw_levels = [
-        ("+3",  or_high + 3 * rung, "above"),
-        ("+2",  or_high + 2 * rung, "above"),
-        ("+1",  or_high + 1 * rung, "above"),
-        ("OR-H", or_high,           "above"),
-        ("OR-L", or_low,            "below"),
-        ("-1",  or_low - 1 * rung,  "below"),
-        ("-2",  or_low - 2 * rung,  "below"),
-        ("-3",  or_low - 3 * rung,  "below"),
-    ]
+    # Grow each side independently to cover the current mid + one buffer rung,
+    # always at least OR_MIN_EXT, never more than OR_MAX_EXT. Inside-OR default
+    # remains ±3; late-day rotations like +5 or -6 show their next magnet
+    # before price hits it.
+    reach_above = max(0.0, mid - or_high)
+    reach_below = max(0.0, or_low - mid)
+    n_above = max(OR_MIN_EXT,
+                  min(OR_MAX_EXT, int(reach_above // rung) + 1))
+    n_below = max(OR_MIN_EXT,
+                  min(OR_MAX_EXT, int(reach_below // rung) + 1))
+    raw_levels: List[Tuple[str, float, str]] = []
+    for n in range(n_above, 0, -1):
+        raw_levels.append((f"+{n}", or_high + n * rung, "above"))
+    raw_levels.append(("OR-H", or_high, "above"))
+    raw_levels.append(("OR-L", or_low,  "below"))
+    for n in range(1, n_below + 1):
+        raw_levels.append((f"-{n}", or_low - n * rung, "below"))
     prox_pts = PROX_TICKS * NQ_TICK  # 12.5 pts
 
     levels = []
@@ -3304,7 +3385,6 @@ def fetch_snapshot() -> Dict[str, Any]:
         return {"health": "ok", "ping": ping, "alias": None, "instruments": instruments,
                 "note": "Bridge alive but no instrument attached."}
     now_et = dt.datetime.now(ET)
-    or_row = or_latest_row()
     state, label = session_state(now_et)
     blocked, news_label = news_blackout(now_et)
     gates_shared = {
@@ -3317,11 +3397,13 @@ def fetch_snapshot() -> Dict[str, Any]:
     }
 
     alias_list = [i["alias"] for i in insts if isinstance(i, dict) and i.get("alias")]
+    or_rows = _build_or_rows_by_alias(alias_list, instruments)
     per_alias_snaps: Dict[str, Dict[str, Any]] = {}
     with BridgeClient(cfg, timeout_s=3.0) as c:
         for alias in alias_list:
             per_alias_snaps[alias] = _compose_alias_snapshot(
-                c, cfg, alias, ping, instruments, now_et, or_row, gates_shared)
+                c, cfg, alias, ping, instruments, now_et,
+                or_rows.get(alias), gates_shared)
 
     default_alias = alias_list[0]
     # Top-level snapshot is a shallow copy of the default alias's snapshot — keeps
@@ -3346,6 +3428,22 @@ def fetch_snapshot() -> Dict[str, Any]:
     try: pax_record(snap, snap.get("pax") or {})
     except Exception as e: sys.stderr.write(f"[pax] record failed: {e}\n")
     return snap
+
+
+def cached_fetch_snapshot() -> Dict[str, Any]:
+    """Return a short-lived single-flight snapshot for HTTP consumers."""
+    global _SNAPSHOT_CACHE
+    now_mono = time.monotonic()
+    with _SNAPSHOT_CACHE_LOCK:
+        cached = _SNAPSHOT_CACHE
+        if cached is not None:
+            cached_ts, cached_snap = cached
+            if (now_mono - cached_ts) <= _SNAPSHOT_CACHE_TTL_SECS:
+                return cached_snap
+
+        snap = fetch_snapshot()
+        _SNAPSHOT_CACHE = (time.monotonic(), snap)
+        return snap
 
 
 def _compose_alias_snapshot(c, cfg, alias: str,
@@ -3520,7 +3618,12 @@ th { color:#7aa2f7; font-size:10px; text-transform:uppercase; border-bottom:1px 
 .d-exit        .dec-conf   { background:#ff5d62; color:#2a0a0a; }
 
 /* OR levels grid */
-.lvl-grid { display:flex; flex-direction:column; gap:2px; }
+.lvl-grid { display:flex; flex-direction:column; gap:2px;
+            max-height:340px; overflow-y:auto; padding-right:4px;
+            scrollbar-width: thin; scrollbar-color: #3a4055 #0f1218; }
+.lvl-grid::-webkit-scrollbar { width:6px; }
+.lvl-grid::-webkit-scrollbar-track { background:#0f1218; }
+.lvl-grid::-webkit-scrollbar-thumb { background:#3a4055; border-radius:3px; }
 .lvl-row  { display:grid; grid-template-columns:54px 70px 70px 92px 1fr 60px; gap:8px;
             align-items:center; padding:3px 6px; border-radius:3px; font-size:12px;
             font-variant-numeric: tabular-nums; }
@@ -5640,7 +5743,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(200, self._settings_payload())
                 return
             if path == "/api/snapshot":
-                try: snap = fetch_snapshot()
+                try: snap = cached_fetch_snapshot()
                 except Exception as e:
                     sys.stderr.write("[dashboard] snapshot crashed:\n" + traceback.format_exc() + "\n")
                     snap = {"health": "error", "error": f"{type(e).__name__}: {e}"}

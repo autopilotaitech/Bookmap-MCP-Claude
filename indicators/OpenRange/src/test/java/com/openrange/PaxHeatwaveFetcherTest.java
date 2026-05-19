@@ -31,6 +31,7 @@ public class PaxHeatwaveFetcherTest {
         backoffActivatesAfterRepeatedFailures();
         applySettingsClampsPollMs();
         repaintCallbackInvokedOnSuccess();
+        timeoutBudgetCoversLiveDashboardLatency();
     }
 
     private static void successSwapsLatest() throws Exception {
@@ -150,6 +151,15 @@ public class PaxHeatwaveFetcherTest {
             }
         } finally {
             server.stop(0);
+        }
+    }
+
+    private static void timeoutBudgetCoversLiveDashboardLatency() {
+        if (PaxHeatwaveFetcher.REQUEST_TIMEOUT_MS < 10000L) {
+            throw new AssertionError("request timeout must cover live /api/snapshot latency");
+        }
+        if (PaxHeatwaveFetcher.CONNECT_TIMEOUT_MS > PaxHeatwaveFetcher.REQUEST_TIMEOUT_MS) {
+            throw new AssertionError("connect timeout must not exceed request timeout");
         }
     }
 

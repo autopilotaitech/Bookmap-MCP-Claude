@@ -12,8 +12,8 @@ import velox.api.layer1.common.Log;
 
 final class PaxHeatwaveFetcher {
 
-    static final long REQUEST_TIMEOUT_MS = 750L;
-    static final long CONNECT_TIMEOUT_MS = 750L;
+    static final long REQUEST_TIMEOUT_MS = 12_000L;
+    static final long CONNECT_TIMEOUT_MS = 1_000L;
     static final int FAIL_BACKOFF_THRESHOLD = 3;
     static final long MAX_BACKOFF_MS = 5_000L;
     static final long LOG_THROTTLE_MS = 60_000L;

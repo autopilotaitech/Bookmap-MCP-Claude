@@ -32,6 +32,7 @@ public class PaxTrendSignalFetcherTest {
         backoffActivatesAfterRepeatedFailures();
         applySettingsClampsPollMs();
         applySettingsTogglesWorker();
+        timeoutBudgetCoversLiveDashboardLatency();
         System.out.println("PaxTrendSignalFetcherTest OK");
     }
 
@@ -120,6 +121,15 @@ public class PaxTrendSignalFetcherTest {
         // Stop again.
         fetcher.applySettings(false, "http://127.0.0.1:1/api/snapshot", 1000);
         if (fetcher.isRunning()) throw new AssertionError("expected fetcher OFF after applySettings(false)");
+    }
+
+    private static void timeoutBudgetCoversLiveDashboardLatency() {
+        if (PaxTrendSignalFetcher.REQUEST_TIMEOUT_MS < 10000L) {
+            throw new AssertionError("request timeout must cover live /api/snapshot latency");
+        }
+        if (PaxTrendSignalFetcher.CONNECT_TIMEOUT_MS > PaxTrendSignalFetcher.REQUEST_TIMEOUT_MS) {
+            throw new AssertionError("connect timeout must not exceed request timeout");
+        }
     }
 
     private static void applyOff(PaxTrendSignalFetcher fetcher, String url) {
