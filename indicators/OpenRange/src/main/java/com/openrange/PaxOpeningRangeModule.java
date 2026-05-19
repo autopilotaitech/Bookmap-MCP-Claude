@@ -19,6 +19,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -91,6 +92,10 @@ public class PaxOpeningRangeModule implements
     private static final long REPAINT_THROTTLE_NANOS = 1_000_000_000L;
     private static final long DEPTH_SIGNAL_THROTTLE_NANOS = 50_000_000L;
     private static final int FEATURE_CACHE_HISTORY_SIZE = 1_024;
+    /** How long the painter trusts a CSV-derived fallback before re-scanning.
+     * Bounds disk hits per paint frame; short enough that a freshly-written
+     * CSV becomes visible within the window. */
+    private static final long FALLBACK_TTL_MS = 30_000L;
     static final int MAX_LIVE_TRIANGLES = 8;
     /** Stale-cliff for incoming trend_signal: keep existing triangles drawn,
      * but do not emit new ones if the fetcher's last successful HTTP receive
@@ -685,6 +690,13 @@ public class PaxOpeningRangeModule implements
         LocalDate orderFlowDate;
         long lastRepaintTime;
         long lastDepthSignalTime;
+        // CSV-backed chart-only fallback. Populated by PaxPainter.update() when
+        // the live calculator has no completed day; cleared as soon as live
+        // data shows up. Never read by trading/signal code.
+        volatile PaxOpeningRangeDayState fallbackDay;
+        volatile long fallbackLoadedAtMs;
+        volatile String fallbackCsvPath = "";
+        volatile String fallbackLoggedKey = "";
         // Trend triangle dedup + history. Mutated only by PaxPainter.update()
         // (Bookmap callback thread). The deque holds visible triangle events
         // so a full `clear()` + redraw on every repaint preserves the chart
@@ -884,6 +896,7 @@ public class PaxOpeningRangeModule implements
 
             clear();
             boolean drewDay = false;
+            Set<LocalDate> drawnDates = new HashSet<>();
             List<PaxOpeningRangeDayState> daysSnapshot;
             synchronized (state.lock) {
                 daysSnapshot = new ArrayList<>(state.calculator.getDays());
@@ -894,6 +907,19 @@ public class PaxOpeningRangeModule implements
                 }
                 drawDay(state, day);
                 drewDay = true;
+                drawnDates.add(day.getDate());
+            }
+            PaxOpeningRangeDayState fallback = resolveFallback(state);
+            if (fallback != null) {
+                if (drawnDates.contains(fallback.getDate())) {
+                    // Live precedence for the same session: never let CSV
+                    // fallback override a completed live day for that date.
+                    state.fallbackDay = null;
+                    state.fallbackCsvPath = "";
+                } else {
+                    drawDay(state, fallback);
+                    drewDay = true;
+                }
             }
             if (!drewDay) {
                 PaxOpeningRangeSettings settings = getCalculatorSettings();
@@ -908,6 +934,53 @@ public class PaxOpeningRangeModule implements
             if (ui.showTrendTriangles) {
                 addTrendTriangles(state);
             }
+        }
+
+        /**
+         * CSV-backed chart-only fallback. Returns the most recently cached
+         * DayState (within FALLBACK_TTL_MS); otherwise scans
+         * <logDir>/openrange-signals-*.csv for the newest row matching
+         * state.info.symbol, caches it, and returns it. Returns null when no
+         * valid row exists. Never writes into the trading calculator.
+         */
+        private PaxOpeningRangeDayState resolveFallback(InstrumentState state) {
+            long nowMs = System.currentTimeMillis();
+            PaxOpeningRangeDayState cached = state.fallbackDay;
+            if (cached != null && nowMs - state.fallbackLoadedAtMs < FALLBACK_TTL_MS) {
+                return cached;
+            }
+            PaxOpeningRangeUiSettings ui = loadSettings();
+            String logDir = ui.logDirectory == null || ui.logDirectory.isBlank()
+                    ? "build\\logs" : ui.logDirectory;
+            List<Path> logDirs = new ArrayList<>();
+            logDirs.add(Path.of(logDir));
+            logDirs.add(Path.of("D:\\BookmapLogs"));
+            java.util.Optional<PaxOpeningRangeChartFallback.Result> res =
+                    PaxOpeningRangeChartFallback.loadLatest(
+                            logDirs, state.info.symbol, state.pips);
+            state.fallbackLoadedAtMs = nowMs;
+            if (res.isEmpty()) {
+                state.fallbackDay = null;
+                state.fallbackCsvPath = "";
+                return null;
+            }
+            PaxOpeningRangeChartFallback.Result r = res.get();
+            r.day.setLastUpdateTime(getCalculatorSettings().lineEndDateTime(r.day.getDate()));
+            state.fallbackDay = r.day;
+            String csvPath = r.csvPath.toString();
+            state.fallbackCsvPath = csvPath;
+            String key = state.info.symbol + "|" + csvPath;
+            if (!key.equals(state.fallbackLoggedKey)) {
+                Log.info("OpenRange CSV chart fallback hydrated"
+                        + " symbol=" + state.info.symbol
+                        + " sessionDate=" + r.day.getDate()
+                        + " rowTime=" + r.rowTime
+                        + " high=" + r.day.getHigh()
+                        + " low=" + r.day.getLow()
+                        + " csv=" + csvPath);
+                state.fallbackLoggedKey = key;
+            }
+            return r.day;
         }
 
         /**
