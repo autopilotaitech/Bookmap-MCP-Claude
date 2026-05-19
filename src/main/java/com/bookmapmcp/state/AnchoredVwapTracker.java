@@ -77,6 +77,9 @@ public final class AnchoredVwapTracker {
             LocalTime lt = z.toLocalTime();
             boolean inDrive = !lt.isBefore(DRIVE_OPEN) && lt.isBefore(DRIVE_CLOSE);
 
+            boolean topJustAnchored = false;
+            boolean botJustAnchored = false;
+
             // Re-anchor logic — only during the drive window
             if (inDrive) {
                 // Capture trade into the drive ring (for re-anchoring)
@@ -93,6 +96,7 @@ public final class AnchoredVwapTracker {
                     topAnchorMs = nowMs;
                     topPriceVolume = price * size;
                     topVolume = size;
+                    topJustAnchored = true;
                 }
                 // New low → re-anchor bottom AVWAP
                 if (price < driveLowPx) {
@@ -101,6 +105,7 @@ public final class AnchoredVwapTracker {
                     botAnchorMs = nowMs;
                     botPriceVolume = price * size;
                     botVolume = size;
+                    botJustAnchored = true;
                 }
             } else if (!driveFrozen && !lt.isBefore(DRIVE_CLOSE)) {
                 // Drive just closed — anchors are now frozen for the session.
@@ -112,18 +117,15 @@ public final class AnchoredVwapTracker {
 
             // Update both anchored VWAPs with every trade AFTER their anchor
             // (regardless of whether we're in the drive window or not).
-            if (topAnchorMs > 0 && nowMs >= topAnchorMs && !(inDrive && price > driveHighPx)) {
-                // Skip the trade that just re-set the anchor (it's already counted)
-                if (nowMs > topAnchorMs) {
-                    topPriceVolume += price * size;
-                    topVolume += size;
-                }
+            // Skip the trade that just re-set the anchor (already counted in the
+            // reset). Same-ms trades AFTER the anchor must still be included.
+            if (topAnchorMs > 0 && nowMs >= topAnchorMs && !topJustAnchored) {
+                topPriceVolume += price * size;
+                topVolume += size;
             }
-            if (botAnchorMs > 0 && nowMs >= botAnchorMs && !(inDrive && price < driveLowPx)) {
-                if (nowMs > botAnchorMs) {
-                    botPriceVolume += price * size;
-                    botVolume += size;
-                }
+            if (botAnchorMs > 0 && nowMs >= botAnchorMs && !botJustAnchored) {
+                botPriceVolume += price * size;
+                botVolume += size;
             }
         }
     }

@@ -1475,9 +1475,11 @@ CONVICTION_SOURCE_WEIGHTS = {
     "bias_score":                  0.08,
     "vwap_dislocation":            0.08,
     "vwap_slope":                  0.08,
+    "vwap_or_gate":                0.04,
     "volume_profile":              0.08,
     "pull_stack":                  0.10,
     "tape_large_lot":              0.06,
+    "orderbook":                   0.05,
     "lt_liquidity":                0.04,
     "micro_events":                0.04,
     "level_reaction":              0.08,
@@ -1488,14 +1490,14 @@ CONVICTION_SOURCE_WEIGHTS = {
 
 CONVICTION_CLUSTERS = {
     "flow":           ["flow_ofi", "flow_cvd", "bias_score", "regime"],
-    "vwap":           ["vwap_dislocation", "vwap_slope", "anchored_vwap_opening_drive"],
+    "vwap":           ["vwap_dislocation", "vwap_slope", "vwap_or_gate", "anchored_vwap_opening_drive"],
     "structure":      ["volume_profile", "ib_context"],
-    "microstructure": ["pull_stack", "tape_large_lot", "lt_liquidity", "micro_events"],
+    "microstructure": ["pull_stack", "tape_large_lot", "orderbook", "lt_liquidity", "micro_events"],
 }
 
 CONVICTION_CLUSTER_CAPS = {
     "flow":           0.35,
-    "vwap":           0.25,
+    "vwap":           0.30,
     "structure":      0.20,
     "microstructure": 0.30,
 }
@@ -2352,17 +2354,20 @@ def _source_anchored_vwap_opening_drive(snap: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _source_ib_context(snap: Dict[str, Any]) -> Dict[str, Any]:
-    """IB-breakout context. The /momentum payload exposes ib.dayType / ibSizeTag
-    but no live IB-high/low or break-direction field. We treat this as a context
-    flag with no usable sign until IB break direction is plumbed through.
+    """IB-breakout context.
+
+    Reads `flow.ib.{ibHigh, ibLow, ibComplete}` (bridge field names emitted by
+    MomentumHandler.buildIb), with legacy `{high, low, complete}` accepted for
+    older replays. Above IB-H is bullish, below IB-L is bearish, inside the
+    range is neutral but reliable. Reliability is 0 until IB is complete.
     """
     flow = snap.get("flow") or {}
     ib = flow.get("ib") or {}
     if not ib:
         return {"score": 0.0, "reliability": 0.0, "raw": {}, "reason": "no ib"}
-    ib_high, hok = _as_float(ib.get("high"))
-    ib_low, lok = _as_float(ib.get("low"))
-    complete = ib.get("complete")
+    ib_high, hok = _as_float(ib.get("ibHigh", ib.get("high")))
+    ib_low, lok = _as_float(ib.get("ibLow", ib.get("low")))
+    complete = ib.get("ibComplete", ib.get("complete"))
     book = snap.get("book") or {}
     mid, mok = _as_float(book.get("mid"))
     if hok and lok and mok and ib_high > ib_low and complete:
@@ -3298,38 +3303,94 @@ def fetch_snapshot() -> Dict[str, Any]:
     if not insts:
         return {"health": "ok", "ping": ping, "alias": None, "instruments": instruments,
                 "note": "Bridge alive but no instrument attached."}
-    alias = insts[0]["alias"]
+    now_et = dt.datetime.now(ET)
+    or_row = or_latest_row()
+    state, label = session_state(now_et)
+    blocked, news_label = news_blackout(now_et)
+    gates_shared = {
+        "session": {
+            "code": state, "label": label,
+            "now_local": dt.datetime.now(DISPLAY_TZ).strftime("%H:%M:%S ") + DISPLAY_TZ_LABEL,
+            "now_et":    now_et.strftime("%H:%M:%S ET"),
+        },
+        "news":    {"blocked": blocked, "label": news_label},
+    }
+
+    alias_list = [i["alias"] for i in insts if isinstance(i, dict) and i.get("alias")]
+    per_alias_snaps: Dict[str, Dict[str, Any]] = {}
+    with BridgeClient(cfg, timeout_s=3.0) as c:
+        for alias in alias_list:
+            per_alias_snaps[alias] = _compose_alias_snapshot(
+                c, cfg, alias, ping, instruments, now_et, or_row, gates_shared)
+
+    default_alias = alias_list[0]
+    # Top-level snapshot is a shallow copy of the default alias's snapshot — keeps
+    # the legacy single-alias API stable. The `aliases` map carries every alias
+    # (including the default) so multi-instrument consumers can iterate.
+    snap = dict(per_alias_snaps[default_alias])
+    snap["aliases"] = per_alias_snaps
+
+    # Once-per-snapshot side effects keyed off the default alias. Per-alias
+    # magnet sync already ran inside _compose_alias_snapshot for every alias.
+    try:
+        _sync_bridge_config(cfg)
+    except Exception as exc:
+        sys.stderr.write(f"[dashboard] _sync_bridge_config outer guard: "
+                         f"{type(exc).__name__}: {exc}\n")
+    try:
+        coll = _get_pax_collector()
+        if coll is not None:
+            coll.tick(snap)
+    except Exception as e:
+        sys.stderr.write(f"[dashboard] pax_collector tick failed: {e}\n")
+    try: pax_record(snap, snap.get("pax") or {})
+    except Exception as e: sys.stderr.write(f"[pax] record failed: {e}\n")
+    return snap
+
+
+def _compose_alias_snapshot(c, cfg, alias: str,
+                            ping: Dict[str, Any],
+                            instruments: Dict[str, Any],
+                            now_et,
+                            or_row,
+                            gates_shared: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the full per-alias snapshot dict (bridge fetches + derived
+    signals + per-alias magnet sync + per-alias sim). Does NOT carry an
+    `aliases` field — that is added at the top level by fetch_snapshot to
+    avoid self-referential cycles.
+
+    Per-alias state caches (`_LAST_CONVICTION`, `_CONVICTION_STATE`,
+    `_LAST_TREND_SIGNAL`) key off `snap["alias"]`, so this helper sets
+    `alias` first so downstream helpers route to the correct bucket.
+    """
     def safe(fn):
         try: return fn()
         except Exception as e: return {"_error": f"{type(e).__name__}: {e}"}
-    with BridgeClient(cfg, timeout_s=3.0) as c:
-        # depth=300 ticks (~75 pts each side at NQ 0.25/tick) gives ~15 five-point
-        # buckets per side — supports the 12-per-side visible window with headroom
-        # so out-of-band orders still contribute to the EMA accumulator.
-        book     = safe(lambda: c.get_json("/orderbook",      {"alias": alias, "depth": 300}))
-        trades   = safe(lambda: c.get_json("/recent_trades",  {"alias": alias, "count": 200}))
-        position = safe(lambda: c.get_json("/position",       {"alias": alias}))
-        working  = safe(lambda: c.get_json("/working_orders", {"alias": alias}))
-        balance  = safe(lambda: c.get_json("/balance",        {"alias": alias}))
-        fills    = safe(lambda: c.get_json("/recent_fills",   {"alias": alias, "count": 20}))
-        vwap_obj = safe(lambda: c.get_json("/vwap",           {"alias": alias}))
-        flow_obj = safe(lambda: c.get_json("/momentum",       {"alias": alias, "windows": "30,120,600"}))
-        vp_obj   = safe(lambda: c.get_json("/volume_profile", {"alias": alias}))
-        tape_obj = safe(lambda: c.get_json("/tape_buckets",   {"alias": alias}))
-        lt_obj   = safe(lambda: c.get_json("/lt_liquidity",   {"alias": alias}))
-        ps_obj   = safe(lambda: c.get_json("/pull_stack",     {"alias": alias}))
-        me_obj   = safe(lambda: c.get_json("/microstructure_events", {"alias": alias, "max": 30}))
-        trend_obj = safe(lambda: c.get_json("/trend_analyzer",        {"alias": alias}))
-    now_et = dt.datetime.now(ET)
-    state, label = session_state(now_et)
-    blocked, news_label = news_blackout(now_et)
-    or_row = or_latest_row()
+    # depth=300 ticks (~75 pts each side at NQ 0.25/tick) gives ~15 five-point
+    # buckets per side — supports the 12-per-side visible window with headroom
+    # so out-of-band orders still contribute to the EMA accumulator.
+    book     = safe(lambda: c.get_json("/orderbook",      {"alias": alias, "depth": 300}))
+    trades   = safe(lambda: c.get_json("/recent_trades",  {"alias": alias, "count": 200}))
+    position = safe(lambda: c.get_json("/position",       {"alias": alias}))
+    working  = safe(lambda: c.get_json("/working_orders", {"alias": alias}))
+    balance  = safe(lambda: c.get_json("/balance",        {"alias": alias}))
+    fills    = safe(lambda: c.get_json("/recent_fills",   {"alias": alias, "count": 20}))
+    vwap_obj = safe(lambda: c.get_json("/vwap",           {"alias": alias}))
+    flow_obj = safe(lambda: c.get_json("/momentum",       {"alias": alias, "windows": "30,120,600"}))
+    vp_obj   = safe(lambda: c.get_json("/volume_profile", {"alias": alias}))
+    tape_obj = safe(lambda: c.get_json("/tape_buckets",   {"alias": alias}))
+    lt_obj   = safe(lambda: c.get_json("/lt_liquidity",   {"alias": alias}))
+    ps_obj   = safe(lambda: c.get_json("/pull_stack",     {"alias": alias}))
+    me_obj   = safe(lambda: c.get_json("/microstructure_events", {"alias": alias, "max": 30}))
+    trend_obj = safe(lambda: c.get_json("/trend_analyzer",        {"alias": alias}))
+
     trade_list = trades.get("trades", []) if isinstance(trades, dict) and "_error" not in trades else []
     if isinstance(vwap_obj, dict) and "_error" not in vwap_obj and vwap_obj.get("vwap") is not None:
         vwap = vwap_obj.get("vwap"); vwap_source = "session"
     else:
         vwap = vwap_from_trades(trade_list); vwap_source = "ring_buffer_fallback"
-    snap = {
+
+    snap: Dict[str, Any] = {
         "health": "ok",
         "ts": now_et.isoformat(timespec="seconds"),
         "ping": ping, "alias": alias, "instruments": instruments,
@@ -3351,12 +3412,7 @@ def fetch_snapshot() -> Dict[str, Any]:
             "flag": momentum_flag(imbalance(trade_list, 10), imbalance(trade_list, 50), imbalance(trade_list, 200)),
         },
         "gates": {
-            "session": {
-                "code": state, "label": label,
-                "now_local": dt.datetime.now(DISPLAY_TZ).strftime("%H:%M:%S ") + DISPLAY_TZ_LABEL,
-                "now_et":    now_et.strftime("%H:%M:%S ET"),
-            },
-            "news":    {"blocked": blocked, "label": news_label},
+            **gates_shared,
             "vwap_or": vwap_or_gate(book if isinstance(book, dict) and "_error" not in book else {}, vwap, or_row),
         },
     }
@@ -3364,25 +3420,18 @@ def fetch_snapshot() -> Dict[str, Any]:
     def _safe_call(fn, name):
         try: return fn(snap)
         except Exception as e:
-            sys.stderr.write(f"[dashboard] {name} crashed: {type(e).__name__}: {e}\n"
+            sys.stderr.write(f"[dashboard] {name}({alias}) crashed: {type(e).__name__}: {e}\n"
                              + traceback.format_exc() + "\n")
             return {"_error": f"{name}: {type(e).__name__}: {e}"}
     snap["tape_flow"] = _safe_call(compute_tape_flow, "compute_tape_flow")
     snap["or_levels"] = _safe_call(compute_or_levels, "compute_or_levels")
-    # Push the OR grid to the bridge as STOP_SWEEP magnets. Failure is logged
-    # but never propagates — magnet sync is best-effort, snapshot composition
-    # is critical-path.
+    # Push the OR grid to the bridge as STOP_SWEEP magnets. Per-alias —
+    # each alias gets its own magnet set. Failure is logged but never
+    # propagates; snapshot composition is critical-path.
     try:
         _sync_magnet_levels(cfg, alias, snap["or_levels"])
     except Exception as exc:
-        sys.stderr.write(f"[dashboard] _sync_magnet_levels outer guard: "
-                         f"{type(exc).__name__}: {exc}\n")
-    # Same pattern: push VWAP/VP runtime config (RTH/ETH anchor times,
-    # value-area %) to the Java bridge. Best-effort; never propagates.
-    try:
-        _sync_bridge_config(cfg)
-    except Exception as exc:
-        sys.stderr.write(f"[dashboard] _sync_bridge_config outer guard: "
+        sys.stderr.write(f"[dashboard] _sync_magnet_levels({alias}) outer guard: "
                          f"{type(exc).__name__}: {exc}\n")
     snap["vwap_bias"] = _safe_call(compute_vwap_bias, "compute_vwap_bias")
     snap["vp_bias"]   = _safe_call(compute_vp_bias,   "compute_vp_bias")
@@ -3393,21 +3442,10 @@ def fetch_snapshot() -> Dict[str, Any]:
     # SIM trades from local sim engine (read-only — agent process owns writes)
     try:
         from .sim_engine import SimEngine
-        if alias:
-            snap["sim"] = SimEngine(alias=alias).snapshot()
+        snap["sim"] = SimEngine(alias=alias).snapshot()
     except Exception as e:
-        sys.stderr.write(f"[dashboard] sim snapshot failed: {e}\n")
+        sys.stderr.write(f"[dashboard] sim snapshot({alias}) failed: {e}\n")
         snap["sim"] = {"_error": str(e)}
-    # Proximity-triggered data collector — produces D:/BookmapLogs/pax-recordings/
-    # regardless of whether pax_trader is running.
-    try:
-        coll = _get_pax_collector()
-        if coll is not None:
-            coll.tick(snap)
-    except Exception as e:
-        sys.stderr.write(f"[dashboard] pax_collector tick failed: {e}\n")
-    try: pax_record(snap, snap["pax"] or {})
-    except Exception as e: sys.stderr.write(f"[pax] record failed: {e}\n")
     return snap
 
 
