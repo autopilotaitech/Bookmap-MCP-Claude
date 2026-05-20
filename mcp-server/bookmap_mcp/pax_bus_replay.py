@@ -67,19 +67,45 @@ def _load_snapshot_blob(snap_dir: Path, date_str: str,
         return None
 
 
-def _rebuild_digest(snap: dict, user_text: str, alias: str,
-                     ts_ms: int, router_primary: Optional[str]) -> str:
+def _rebuild_router_hint(user_text_raw: str,
+                           user_text_normalized: Optional[str]) -> str:
+    """Reconstruct the EXACT router_hint string that capture-time chat.py used.
+
+    Capture path:
+        normalized = voice.normalize(user_text)
+        routed     = prompts.route(normalized)
+        router_hint = routed["router_hint"]
+
+    Replay path mirrors this. Prefer the stored user_text_normalized when
+    present; otherwise re-run voice.normalize() on user_text_raw. NEVER
+    synthesizes the hint from router_primary alone - that drops the
+    "consult SKILL ..." prefix and the secondary-skill clause, both of
+    which prompts.route() includes and which were captured into the
+    stored digest."""
+    from pax_ai import prompts, voice
+    normalized = (user_text_normalized
+                  if user_text_normalized is not None
+                  else voice.normalize(user_text_raw or ""))
+    return prompts.route(normalized)["router_hint"]
+
+
+def _rebuild_digest(snap: dict, user_text_raw: str,
+                     user_text_normalized: Optional[str],
+                     alias: str, ts_ms: int) -> str:
     """Rebuild the bus digest from a saved snapshot blob.
 
     Uses session_memory_before_ts_ms=ts_ms so that the SESSION_MEMORY block
     contains exactly the prior turns the capture-time chat.py saw (rows
-    with ts_ms strictly less than the current ai_turn's ts_ms). Capture-time
-    chat.py did not pass this kwarg because the current turn wasn't in the
-    DB yet; both paths therefore see the same set of session-memory rows."""
+    with ts_ms strictly less than the current ai_turn's ts_ms).
+
+    router_hint is rebuilt by calling the real pax_ai.prompts.route() (via
+    the same voice.normalize() pipeline chat.py uses), NOT synthesized from
+    router_primary. Otherwise replay would drop the routing-hint preamble
+    that the stored digest contains."""
     from pax_ai import bus_digest
-    router_hint = f"ROUTER: {router_primary}" if router_primary else ""
+    router_hint = _rebuild_router_hint(user_text_raw, user_text_normalized)
     return bus_digest.render_user_message(
-        snap=snap, user_text=user_text or "",
+        snap=snap, user_text=user_text_raw or "",
         router_hint=router_hint, alias=alias, ts_ms=ts_ms,
         session_memory_before_ts_ms=ts_ms,
     )
@@ -120,7 +146,7 @@ def main(argv=None) -> int:
 
     try:
         sql = ("SELECT id, ts_ms, snapshot_alias, snapshot_sha256, "
-               "digest_sha256, user_text_raw, router_primary "
+               "digest_sha256, user_text_raw, user_text_normalized "
                "FROM ai_turns WHERE ts_ms>=? AND ts_ms<?")
         params: list = [start_ms, end_ms]
         if args.alias:
@@ -139,9 +165,11 @@ def main(argv=None) -> int:
             continue
         try:
             rebuilt = _rebuild_digest(
-                snap=snap, user_text=r["user_text_raw"] or "",
+                snap=snap,
+                user_text_raw=r["user_text_raw"] or "",
+                user_text_normalized=r["user_text_normalized"],
                 alias=r["snapshot_alias"] or "",
-                ts_ms=r["ts_ms"], router_primary=r["router_primary"])
+                ts_ms=r["ts_ms"])
         except Exception as exc:
             mismatched.append({"id": r["id"], "ts_ms": r["ts_ms"],
                                 "reason": f"rebuild failed: {exc}"})

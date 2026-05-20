@@ -47,11 +47,17 @@ def _invoke_cli(args: list, env_extra: dict = None) -> subprocess.CompletedProce
 
 
 def _seed_bus(tmp_path, ai_ts_ms, snap_dict, user_text="ping",
-                alias="NQM6", router_hint="ROUTER: pax-or"):
+                alias="NQM6"):
     """Create the bus DB schema, write the snapshot blob, write the digest
     blob (using bus_digest.render_user_message), and insert one ai_turns row.
+
+    Mirrors capture-time chat.py: normalizes user_text via voice.normalize(),
+    routes via prompts.route(), and uses routed['router_hint'] as the
+    capture-time hint. Stores user_text_normalized so replay can recompute
+    the same hint deterministically.
+
     Returns (db_path, snapshot_dir, digest_dir, snapshot_sha, digest_sha)."""
-    from pax_ai import feature_bus, bus_digest
+    from pax_ai import feature_bus, bus_digest, prompts, voice
     db_path = tmp_path / "pax-bus.db"
     snap_dir = tmp_path / "snapshots"
     dig_dir  = tmp_path / "digests"
@@ -62,6 +68,11 @@ def _seed_bus(tmp_path, ai_ts_ms, snap_dict, user_text="ping",
     dig_dir_dated  = dig_dir / date_part
     snap_dir_dated.mkdir(parents=True, exist_ok=True)
     dig_dir_dated.mkdir(parents=True, exist_ok=True)
+
+    # Mirror capture-time routing.
+    user_text_normalized = voice.normalize(user_text)
+    routed = prompts.route(user_text_normalized)
+    router_hint = routed["router_hint"]
 
     # Build the same bus digest the CLI will rebuild.
     digest_text = bus_digest.render_user_message(
@@ -85,10 +96,12 @@ def _seed_bus(tmp_path, ai_ts_ms, snap_dict, user_text="ping",
                user_text_raw, user_text_normalized, pax_text,
                snapshot_alias, snapshot_sha256, digest_sha256, aborted)
             VALUES (1, ?, 'r1', 0, 'claude-haiku-4-5',
-                    'pax-or', NULL,
+                    ?, ?,
                     ?, ?, 'OMITTED',
                     ?, ?, ?, 0)
-        """, (ai_ts_ms, user_text, user_text, alias, snap_sha, digest_sha))
+        """, (ai_ts_ms, routed["primary"],
+              json.dumps(routed["secondary"]) if routed["secondary"] else None,
+              user_text, user_text_normalized, alias, snap_sha, digest_sha))
 
     return db_path, snap_dir, dig_dir, snap_sha, digest_sha
 
@@ -219,7 +232,7 @@ def test_replay_multi_turn_matches_with_before_ts_ms_filter(tmp_path, monkeypatc
     each digest using session_memory_before_ts_ms=ai_turn.ts_ms so that the
     SESSION_MEMORY block matches what capture-time chat.py saw. Without the
     filter, this test would fail with false SHA mismatches for turn 2."""
-    from pax_ai import feature_bus, bus_digest
+    from pax_ai import feature_bus, bus_digest, prompts, voice
     db_path = tmp_path / "pax-bus.db"
     snap_dir = tmp_path / "snapshots"
     dig_dir  = tmp_path / "digests"
@@ -244,10 +257,18 @@ def test_replay_multi_turn_matches_with_before_ts_ms_filter(tmp_path, monkeypatc
     with feature_bus._open_db(db_path) as conn:
         feature_bus._ensure_schema(conn)
 
+    # Mirror capture-time routing for each turn (uses real prompts.route()).
+    user1_raw = "first"
+    user2_raw = "second"
+    user1_norm = voice.normalize(user1_raw)
+    user2_norm = voice.normalize(user2_raw)
+    routed1 = prompts.route(user1_norm)
+    routed2 = prompts.route(user2_norm)
+
     # Turn 1 at ts1: SESSION_MEMORY is empty (no prior turns).
     digest_1 = bus_digest.render_user_message(
-        snap=SNAP_FIXTURE, user_text="first",
-        router_hint="ROUTER: pax-or", alias="NQM6", ts_ms=ts1)
+        snap=SNAP_FIXTURE, user_text=user1_raw,
+        router_hint=routed1["router_hint"], alias="NQM6", ts_ms=ts1)
     digest_1_sha = hashlib.sha256(digest_1.encode("utf-8")).hexdigest()
     (dig_dir_dated / f"{digest_1_sha}.txt").write_text(digest_1, encoding="utf-8")
 
@@ -260,14 +281,16 @@ def test_replay_multi_turn_matches_with_before_ts_ms_filter(tmp_path, monkeypatc
                user_text_raw, user_text_normalized, pax_text,
                snapshot_alias, snapshot_sha256, digest_sha256, aborted)
             VALUES (1, ?, 'r1', 0, 'claude-haiku-4-5',
-                    'pax-or', NULL,
+                    ?, ?,
                     ?, ?, 'OMITTED', 'NQM6', ?, ?, 0)
-        """, (ts1, "first", "first", snap_sha, digest_1_sha))
+        """, (ts1, routed1["primary"],
+              json.dumps(routed1["secondary"]) if routed1["secondary"] else None,
+              user1_raw, user1_norm, snap_sha, digest_1_sha))
 
     # Turn 2 at ts2: SESSION_MEMORY sees turn 1 because it's in the DB.
     digest_2 = bus_digest.render_user_message(
-        snap=SNAP_FIXTURE, user_text="second",
-        router_hint="ROUTER: pax-or", alias="NQM6", ts_ms=ts2)
+        snap=SNAP_FIXTURE, user_text=user2_raw,
+        router_hint=routed2["router_hint"], alias="NQM6", ts_ms=ts2)
     digest_2_sha = hashlib.sha256(digest_2.encode("utf-8")).hexdigest()
     (dig_dir_dated / f"{digest_2_sha}.txt").write_text(digest_2, encoding="utf-8")
 
@@ -280,9 +303,11 @@ def test_replay_multi_turn_matches_with_before_ts_ms_filter(tmp_path, monkeypatc
                user_text_raw, user_text_normalized, pax_text,
                snapshot_alias, snapshot_sha256, digest_sha256, aborted)
             VALUES (1, ?, 'r1', 0, 'claude-haiku-4-5',
-                    'pax-or', NULL,
+                    ?, ?,
                     ?, ?, 'OMITTED', 'NQM6', ?, ?, 0)
-        """, (ts2, "second", "second", snap_sha, digest_2_sha))
+        """, (ts2, routed2["primary"],
+              json.dumps(routed2["secondary"]) if routed2["secondary"] else None,
+              user2_raw, user2_norm, snap_sha, digest_2_sha))
 
     # Now replay both: both rebuilds must SHA-match their stored digests.
     if _HAVE_DIRECT_IMPORT:
@@ -325,3 +350,159 @@ def test_replay_date_filter_excludes_other_days(tmp_path, monkeypatch):
     assert rc == 0
     report = (tmp_path / "report.md").read_text(encoding="utf-8")
     assert "0 row" in report.lower() or "no rows" in report.lower()
+
+
+def test_replay_router_hint_uses_real_routing_not_router_primary(tmp_path, monkeypatch):
+    """Capture-time chat.py stores router_hint built by prompts.route(), which
+    is a long-form string like 'ROUTER: consult SKILL pax-or; secondary
+    SKILL hft_microstructure_quant_v1.' — NOT simply 'ROUTER: pax-or'.
+
+    Regression: an earlier replay implementation synthesized router_hint as
+    f'ROUTER: {router_primary}', which produces a different string and
+    therefore a SHA mismatch on every multi-skill turn. This test seeds an
+    ai_turn whose stored digest used the REAL prompts.route()['router_hint'],
+    then asserts replay still matches because _rebuild_router_hint calls
+    prompts.route() rather than synthesizing from router_primary."""
+    from pax_ai import feature_bus, bus_digest, prompts, voice
+
+    db_path  = tmp_path / "pax-bus.db"
+    snap_dir = tmp_path / "snapshots"
+    dig_dir  = tmp_path / "digests"
+    date_part = "2026-01-15"
+    (snap_dir / date_part).mkdir(parents=True, exist_ok=True)
+    (dig_dir  / date_part).mkdir(parents=True, exist_ok=True)
+
+    _enable_bus_pointing_at(tmp_path, db_path, snap_dir, dig_dir, monkeypatch)
+
+    # Pick a user message that prompts.route() will route to BOTH primary AND
+    # secondary skills (e.g. "tape and iceberg" hits hft_microstructure on top
+    # of pax-or). This makes the real router_hint distinctly different from
+    # any naive "ROUTER: pax-or" synthesis.
+    user_text = "what does the tape say about iceberg activity?"
+    normalized = voice.normalize(user_text)
+    routed = prompts.route(normalized)
+    real_router_hint = routed["router_hint"]
+    assert "consult SKILL" in real_router_hint, (
+        "test sanity: prompts.route() should produce a long-form 'consult SKILL ...' hint; "
+        f"got: {real_router_hint!r}")
+    naive_hint = f"ROUTER: {routed['primary']}"
+    assert naive_hint != real_router_hint, (
+        "test sanity: the naive synthesis must differ from the real hint")
+
+    ai_ts = _UTC_2026_01_15_NOON
+    snap_json = feature_bus._canonical_snapshot_json(SNAP_FIXTURE)
+    snap_sha = hashlib.sha256(snap_json.encode("utf-8")).hexdigest()
+    (snap_dir / date_part / f"{snap_sha}.json").write_text(
+        snap_json, encoding="utf-8")
+
+    # Capture-time digest uses the REAL router_hint from prompts.route().
+    digest_text = bus_digest.render_user_message(
+        snap=SNAP_FIXTURE, user_text=user_text,
+        router_hint=real_router_hint,
+        alias="NQM6", ts_ms=ai_ts)
+    digest_sha = hashlib.sha256(digest_text.encode("utf-8")).hexdigest()
+    (dig_dir / date_part / f"{digest_sha}.txt").write_text(
+        digest_text, encoding="utf-8")
+
+    with feature_bus._open_db(db_path) as conn:
+        feature_bus._ensure_schema(conn)
+        conn.execute("""
+            INSERT INTO ai_turns
+              (schema_version, ts_ms, chat_run_id, deep, model,
+               router_primary, router_secondary,
+               user_text_raw, user_text_normalized, pax_text,
+               snapshot_alias, snapshot_sha256, digest_sha256, aborted)
+            VALUES (1, ?, 'r1', 0, 'claude-haiku-4-5',
+                    ?, ?,
+                    ?, ?, 'OMITTED',
+                    'NQM6', ?, ?, 0)
+        """, (ai_ts, routed["primary"],
+              json.dumps(routed["secondary"]) if routed["secondary"] else None,
+              user_text, normalized, snap_sha, digest_sha))
+
+    # Replay - must reproduce the SAME router_hint.
+    if _HAVE_DIRECT_IMPORT:
+        rc = replay_main(["--date", "2026-01-15",
+                           "--report", str(tmp_path / "report.md")])
+    else:
+        env_extra = {
+            "PAX_AI_BUS_DB":     str(db_path),
+            "PAX_AI_SNAP_DIR":   str(snap_dir),
+            "PAX_AI_DIGEST_DIR": str(dig_dir),
+            "PAX_AI_REPORT":     str(tmp_path / "report.md"),
+        }
+        result = _invoke_cli(["--date", "2026-01-15"], env_extra=env_extra)
+        rc = result.returncode
+    report = (tmp_path / "report.md").read_text(encoding="utf-8")
+    assert rc == 0, (
+        "replay must match when it rebuilds router_hint via prompts.route(); "
+        f"report:\n{report}")
+
+
+def test_replay_prefers_stored_user_text_normalized(tmp_path, monkeypatch):
+    """When user_text_normalized differs from voice.normalize(user_text_raw)
+    (e.g. operator hand-tunes the normalization or voice rules change later),
+    replay should use the STORED normalized text - not re-normalize. This
+    keeps replay deterministic across voice-rule changes."""
+    from pax_ai import feature_bus, bus_digest, prompts, voice
+
+    db_path  = tmp_path / "pax-bus.db"
+    snap_dir = tmp_path / "snapshots"
+    dig_dir  = tmp_path / "digests"
+    date_part = "2026-01-15"
+    (snap_dir / date_part).mkdir(parents=True, exist_ok=True)
+    (dig_dir  / date_part).mkdir(parents=True, exist_ok=True)
+
+    _enable_bus_pointing_at(tmp_path, db_path, snap_dir, dig_dir, monkeypatch)
+
+    # Deliberately STORED normalized != live voice.normalize(raw).
+    raw        = "tape please"
+    stored_norm = "tape and iceberg"          # stored what capture-time saw
+    # Capture-time digest uses prompts.route(stored_norm).
+    routed = prompts.route(stored_norm)
+    real_router_hint = routed["router_hint"]
+
+    ai_ts = _UTC_2026_01_15_NOON
+    snap_json = feature_bus._canonical_snapshot_json(SNAP_FIXTURE)
+    snap_sha = hashlib.sha256(snap_json.encode("utf-8")).hexdigest()
+    (snap_dir / date_part / f"{snap_sha}.json").write_text(
+        snap_json, encoding="utf-8")
+
+    digest_text = bus_digest.render_user_message(
+        snap=SNAP_FIXTURE, user_text=raw,
+        router_hint=real_router_hint,
+        alias="NQM6", ts_ms=ai_ts)
+    digest_sha = hashlib.sha256(digest_text.encode("utf-8")).hexdigest()
+    (dig_dir / date_part / f"{digest_sha}.txt").write_text(
+        digest_text, encoding="utf-8")
+
+    with feature_bus._open_db(db_path) as conn:
+        feature_bus._ensure_schema(conn)
+        conn.execute("""
+            INSERT INTO ai_turns
+              (schema_version, ts_ms, chat_run_id, deep, model,
+               router_primary, router_secondary,
+               user_text_raw, user_text_normalized, pax_text,
+               snapshot_alias, snapshot_sha256, digest_sha256, aborted)
+            VALUES (1, ?, 'r1', 0, 'claude-haiku-4-5',
+                    ?, NULL,
+                    ?, ?, 'OMITTED',
+                    'NQM6', ?, ?, 0)
+        """, (ai_ts, routed["primary"], raw, stored_norm, snap_sha, digest_sha))
+
+    if _HAVE_DIRECT_IMPORT:
+        rc = replay_main(["--date", "2026-01-15",
+                           "--report", str(tmp_path / "report.md")])
+    else:
+        env_extra = {
+            "PAX_AI_BUS_DB":     str(db_path),
+            "PAX_AI_SNAP_DIR":   str(snap_dir),
+            "PAX_AI_DIGEST_DIR": str(dig_dir),
+            "PAX_AI_REPORT":     str(tmp_path / "report.md"),
+        }
+        result = _invoke_cli(["--date", "2026-01-15"], env_extra=env_extra)
+        rc = result.returncode
+    report = (tmp_path / "report.md").read_text(encoding="utf-8")
+    assert rc == 0, (
+        "replay must use STORED user_text_normalized, not re-normalize raw text. "
+        f"report:\n{report}")

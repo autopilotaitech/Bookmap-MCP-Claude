@@ -615,3 +615,118 @@ def test_flag_true_uses_bus_full_msg_only_when_feature_bus_enabled(monkeypatch, 
     chat.handle_chat_stream(_W(), "ping", deep=False)
     assert "[STATE]" not in captured["user_message"], \
         "feature_bus.enabled=False must NEVER route bus digest to Claude even with flag=True"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3A router_hint plumbing (chat side)
+# ---------------------------------------------------------------------------
+
+def test_build_user_message_meta_includes_router_hint(monkeypatch):
+    """build_user_message MUST expose the real router_hint string in meta
+    (not just router_primary/router_secondary). Phase 3A's shadow render
+    + flag-gated swap reads meta['router_hint'] to keep routing context
+    in the bus digest."""
+    from pax_ai import chat
+    monkeypatch.setattr(chat.prompts, "route", lambda t: {
+        "primary": "pax-or",
+        "secondary": ["hft_microstructure_quant_v1"],
+        "router_hint": "ROUTER: consult SKILL pax-or; secondary SKILL hft_microstructure_quant_v1.",
+    })
+    full, meta = chat.build_user_message("ping")
+    assert "router_hint" in meta
+    assert meta["router_hint"] == \
+        "ROUTER: consult SKILL pax-or; secondary SKILL hft_microstructure_quant_v1."
+    # The legacy full_msg also begins with the same hint (Phase 1+2 invariant).
+    assert full.startswith(meta["router_hint"])
+
+
+def test_bus_digest_receives_real_router_hint_from_meta(monkeypatch, tmp_path):
+    """When the shadow runs (feature_bus.enabled=True), the router_hint
+    passed to bus_digest.render_user_message MUST be the meta['router_hint']
+    string (not f'ROUTER: {primary}')."""
+    from pax_ai import chat, feature_bus
+    from pax_ai import claude_stream as cs
+    from pax_ai import bus_digest as bd
+
+    captured_call = {}
+    real_render = bd.render_user_message
+    def spy_render(*args, **kwargs):
+        captured_call["router_hint"] = kwargs.get("router_hint")
+        return real_render(*args, **kwargs)
+    monkeypatch.setattr(bd, "render_user_message", spy_render)
+
+    monkeypatch.setattr(cs, "stream_chat", lambda **kw: (
+        kw["on_token"]("ok"),
+        kw["on_done"]({"exit_code": 0}), 0)[2])
+    monkeypatch.setattr(chat.prompts, "write_frozen_prompt", lambda: Path("/tmp/sp.txt"))
+    monkeypatch.setattr(chat.prompts, "route", lambda t: {
+        "primary": "pax-or",
+        "secondary": ["hft_microstructure_quant_v1"],
+        "router_hint": "ROUTER: consult SKILL pax-or; secondary SKILL hft_microstructure_quant_v1.",
+    })
+
+    from pax_ai import config as cfg_mod
+    monkeypatch.setattr(cfg_mod, "_reload_if_stale", lambda: None)
+    monkeypatch.setattr(cfg_mod, "_CACHE", {**cfg_mod._CACHE,
+        "feature_bus": {"enabled": True, "db_path": str(tmp_path / "bus.db"),
+            "snapshot_blob_dir": str(tmp_path / "s"),
+            "digest_blob_dir":   str(tmp_path / "d"),
+            "queue_max": 2000, "writer_idle_ms": 100, "capture_ms": 1000,
+            "retention_days": 30},
+        "chat": {"use_feature_bus_digest": False}})
+
+    class _W:
+        def write(self, b): pass
+        def flush(self): pass
+    chat.handle_chat_stream(_W(), "ping", deep=False)
+
+    assert captured_call.get("router_hint") == \
+        "ROUTER: consult SKILL pax-or; secondary SKILL hft_microstructure_quant_v1."
+
+
+def test_router_hint_does_not_leak_into_sse_done_payload(monkeypatch):
+    """SSE done event MUST NOT include router_hint. The 'start' and 'done'
+    payloads carry router_primary (and secondary on 'start') but not the
+    raw hint string. Regression guard against accidentally exposing
+    meta['router_hint'] in the SSE response."""
+    from pax_ai import chat, feature_bus
+    from pax_ai import claude_stream as cs
+
+    class _CaptureWfile:
+        def __init__(self): self.buf = bytearray()
+        def write(self, b):
+            self.buf.extend(b if isinstance(b, (bytes, bytearray)) else b.encode())
+        def flush(self): pass
+
+    def _fake_stream_chat(user_message, model, system_prompt_path,
+                          on_token, on_done, abort, timeout_sec):
+        on_token("hello")
+        on_done({"exit_code": 0, "elapsed_ms": 5, "tokens_emitted": 1,
+                 "aborted": False, "error": None,
+                 "total_cost_usd": 0.001, "input_tokens": 100,
+                 "output_tokens": 1, "cache_creation_input_tokens": 0,
+                 "cache_read_input_tokens": 0, "duration_api_ms": 5})
+        return 0
+    monkeypatch.setattr(cs, "stream_chat", _fake_stream_chat)
+    monkeypatch.setattr(chat.prompts, "write_frozen_prompt", lambda: Path("/tmp/sp.txt"))
+    distinct_hint = "ROUTER_HINT_SENTINEL_DO_NOT_LEAK_TO_SSE"
+    monkeypatch.setattr(chat.prompts, "route", lambda t: {
+        "primary": "pax-or",
+        "secondary": [],
+        "router_hint": distinct_hint,
+    })
+
+    from pax_ai import config as cfg_mod
+    monkeypatch.setattr(cfg_mod, "_reload_if_stale", lambda: None)
+    monkeypatch.setattr(cfg_mod, "_CACHE", {**cfg_mod._CACHE,
+        "feature_bus": {"enabled": False, "db_path": "", "snapshot_blob_dir": "",
+            "digest_blob_dir": "", "queue_max": 2000, "writer_idle_ms": 100,
+            "capture_ms": 1000, "retention_days": 30},
+        "chat": {"use_feature_bus_digest": False}})
+
+    w = _CaptureWfile()
+    chat.handle_chat_stream(w, "ping", deep=False)
+    sse_bytes = bytes(w.buf).decode("utf-8")
+    assert distinct_hint not in sse_bytes, (
+        "router_hint must NOT appear in any SSE event payload "
+        "(start/token/done/error)")
