@@ -1,0 +1,12 @@
+{
+  "_comment": "Pax AI runtime config. Hot-reloaded on mtime change (pax_ai/config.py). Defaults live in code; this file overrides them.",
+  "models": {
+    "live":           "claude-haiku-4-5",
+    "deep":           "claude-sonnet-4-6",
+    "opus_opt_in":    false,
+    "deep_when_opus": "claude-opus-4-7"
+  },
+  "poll_ms":           1000,
+  "stale_snapshot_ms": 5000,
+  "prox_ticks":        8
+}

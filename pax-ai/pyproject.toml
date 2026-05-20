@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pax-ai"
+version = "0.0.1"
+description = "Pax AI - floating dark-glass quant chat over Bookmap MCP dashboard"
+requires-python = ">=3.11"
+authors = [{name = "Will (autopilotaitech)", email = "will@autopilotaitech.com"}]
+dependencies = [
+    "pywebview>=6.2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["pax_ai*"]
+
+[tool.setuptools.package-data]
+pax_ai = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

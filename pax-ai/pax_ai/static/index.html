@@ -1,0 +1,610 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Pax AI</title>
+<style>
+  :root {
+    --bg-0: #07090d;
+    --bg-1: #0b0f17;
+    --bg-2: #11161f;
+    --bg-3: #161c27;
+    --line: rgba(255,255,255,0.045);
+    --line-2: rgba(255,255,255,0.08);
+    --text: #d8e3f0;
+    --text-dim: #7c8a9c;
+    --text-faint: #4d5868;
+    --cyan: #36d6ff;
+    --orange: #ff9b3c;
+    --green: #4ade80;
+    --red: #ff5a6a;
+    --yellow: #f1c54a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; height:100%; width:100%;
+    background: var(--bg-0); color: var(--text);
+    font-family: 'Inter', 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
+    font-size: 13px; line-height: 1.42;
+    -webkit-user-select: none; user-select: none;
+    -webkit-font-smoothing: antialiased;
+  }
+  .root {
+    display: grid; grid-template-rows: 30px 36px 1fr auto; height: 100vh;
+    background:
+      radial-gradient(120% 80% at 50% 0%, #131a25 0%, #0a0e15 55%, var(--bg-0) 100%);
+    border: 1px solid rgba(54,214,255,0.10);
+    box-shadow: 0 14px 50px rgba(0,0,0,0.55), 0 1px 0 rgba(255,255,255,0.04) inset;
+  }
+  .titlebar {
+    display:flex; align-items:center; justify-content:space-between;
+    padding: 0 8px 0 12px;
+    border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, rgba(54,214,255,0.04), transparent);
+  }
+  .titlebar .brand { font-size: 11px; letter-spacing: 1.4px;
+    color: var(--text-dim); font-weight: 600; }
+  .titlebar .brand b { color: var(--cyan); font-weight: 700; }
+  .titlebar .ctrls { display:flex; gap:6px; }
+  .titlebar .dot { width:11px; height:11px; border-radius:50%;
+    background: var(--bg-3); border: 1px solid var(--line-2); cursor:pointer; }
+  .titlebar .dot:hover { filter: brightness(1.4); }
+  .titlebar .dot.x { background:#3a1820; border-color: rgba(255,90,106,0.4); }
+  .titlebar .dot.x:hover { background:#ff5a6a; }
+  .strip {
+    display:grid; grid-template-columns: auto 1fr auto;
+    align-items:center; gap: 10px;
+    padding: 0 12px;
+    background: var(--bg-1);
+    border-bottom: 1px solid var(--line);
+    font-family: 'JetBrains Mono', 'Consolas', monospace;
+    font-size: 11.5px;
+  }
+  .strip #sym { color: var(--text); font-weight: 600; }
+  .strip #mid { color: var(--cyan); font-variant-numeric: tabular-nums;
+    font-weight: 600; }
+  .strip #nearest { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .strip #nearest b { color: var(--text); font-weight: 600; }
+  .strip #conv { color: var(--text-faint); font-size: 10.5px; text-align:right;}
+  .strip #conv .pos { color: var(--green); }
+  .strip #conv .neg { color: var(--red); }
+  .strip .offline { color: var(--red); }
+  .strip .stale { color: var(--yellow); }
+  .body { overflow-y: auto; padding: 10px 12px 8px;
+    scrollbar-width: thin; scrollbar-color: #2a3242 transparent; }
+  .body::-webkit-scrollbar { width: 6px; }
+  .body::-webkit-scrollbar-thumb { background: #1f2735; border-radius: 3px; }
+  details { margin-bottom: 8px; }
+  details summary { cursor: pointer; outline: none;
+    font-size: 10.5px; letter-spacing: 0.6px; color: var(--text-dim);
+    text-transform: uppercase; padding: 2px 0;
+    list-style: none; user-select: none; }
+  details summary::-webkit-details-marker { display: none; }
+  details summary::before { content: '\25B8 '; color: var(--text-faint);
+    display: inline-block; transition: transform 0.15s; }
+  details[open] summary::before { transform: rotate(90deg); }
+  /* —— WHY NOW chips —— */
+  .whynow { display: flex; flex-direction: column; gap: 5px; margin-bottom: 8px; }
+  .chip {
+    display: grid; grid-template-columns: auto 1fr; gap: 8px;
+    align-items: center;
+    padding: 6px 9px 6px 8px;
+    border-radius: 6px;
+    font-size: 11px; line-height: 1.35;
+    cursor: pointer;
+    transition: transform 0.08s ease, box-shadow 0.12s ease;
+  }
+  .chip:hover { transform: translateX(2px); box-shadow: 0 2px 12px rgba(0,0,0,0.4); }
+  .chip .sev {
+    width: 32px; text-align: center; font-size: 9px; font-weight: 700;
+    letter-spacing: 0.6px; padding: 1px 0; border-radius: 3px;
+    font-family: 'JetBrains Mono', 'Consolas', monospace;
+  }
+  .chip .body-txt { color: var(--text); }
+  .chip .kind { display: block; font-size: 9.5px; letter-spacing: 0.6px;
+    color: var(--text-faint); font-family: 'JetBrains Mono', monospace; }
+  .chip .headline { display: block; color: var(--text); }
+  .chip .details {
+    display: none; margin-top: 4px; padding-top: 4px;
+    border-top: 1px solid rgba(255,255,255,0.05);
+    color: var(--text-dim); font-size: 10.5px;
+  }
+  .chip.open .details { display: block; }
+  .chip.HIGH {
+    background: linear-gradient(180deg, rgba(54,214,255,0.10), rgba(54,214,255,0.02));
+    border: 1px solid rgba(54,214,255,0.32);
+  }
+  .chip.HIGH .sev { background: rgba(54,214,255,0.20); color: var(--cyan); }
+  .chip.MED {
+    background: linear-gradient(180deg, rgba(255,155,60,0.08), rgba(255,155,60,0.02));
+    border: 1px solid rgba(255,155,60,0.28);
+  }
+  .chip.MED .sev { background: rgba(255,155,60,0.18); color: var(--orange); }
+  .chip.LOW {
+    background: rgba(255,255,255,0.025);
+    border: 1px solid var(--line-2);
+  }
+  .chip.LOW .sev { background: rgba(255,255,255,0.05); color: var(--text-dim); }
+  .edge-card {
+    padding: 8px 10px;
+    background: linear-gradient(180deg, rgba(54,214,255,0.05), rgba(54,214,255,0.01));
+    border: 1px solid rgba(54,214,255,0.18); border-radius: 6px;
+    font-size: 11.5px; margin-top: 4px;
+  }
+  .edge-grid { display: grid; grid-template-columns: 1fr 1fr;
+    gap: 3px 12px; font-family: 'JetBrains Mono', 'Consolas', monospace;
+    font-size: 10.5px; }
+  .edge-grid .k { color: var(--text-faint); }
+  .edge-grid .v { color: var(--text); font-variant-numeric: tabular-nums;
+    text-align: right; }
+  .edge-card .reasons { margin-top: 6px; padding-top: 5px;
+    border-top: 1px solid rgba(255,255,255,0.04);
+    color: var(--text-dim); font-size: 10.5px; line-height: 1.45; }
+  .edge-card .reasons li { margin-left: 14px; }
+  .playbook {
+    padding: 8px 10px; background: var(--bg-1);
+    border: 1px solid var(--line-2); border-radius: 6px;
+    font-size: 11.5px; margin-top: 4px;
+  }
+  .playbook .state { color: var(--cyan); font-weight: 600;
+    font-family: 'JetBrains Mono', 'Consolas', monospace; font-size: 11px; }
+  .playbook .branch { padding: 4px 0;
+    border-top: 1px dashed rgba(255,255,255,0.04); }
+  .playbook .branch:first-of-type { border-top: 0; }
+  .playbook .branch .nm { color: var(--text); font-weight: 600; font-size: 11px;}
+  .playbook .branch .iff { color: var(--text-dim); font-size: 10.5px; }
+  .playbook .branch .ths { color: var(--cyan); font-size: 10.5px; }
+  /* —— transcript —— */
+  .transcript { margin-top: 6px; }
+  .turn { padding: 6px 0; border-top: 1px solid var(--line); }
+  .turn:first-child { border-top: 0; }
+  .turn .who { font-size: 10px; letter-spacing: 0.8px; text-transform: uppercase;
+    margin-bottom: 2px; }
+  .turn .who.you { color: var(--text-faint); }
+  .turn .who.you b { color: var(--text-dim); }
+  .turn .who.pax { color: var(--text-faint); }
+  .turn .who.pax b { color: var(--cyan); }
+  .turn .msg { color: var(--text); font-size: 12.5px; line-height: 1.45;
+    white-space: pre-wrap; -webkit-user-select: text; user-select: text; }
+  .turn.pax .msg em { color: var(--text-dim); font-style: normal; }
+  .turn.pax.streaming .msg::after { content: '\258F';
+    color: var(--cyan); opacity: 0.7; margin-left: 2px;
+    animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .turn .meta { font-size: 9.5px; color: var(--text-faint);
+    font-family: 'JetBrains Mono', 'Consolas', monospace; margin-top: 3px; }
+  .turn.error .msg { color: var(--red); font-size: 11px; }
+  /* —— input —— */
+  .input {
+    display: grid; grid-template-columns: 1fr auto auto;
+    align-items: center; gap: 6px;
+    padding: 6px 8px 8px;
+    border-top: 1px solid var(--line); background: var(--bg-1);
+  }
+  .input textarea {
+    background: var(--bg-2); color: var(--text);
+    border: 1px solid var(--line-2); border-radius: 8px;
+    padding: 7px 10px; font: inherit; font-size: 13px;
+    resize: none; height: 30px; line-height: 1.3;
+    outline: none; transition: border-color .12s ease;
+    -webkit-user-select: text; user-select: text;
+  }
+  .input textarea::placeholder { color: var(--text-faint); }
+  .input textarea:focus { border-color: rgba(54,214,255,0.45); }
+  .input textarea:disabled { color: var(--text-faint); cursor: not-allowed; }
+  .icon-btn {
+    width: 30px; height: 30px; background: var(--bg-2);
+    border: 1px solid var(--line-2); border-radius: 8px;
+    display:flex; align-items:center; justify-content:center;
+    color: var(--text-dim); cursor: pointer;
+    transition: all .12s ease;
+  }
+  .icon-btn:hover { color: var(--cyan); border-color: rgba(54,214,255,0.4); }
+  .icon-btn:disabled, .icon-btn.disabled { cursor: not-allowed; opacity: 0.4; }
+  .icon-btn.send { color: var(--cyan); border-color: rgba(54,214,255,0.3);
+    background: linear-gradient(180deg, rgba(54,214,255,0.10), rgba(54,214,255,0.04)); }
+  .icon-btn.send:hover { background: rgba(54,214,255,0.18); }
+  .icon-btn.mic.listening { color: var(--red); border-color: rgba(255,90,106,0.4);
+    background: rgba(255,90,106,0.10);
+    animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { background: rgba(255,90,106,0.25); } }
+  svg { width: 14px; height: 14px; }
+  .voice-warn { font-size: 10px; color: var(--text-faint);
+    padding: 4px 12px; border-bottom: 1px solid var(--line); }
+</style></head>
+<body>
+  <div class="root">
+    <div class="titlebar">
+      <div class="brand"><b>PAX</b> AI</div>
+      <div class="ctrls">
+        <div class="dot" title="minimize"></div>
+        <div class="dot x" title="close" onclick="closePaxAi()"></div>
+      </div>
+    </div>
+
+    <div class="strip">
+      <div><span id="sym">--</span> <span id="mid">-</span></div>
+      <div id="nearest">--</div>
+      <div id="conv">--</div>
+    </div>
+
+    <div class="body" id="body">
+      <div id="whynow-area"></div>
+      <details open><summary>EDGE CALCULUS</summary>
+        <div class="edge-card" id="edge"><div id="edge-content">loading...</div></div>
+      </details>
+      <details><summary>PLAYBOOK</summary>
+        <div class="playbook" id="playbook"><div id="playbook-content">loading...</div></div>
+      </details>
+      <div class="transcript" id="transcript"></div>
+    </div>
+
+    <div class="input">
+      <textarea id="chat-input" placeholder="ask about flow, levels, or tap the mic..." rows="1"></textarea>
+      <button class="icon-btn mic" id="mic-btn" title="voice (Web Speech API)"
+              onclick="toggleMic()">
+        <svg viewBox="0 0 16 16" fill="currentColor">
+          <path d="M8 1.5a2 2 0 0 0-2 2v5a2 2 0 1 0 4 0v-5a2 2 0 0 0-2-2zM4 7.5a.5.5 0 0 0-1 0 5 5 0 0 0 4.5 4.975V14H6a.5.5 0 0 0 0 1h4a.5.5 0 0 0 0-1H8.5v-1.525A5 5 0 0 0 13 7.5a.5.5 0 0 0-1 0 4 4 0 1 1-8 0z"/>
+        </svg>
+      </button>
+      <button class="icon-btn send" id="send-btn" title="send (Enter)"
+              onclick="sendChat()">
+        <svg viewBox="0 0 16 16" fill="currentColor">
+          <path d="M1.5 1.5l13 6.5-13 6.5 2.5-6.5-2.5-6.5z"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+
+<script>
+// ---------- ui helpers ----------
+function closePaxAi() {
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.close) {
+    window.pywebview.api.close();
+  }
+}
+function fmtP(p) {
+  if (p == null) return '--';
+  return (p >= 0 ? '+' : '') + Number(p).toFixed(2) + 'p';
+}
+function decisionGlyph(d) {
+  if (!d) return '';
+  if (d.includes('FOLLOW') && d.includes('LONG'))  return ' FOLLOW ▲';
+  if (d.includes('FOLLOW') && d.includes('SHORT')) return ' FOLLOW ▼';
+  if (d.includes('FADE')   && d.includes('LONG'))  return ' FADE ▲';
+  if (d.includes('FADE')   && d.includes('SHORT')) return ' FADE ▼';
+  return '';
+}
+function nowHHMMSS() {
+  const d = new Date();
+  return d.toTimeString().slice(0,8);
+}
+
+// ---------- strip + edge + playbook polling ----------
+async function pollContext() {
+  try {
+    const r = await fetch('/api/pax/context', {cache:'no-store'});
+    const s = await r.json();
+    const symEl  = document.getElementById('sym');
+    const midEl  = document.getElementById('mid');
+    const nEl    = document.getElementById('nearest');
+    const cEl    = document.getElementById('conv');
+    if (s.health !== 'ok') {
+      symEl.textContent = 'BRIDGE';
+      midEl.innerHTML = '<span class="offline">OFFLINE</span>';
+      nEl.textContent = s.bridgeError || '';
+      cEl.textContent = '';
+      return null;
+    }
+    const alias = (s.alias || '').split('.')[0] || '--';
+    symEl.textContent = alias;
+    let midHtml = s.mid != null ? Number(s.mid).toFixed(2) : '-';
+    if (s.stale) midHtml += ' <span class="stale">STALE</span>';
+    midEl.innerHTML = midHtml;
+    if (s.nearest) {
+      nEl.innerHTML = fmtP(s.nearest.distance) + ' to <b>' + s.nearest.label +
+        '</b><span style="color:var(--text-faint)">' +
+        decisionGlyph(s.nearest.decision || '') + '</span>';
+    } else { nEl.textContent = '--'; }
+    const cs = s.conviction && s.conviction.score;
+    const anchor = (s.session && s.session.anchorMode) ||
+                    (s.conviction && s.conviction.anchorMode) || '--';
+    if (cs == null) {
+      cEl.innerHTML = anchor;
+    } else {
+      const cls = cs >= 0 ? 'pos' : 'neg';
+      const sign = cs >= 0 ? '+' : '';
+      cEl.innerHTML = 'conv <span class="' + cls + '">' + sign + cs.toFixed(2)
+        + '</span> &middot; ' + anchor;
+    }
+    return s.nearest ? s.nearest.label : null;
+  } catch (e) {
+    document.getElementById('sym').textContent = 'PAX-AI';
+    document.getElementById('mid').innerHTML = '<span class="offline">PROXY ERR</span>';
+    return null;
+  }
+}
+
+async function pollLevel(label) {
+  const target = document.getElementById('edge-content');
+  if (!label) { target.textContent = 'no active level in proximity'; return; }
+  try {
+    const r = await fetch('/api/pax/level/' + encodeURIComponent(label), {cache:'no-store'});
+    if (!r.ok) { target.textContent = 'level ' + label + ' not found'; return; }
+    const j = await r.json();
+    const e = j.edge_calculus || {};
+    const row = (k, v) => '<div class="k">' + k + '</div><div class="v">' +
+      (v == null ? '-' : v) + '</div>';
+    target.innerHTML = '<div class="edge-grid">'
+      + row('label',         j.label)
+      + row('decision',      j.decision || '-')
+      + row('confidence',    j.confidence != null ? j.confidence.toFixed(2) : '-')
+      + row('size_tier',     e.size_tier)
+      + row('expected_R',    e.expected_R != null ? e.expected_R.toFixed(2) : '-')
+      + row('prob_payline',  e.prob_pay_for_trade != null ? e.prob_pay_for_trade.toFixed(2) : '-')
+      + row('prob_next',     e.prob_reach_next_rung != null ? e.prob_reach_next_rung.toFixed(2) : '-')
+      + row('max_heat',      e.max_heat_pts != null ? e.max_heat_pts.toFixed(1) + 'p' : '-')
+      + row('entry',         e.scratch_price != null ? e.scratch_price.toFixed(2) : '-')
+      + row('payline',       e.payline_price != null ? e.payline_price.toFixed(2) : '-')
+      + row('rung1',         e.rung1_price != null ? e.rung1_price.toFixed(2) : '-')
+      + row('stop',          e.invalidation_price != null ? e.invalidation_price.toFixed(2) : '-')
+      + '</div>'
+      + (e.reasons && e.reasons.length
+          ? '<div class="reasons"><ul>' + e.reasons.map(x => '<li>'+x+'</li>').join('') + '</ul></div>'
+          : '');
+  } catch (e) { target.textContent = 'edge fetch error: ' + e; }
+}
+
+async function pollPlaybook() {
+  const target = document.getElementById('playbook-content');
+  try {
+    const r = await fetch('/api/pax/playbook', {cache:'no-store'});
+    if (!r.ok) { target.textContent = '-'; return; }
+    const j = await r.json();
+    const head = '<div><span class="state">' + (j.current_state || '-') +
+      '</span>' + (j.active_level ? ' at <b>' + j.active_level + '</b>' : '') + '</div>';
+    const branches = (j.branches || []).map(b =>
+      '<div class="branch">' +
+        '<div class="nm">' + b.name + '</div>' +
+        '<div class="iff">if: ' + b.if + '</div>' +
+        '<div class="ths">then: ' + b.then + '</div>' +
+      '</div>').join('');
+    target.innerHTML = head +
+      (branches || '<div style="color:var(--text-faint); padding-top:4px">no branches active</div>');
+  } catch (e) { target.textContent = 'playbook fetch error: ' + e; }
+}
+
+async function pollWhyNow() {
+  const target = document.getElementById('whynow-area');
+  try {
+    const r = await fetch('/api/pax/whynow', {cache:'no-store'});
+    if (!r.ok) { target.innerHTML = ''; return; }
+    const j = await r.json();
+    const triggers = j.triggers || [];
+    if (!triggers.length) { target.innerHTML = ''; return; }
+    const html = ['<div class="whynow">'];
+    for (const t of triggers) {
+      const sev = (t.severity || 'LOW').toUpperCase();
+      html.push(
+        '<div class="chip ' + sev + '" onclick="this.classList.toggle(\'open\')">' +
+          '<div class="sev">' + sev + '</div>' +
+          '<div class="body-txt">' +
+            '<span class="kind">' + (t.kind || '') + (t.label ? ' &middot; ' + t.label : '') + '</span>' +
+            '<span class="headline">' + (t.headline || '') + '</span>' +
+            (t.details ? '<div class="details">' + t.details + '</div>' : '') +
+          '</div>' +
+        '</div>'
+      );
+    }
+    html.push('</div>');
+    target.innerHTML = html.join('');
+  } catch (e) { /* keep prior render on transient errors */ }
+}
+
+async function tick() {
+  const label = await pollContext();
+  await Promise.all([pollLevel(label), pollPlaybook(), pollWhyNow()]);
+}
+tick();
+setInterval(tick, 1000);
+
+// ---------- chat ----------
+let _streamingPaxBubble = null;   // currently-streaming Pax turn DOM
+let _chatInFlight = false;
+
+function appendTurn(kind, who, text, isStreaming) {
+  const t = document.getElementById('transcript');
+  const div = document.createElement('div');
+  div.className = 'turn ' + kind + (isStreaming ? ' streaming' : '');
+  const whoEl = document.createElement('div');
+  whoEl.className = 'who ' + (kind === 'pax' ? 'pax' : 'you');
+  whoEl.innerHTML = '<b>' + who + '</b> &middot; ' + nowHHMMSS();
+  div.appendChild(whoEl);
+  const msgEl = document.createElement('div');
+  msgEl.className = 'msg';
+  msgEl.textContent = text || '';
+  div.appendChild(msgEl);
+  t.appendChild(div);
+  div.scrollIntoView({block: 'end', behavior: 'smooth'});
+  return div;
+}
+
+function appendMeta(parent, metaText) {
+  const m = document.createElement('div');
+  m.className = 'meta';
+  m.textContent = metaText;
+  parent.appendChild(m);
+}
+
+async function sendChat() {
+  if (_chatInFlight) return;
+  const ta = document.getElementById('chat-input');
+  const msg = (ta.value || '').trim();
+  if (!msg) return;
+  ta.value = '';                          // clear-on-send per spec
+  appendTurn('you', 'YOU', msg, false);
+  _chatInFlight = true;
+  document.getElementById('send-btn').classList.add('disabled');
+  _streamingPaxBubble = appendTurn('pax', 'PAX', '', true);
+  const msgEl = _streamingPaxBubble.querySelector('.msg');
+
+  try {
+    const r = await fetch('/api/pax/chat/stream', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message: msg}),
+    });
+    if (!r.ok || !r.body) {
+      msgEl.textContent = 'request failed: ' + r.status;
+      _streamingPaxBubble.classList.remove('streaming');
+      _streamingPaxBubble.classList.add('error');
+      _chatInFlight = false;
+      document.getElementById('send-btn').classList.remove('disabled');
+      return;
+    }
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buf = '';
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, {stream: true});
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const raw = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        handleSseEvent(raw, msgEl);
+      }
+    }
+  } catch (e) {
+    msgEl.textContent += '\n[stream error: ' + e + ']';
+    _streamingPaxBubble.classList.add('error');
+  } finally {
+    if (_streamingPaxBubble) {
+      _streamingPaxBubble.classList.remove('streaming');
+    }
+    _chatInFlight = false;
+    document.getElementById('send-btn').classList.remove('disabled');
+    _streamingPaxBubble = null;
+  }
+}
+
+function handleSseEvent(raw, msgEl) {
+  // parse "event: name\ndata: {...}"
+  let event = 'message', data = '';
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('data:')) data += line.slice(5).trim();
+  }
+  let obj = {};
+  try { obj = JSON.parse(data); } catch (e) { return; }
+  if (event === 'token') {
+    msgEl.textContent += obj.text || '';
+    msgEl.parentElement.scrollIntoView({block: 'end', behavior: 'instant'});
+  } else if (event === 'start') {
+    appendMeta(_streamingPaxBubble,
+      'model=' + obj.model + ' router=' + obj.router_primary
+      + (obj.snapshot_stale ? ' STALE' : ''));
+  } else if (event === 'done') {
+    const note = 'exit=' + obj.exit_code + ' tok=' + obj.tokens_emitted
+      + ' ' + obj.elapsed_ms + 'ms'
+      + (obj.aborted ? ' aborted' : '');
+    appendMeta(_streamingPaxBubble, note);
+    if (obj.error) {
+      msgEl.textContent += '\n[' + obj.error + ']';
+      _streamingPaxBubble.classList.add('error');
+    }
+  } else if (event === 'error') {
+    msgEl.textContent += '\n[error: ' + (obj.error || data) + ']';
+    _streamingPaxBubble.classList.add('error');
+  }
+}
+
+document.getElementById('chat-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault(); sendChat();
+  }
+});
+
+// ---------- voice (Web Speech API) ----------
+const _SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let _recognition = null;
+let _listening = false;
+
+// Client-side normalizer (defense-in-depth; server is authoritative).
+const _voiceRules = [
+  [/\bin\s+queue\b/gi,     'NQ'],
+  [/\bmicro\s+queue\b/gi,  'MNQ'],
+  [/\bv\s*whap\b/gi,       'VWAP'],
+  [/\bor\s+low\b/gi,       'OR-Low'],
+  [/\bor\s+high\b/gi,      'OR-High'],
+  [/\bopening\s+range\b/gi,'Opening Range'],
+  [/\bplus\s+one\b/gi,     '+1'],
+  [/\bplus\s+two\b/gi,     '+2'],
+  [/\bplus\s+three\b/gi,   '+3'],
+  [/\bminus\s+one\b/gi,    '-1'],
+  [/\bminus\s+two\b/gi,    '-2'],
+  [/\bminus\s+three\b/gi,  '-3'],
+  [/\bbuying\s+pressure\b/gi,  'bid-side pressure'],
+  [/\bselling\s+pressure\b/gi, 'ask-side pressure'],
+  [/\bstop\s+sweep\b/gi,       'STOP_SWEEP'],
+  [/\bice\s*berg\b/gi,         'ICEBERG'],
+  [/\bfollow\s+long\b/gi,      'FOLLOW long'],
+  [/\bfollow\s+short\b/gi,     'FOLLOW short'],
+  [/\bfade\s+long\b/gi,        'FADE long'],
+  [/\bfade\s+short\b/gi,       'FADE short'],
+];
+function normalizeVoice(s) {
+  let out = (s || '').trim();
+  for (const [re, repl] of _voiceRules) out = out.replace(re, repl);
+  return out;
+}
+
+function micBtn() { return document.getElementById('mic-btn'); }
+function setListeningUI(on) {
+  _listening = on;
+  micBtn().classList.toggle('listening', on);
+  micBtn().title = on ? 'listening... (tap to stop)' : 'voice (Web Speech API)';
+}
+
+function toggleMic() {
+  if (!_SR) {
+    appendTurn('error', 'PAX', '[voice] SpeechRecognition not available in this WebView', false);
+    return;
+  }
+  if (_listening) {
+    try { _recognition && _recognition.stop(); } catch (e) {}
+    setListeningUI(false);
+    return;
+  }
+  _recognition = new _SR();
+  _recognition.lang = 'en-US';
+  _recognition.interimResults = true;
+  _recognition.continuous = false;
+  _recognition.maxAlternatives = 1;
+  let finalText = '';
+  _recognition.onresult = (ev) => {
+    let interim = '';
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const tr = ev.results[i][0].transcript;
+      if (ev.results[i].isFinal) finalText += tr;
+      else interim += tr;
+    }
+    const live = normalizeVoice(finalText + interim);
+    document.getElementById('chat-input').value = live;
+  };
+  _recognition.onerror = (ev) => {
+    appendTurn('error', 'PAX', '[voice] error: ' + ev.error, false);
+    setListeningUI(false);
+  };
+  _recognition.onend = () => {
+    setListeningUI(false);
+    const final = normalizeVoice(finalText);
+    document.getElementById('chat-input').value = final;
+    // Do NOT auto-send -- user reviews then presses Enter or Send.
+  };
+  try {
+    _recognition.start();
+    setListeningUI(true);
+  } catch (e) {
+    appendTurn('error', 'PAX', '[voice] start failed: ' + e, false);
+    setListeningUI(false);
+  }
+}
+</script>
+</body></html>
