@@ -97,6 +97,21 @@ public class PaxOpeningRangeModule implements
      * CSV becomes visible within the window. */
     private static final long FALLBACK_TTL_MS = 30_000L;
 
+    /** Triangle font sizes for the strong/weak rendering paths. The trend
+     *  triangle is painted as a font glyph (▲/▼) via the same labelImage
+     *  primitive that paints the OR HIGH/LOW labels — Bookmap 7.4's chart
+     *  canvas renders these reliably, where the legacy 18×18 BufferedImage
+     *  Polygon could fail to display. Strong = full alpha + big glyph;
+     *  Weak = lower alpha + smaller glyph. */
+    static final int TRIANGLE_FONT_STRONG = 26;
+    static final int TRIANGLE_FONT_WEAK   = 20;
+    /** Throttle for triangle diagnostic Log lines so the loop doesn't spam
+     *  Bookmap's log every poll. One emit + one skip-reason per minute is
+     *  enough to audit live behavior. */
+    private static final long TRIANGLE_LOG_THROTTLE_MS = 60_000L;
+    private static volatile long lastTriangleEmitLogMs = 0L;
+    private static volatile long lastTriangleSkipLogMs = 0L;
+
     /**
      * Fine-grained repaint dispatch.
      *
@@ -1214,6 +1229,7 @@ public class PaxOpeningRangeModule implements
             // full gate (eligible / fresh / renderable / valid mid / valid
             // tick / dedup tuple). Centralising the rule there means we
             // don't duplicate stale/eligibility checks at the call site.
+            boolean emitted = false;
             if (PaxTrendTriangleDedup.shouldEmit(signal, nowMs, TREND_STALE_AGE_MS,
                     state.lastEmittedKind, state.lastEmittedBucketEnteredMs,
                     state.pips)) {
@@ -1225,18 +1241,77 @@ public class PaxOpeningRangeModule implements
                 }
                 state.lastEmittedKind = signal.kind.name();
                 state.lastEmittedBucketEnteredMs = signal.bucketEnteredMs;
+                emitted = true;
             }
             // Redraw every live triangle. update() called clear() at top,
             // so each refresh re-adds the deque contents.
             for (TrendTriangleEvent evt : state.liveTriangles) {
                 drawTrendTriangle(state, evt);
             }
+            logTriangleDiagnostics(state, signal, nowMs, emitted);
+        }
+
+        /** Throttled audit lines so the operator can see in Bookmap's log
+         *  whether the triangle pipeline is emitting, why it is skipping,
+         *  and how many shapes are currently on the canvas. One emit + one
+         *  skip-reason per minute is enough; spamming every poll would
+         *  drown the bridge logs. */
+        private void logTriangleDiagnostics(InstrumentState state,
+                                            PaxTrendSignalModel signal,
+                                            long nowMs,
+                                            boolean emitted) {
+            int liveCount;
+            synchronized (state.liveTriangles) {
+                liveCount = state.liveTriangles.size();
+            }
+            if (emitted) {
+                if (nowMs - lastTriangleEmitLogMs >= TRIANGLE_LOG_THROTTLE_MS) {
+                    lastTriangleEmitLogMs = nowMs;
+                    try {
+                        Log.info("OpenRange trend triangle emitted"
+                                + " kind="   + (signal != null ? signal.kind : "null")
+                                + " bucket=" + (signal != null ? signal.bucketEnteredMs : 0L)
+                                + " mid="    + (signal != null ? signal.mid : Double.NaN)
+                                + " eventMs=" + (signal != null ? signal.eventMs : 0L)
+                                + " liveCount=" + liveCount);
+                    } catch (Throwable ignored) { /* Log unavailable in tests */ }
+                }
+                return;
+            }
+            if (nowMs - lastTriangleSkipLogMs < TRIANGLE_LOG_THROTTLE_MS) return;
+            // Classify the skip reason so the operator can audit live state.
+            String reason;
+            if (signal == null)                                            reason = "no_snapshot_yet";
+            else if (!signal.eligible)                                     reason = "dashboard_ineligible:" + safeString(signal.blockedReason);
+            else if (signal.isStale(nowMs, TREND_STALE_AGE_MS))            reason = "stale_age_ms=" + (nowMs - signal.fetchedAtMs);
+            else if (!signal.kind.isRenderable())                          reason = "non_renderable_kind:" + signal.kind;
+            else if (signal.eventMs <= 0L)                                 reason = "invalid_event_ms";
+            else if (!Double.isFinite(signal.mid) || signal.mid <= 0.0)    reason = "invalid_mid:" + signal.mid;
+            else if (!Double.isFinite(state.pips) || state.pips <= 0.0)    reason = "invalid_tick_size:" + state.pips;
+            else                                                            reason = "duplicate_bucket";
+            lastTriangleSkipLogMs = nowMs;
+            try {
+                Log.info("OpenRange trend triangle skipped"
+                        + " reason=" + reason
+                        + " liveCount=" + liveCount);
+            } catch (Throwable ignored) { /* Log unavailable in tests */ }
+        }
+
+        private static String safeString(String s) {
+            return s == null || s.isEmpty() ? "?" : s;
         }
 
         private void drawTrendTriangle(InstrumentState state, TrendTriangleEvent evt) {
-            int w = PaxTrendTrianglePainter.pixelWidth(evt.kind);
-            int h = PaxTrendTrianglePainter.pixelHeight(evt.kind);
-            PreparedImage image = PaxTrendTrianglePainter.render(evt.kind);
+            // Render the triangle as a font glyph (▲ / ▼) via the proven
+            // labelImage primitive. Earlier builds used a small custom
+            // BufferedImage Polygon (PaxTrendTrianglePainter); on Bookmap 7.4
+            // that primitive could fail to display on the chart canvas while
+            // OR labels (font glyphs) and OR lines (solidPixel) rendered
+            // reliably. Reusing labelImage eliminates that fragility.
+            int fontSize = evt.kind.isStrong() ? TRIANGLE_FONT_STRONG : TRIANGLE_FONT_WEAK;
+            PreparedImage image = trendGlyphImage(evt.kind, fontSize);
+            int w = image.getReadOnlyImage().getWidth();
+            int h = image.getReadOnlyImage().getHeight();
             long xNanos = PaxChartTimeCoords.epochMsToChartNanos(evt.eventMs);
             int offsetTicks = evt.kind.isStrong()
                     ? TRIANGLE_OFFSET_TICKS_STRONG
@@ -1245,15 +1320,15 @@ public class PaxOpeningRangeModule implements
             double anchorPrice;
             int yPxTop, yPxBottom;
             if (evt.kind.isBull()) {
-                // Bullish: triangle BELOW price (anchor offset down).
+                // Bullish: glyph BELOW price (anchor offset down by N ticks).
                 anchorPrice = (evt.mid - offsetTicks * tickSize) / tickSize;
-                // y-pixels: image extends downward from anchor.
+                // Image top edge at anchor; extends DOWN (screen +y) by h px.
                 yPxTop = 0;
                 yPxBottom = h;
             } else {
-                // Bearish: triangle ABOVE price (anchor offset up).
+                // Bearish: glyph ABOVE price (anchor offset up by N ticks).
                 anchorPrice = (evt.mid + offsetTicks * tickSize) / tickSize;
-                // y-pixels: image extends upward from anchor.
+                // Image bottom edge at anchor; extends UP (screen -y) by h px.
                 yPxTop = -h;
                 yPxBottom = 0;
             }
@@ -1477,6 +1552,59 @@ public class PaxOpeningRangeModule implements
     private static PreparedImage solidPixel(Color color) {
         BufferedImage image = new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB);
         image.setRGB(0, 0, color.getRGB());
+        return new PreparedImage(image);
+    }
+
+    /**
+     * Build a {@link PreparedImage} containing the ▲ / ▼ trend-triangle glyph
+     * at the given font size, in the bull/bear color, with weak/strong alpha.
+     *
+     * <p>Uses {@link Graphics2D#drawString} on a transparent ARGB scratch
+     * image — identical primitive class to {@code labelImage} which paints
+     * the OR HIGH/LOW labels reliably on Bookmap 7.4. Strong = full alpha,
+     * heavier outline; weak = ~70% alpha, lighter outline. NONE / null →
+     * 1×1 transparent placeholder.
+     */
+    static PreparedImage trendGlyphImage(PaxTrendSignalModel.Kind kind, int fontSize) {
+        if (kind == null || kind == PaxTrendSignalModel.Kind.NONE) {
+            BufferedImage placeholder = new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB);
+            return new PreparedImage(placeholder);
+        }
+        String glyph = kind.isBull() ? "▲" : "▼";   // ▲ / ▼
+        Color base = kind.isBull() ? PaxHeatwaveColors.BULL : PaxHeatwaveColors.BEAR;
+        int alpha = kind.isStrong() ? 255 : 178;
+        Color fill = new Color(base.getRed(), base.getGreen(), base.getBlue(), alpha);
+        int safeSize = Math.max(10, Math.min(64, fontSize));
+        Font font = new Font(Font.SANS_SERIF, Font.BOLD, safeSize);
+
+        BufferedImage scratch = new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D scratchGraphics = scratch.createGraphics();
+        scratchGraphics.setFont(font);
+        FontMetrics metrics = scratchGraphics.getFontMetrics();
+        int width  = Math.max(1, metrics.stringWidth(glyph) + 4);
+        int height = Math.max(1, metrics.getHeight() + 2);
+        scratchGraphics.dispose();
+
+        BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D graphics = image.createGraphics();
+        graphics.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING,
+                RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+        graphics.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
+                RenderingHints.VALUE_ANTIALIAS_ON);
+        graphics.setFont(font);
+        // Dark outline pass so the glyph stays visible on any chart background.
+        Color outline = new Color(8, 11, 15, kind.isStrong() ? 235 : 178);
+        graphics.setColor(outline);
+        int baselineY = metrics.getAscent() + 1;
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                if (dx == 0 && dy == 0) continue;
+                graphics.drawString(glyph, 2 + dx, baselineY + dy);
+            }
+        }
+        graphics.setColor(fill);
+        graphics.drawString(glyph, 2, baselineY);
+        graphics.dispose();
         return new PreparedImage(image);
     }
 
