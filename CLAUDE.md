@@ -494,3 +494,136 @@ classifier; net -34 lines, no functionality change.
   unless you specifically want to exercise the EOD auto-flatten path.
   At arbitrary wall-clock times (15:01 CT through midnight), the default
   EOD logic will cancel working orders before the test can fill them.
+
+## Pax AI production invariants (locked 2026-05-20)
+
+Pax AI shipped production-ready on 2026-05-20 after a multi-round audit
+and human visual verification of the floating pywebview window. The
+invariants below are permanent contracts — future sessions must respect
+them.
+
+### Pax AI status
+
+- Pax AI is production-ready.
+- Launch path: `pax-ai-start.bat` defaults to the floating `--shell`
+  pywebview window. Server-only mode is `pax-ai-start.bat server`
+  (optionally followed by a port).
+- The `PaxAILauncher` Bookmap addon (`indicators/PaxAILauncher/`) also
+  spawns Pax AI with `--shell` when the addon is enabled in Bookmap's
+  Add-ons panel.
+- `/api/pax/health` returns 200 whenever the Pax AI HTTP server is up,
+  independent of dashboard reachability — the launcher uses this as
+  its health probe so a dashboard-down state does NOT flag Pax AI as
+  failed.
+
+### OR anchor invariant (Pax AI)
+
+The operator-configured Static OR in the OpenRange UI is the **only**
+active OR anchor source for Pax AI reasoning. The Pax-AI skill bodies
+and chat must NEVER imply RTH/08:30 is the active OR unless the live
+snapshot/operator config says so.
+
+Authoritative snapshot fields:
+
+- `snap.session.anchorHHMM`
+- `snap.session.anchorTimezone`
+- `snap.session.anchorRangeSeconds`
+- `snap.session.anchorMode`
+- `snap.or_session_config`
+- `snap.or_levels.orHigh` / `snap.or_levels.orLow`
+
+RTH/08:30 language is allowed ONLY in explicitly-historical / fallback
+context (e.g. `skills/pax-or/SKILL.md` §1.2 default-exchange table or
+upstream snapshot-field descriptions like `vwap_bias.components.rth_eth`
+and `volume_profile` RTH-session-bounded POC). The active definition in
+§1 of the Pax OR skill must say the OR is the operator-configured
+Static OR window.
+
+When `snap.session.anchorMode != "LIVE"` (LAST_KNOWN_STALE / FALLBACK)
+Pax AI output is **informational only** — no FOLLOW/FADE recommendations,
+no new entries. The base preamble in `pax-ai/pax_ai/prompts.py::_BASE_PREAMBLE`
+and the Pax-OR skill both spell this gate out; do not weaken either.
+
+Tests `pax-ai/tests/test_prompts.py::test_render_system_prompt_no_stale_active_anchor_claims`
+and `..._defines_or_as_operator_configured_static_or` pin this contract.
+Re-introducing "When RTH opens", "Regular Trading Hours" near the OR
+definition, or "For NQ that is 08:30" will fail those tests.
+
+### HFT skill invariant (Pax AI)
+
+`skills/hft_microstructure_quant_v1/SKILL.md` is **reference context only**
+inside Pax AI. It must NEVER force JSON output in Pax AI chat, even when
+the router picks `hft_microstructure_quant_v1` as the primary skill
+(which happens for keywords like "tape", "iceberg", "absorption").
+Pax AI chat responses are conversational prose over the snapshot digest.
+
+- The historical "If the USER MESSAGE began with ROUTER ... mode 1"
+  selector is gone and must stay gone.
+- The unconditional bigram "Output only JSON" must not appear.
+- The skill explicitly disclaims itself as Pax AI's output shape
+  ("never Pax AI"). The JSON schema is documented for external
+  standalone HFT-filter callers only.
+
+Verified live 2026-05-20 against `claude-haiku-4-5` with the prompt
+"tape and iceberg read?" — `router_primary == hft_microstructure_quant_v1`
+and the response was prose, not JSON. Tests
+`pax-ai/tests/test_prompts.py::test_render_system_prompt_no_router_mode_selector`,
+`..._no_unconditional_output_only_json`, and `..._pax_ai_json_exclusion_is_explicit`
+pin this contract.
+
+### Claude CLI invariant (Pax AI)
+
+Pax AI's Claude calls are **read-only**:
+
+- `--tools ""` — unconditional. No Bash, no Read, no Edit, no MCP
+  tool access from the chat path.
+- `--max-turns 1` — unconditional. Chat is a single response, not
+  an agentic loop.
+- `--output-format stream-json --verbose --include-partial-messages` —
+  required combination for line-by-line SSE streaming.
+- `--bare` — **conditional**, set ONLY when `ANTHROPIC_API_KEY` is
+  present in env (API-key mode) or `PAX_AI_CLAUDE_BARE=1` is set to
+  opt in. For OAuth subscription auth (typical individual user),
+  `--bare` is omitted because it skips OAuth/keychain reads and the
+  CLI returns "Not logged in". See `pax-ai/pax_ai/claude_stream.py::_use_bare()`.
+
+If you add new chat code paths or non-Pax-AI Claude calls, do NOT
+re-enable tools or remove `--max-turns 1` without an explicit audit
+finding.
+
+### Chat-handler test isolation invariant
+
+Pax AI chat handler tests (`pax-ai/tests/test_chat_handler.py`) must
+NOT touch the live chat journal at `D:\BookmapLogs\pax-chat.db`. The
+`_isolate_journal` autouse fixture in that file replaces
+`chat.journal.record` with a no-op spy and installs a tripwire on
+`journal._connect` so any accidental real-DB I/O is a loud failure.
+
+When you add a new chat-handler test, either reuse the existing
+fixture or add an equivalent monkeypatch. Live-mode smokes that
+intentionally exercise the real DB are OK provided they clean up
+via `POST /api/pax/chat/forget` at the end.
+
+### Addon jar hygiene (recurring operational item)
+
+Bookmap scans `C:\Bookmap\addons` recursively. The repo lives under
+that tree, so `indicators/*/build/libs/*.jar` outputs from standalone
+`indicators/*/build.ps1` runs are **load candidates that race the
+canonical install**.
+
+Canonical addon jars (the only ones that should be loaded):
+
+- `C:\Bookmap\addons\bookmap-mcp-bridge.jar`
+- `C:\Bookmap\addons\openrange-release.jar`
+- `C:\Bookmap\addons\paxai-launcher-release.jar`
+
+Operational rule: after any standalone `indicators/*/build.ps1` run,
+clear the duplicate `paxai-launcher-release.jar` /
+`openrange-release*.jar` from `indicators/PaxAILauncher/build/libs/`
+and `indicators/OpenRange/build/libs/` before any Bookmap restart.
+The bridge addon uses `build-and-deploy.ps1` which already handles
+this quarantine; the indicator builds do not.
+
+Background: the build.ps1 scripts output into `build/libs/` which sits
+under `C:\Bookmap\addons\**`. Until those scripts are changed to write
+outside the scan tree, this stays a manual hygiene step.
