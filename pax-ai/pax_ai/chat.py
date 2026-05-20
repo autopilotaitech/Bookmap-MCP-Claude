@@ -14,6 +14,7 @@ flag for whichever chat is currently in flight.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import threading
@@ -22,7 +23,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import claude_stream, poller, prompts, voice, config, journal
+from . import claude_stream, feature_bus, poller, prompts, voice, config, journal
 
 
 # Single global abort flag for the most-recent chat. Replaced on every
@@ -164,6 +165,12 @@ def build_user_message(user_text: str) -> Tuple[str, Dict[str, Any]]:
         "snapshot_stale":   stale,
         "snapshot_age_ms":  age_ms,
         "user_normalized":  user_norm,
+        # Feature-bus byte-exact replay: the post-done capture path must
+        # hash the SAME snapshot the digest was built from, not a fresh
+        # poll. Underscore-prefixed: never exposed in SSE payloads.
+        "_snapshot_for_capture":    snap,
+        "_snapshot_ts_ms_capture":  _as_of_ms,
+        "_snapshot_age_ms_capture": age_ms,
     }
     return full, meta
 
@@ -327,5 +334,52 @@ def handle_chat_stream(wfile, user_text: str, deep: bool = False) -> None:
             wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+        # ------------------------------------------------------------------
+        # Phase 1 feature-bus capture. Strictly post-`done`-flush. Any
+        # failure logs to stderr but never raises into the chat path.
+        # The captured snapshot MUST be the one build_user_message used
+        # (carried in meta["_snapshot_for_capture"]); polling again here
+        # would race against the 1 Hz poller and break replay byte-exactness.
+        # ------------------------------------------------------------------
+        try:
+            snap = meta.get("_snapshot_for_capture")
+            snap_ts_ms = int(meta.get("_snapshot_ts_ms_capture") or 0)
+            snap_age_ms = int(meta.get("_snapshot_age_ms_capture") or 0)
+            snapshot_json = feature_bus._canonical_snapshot_json(snap or {})
+            digest_sha = hashlib.sha256(full_msg.encode("utf-8")).hexdigest()
+            snap_sha   = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+            rec = feature_bus.AiTurnRecord(
+                schema_version=1,
+                ts_ms=int(time.time() * 1000),
+                chat_run_id=journal.current_run_id(),
+                deep=bool(deep),
+                model=model,
+                router_primary=meta.get("router_primary"),
+                router_secondary=meta.get("router_secondary"),
+                user_text_raw=user_text,
+                user_text_normalized=meta.get("user_normalized") or user_text,
+                digest_text=full_msg,
+                digest_sha256=digest_sha,
+                snapshot_json=snapshot_json,
+                snapshot_sha256=snap_sha,
+                snapshot_alias=(snap or {}).get("alias"),
+                snapshot_ts_ms=snap_ts_ms if snap_ts_ms > 0 else None,
+                snapshot_age_ms=snap_age_ms,
+                pax_text=pax_text,
+                exit_code=rc,
+                elapsed_ms=elapsed_ms,
+                api_duration_ms=final_info.get("duration_api_ms"),
+                total_cost_usd=final_info.get("total_cost_usd"),
+                input_tokens=final_info.get("input_tokens"),
+                output_tokens=final_info.get("output_tokens"),
+                cache_creation_tokens=final_info.get("cache_creation_input_tokens"),
+                cache_read_tokens=final_info.get("cache_read_input_tokens"),
+                aborted=bool(final_info.get("aborted", abort.is_set())),
+                error=final_info.get("error"),
+            )
+            feature_bus.record_ai_turn(rec)
+        except Exception as exc:
+            sys.stderr.write(f"[chat] feature_bus capture failed: {exc}\n")
     finally:
         _clear_abort_if_owned(abort)

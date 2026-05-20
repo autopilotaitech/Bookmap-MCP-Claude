@@ -248,3 +248,157 @@ def test_handle_chat_stream_deep_default_param_is_false():
     import inspect
     sig = inspect.signature(chat.handle_chat_stream)
     assert sig.parameters["deep"].default is False
+
+
+def test_chat_path_unchanged_when_bus_disabled(monkeypatch):
+    """Phase-1 invariant: SSE byte stream from handle_chat_stream is identical
+    whether feature_bus.enabled is False or True."""
+    from pax_ai import chat, feature_bus
+    from pax_ai import claude_stream as cs
+
+    captures = []
+    class _CaptureWfile:
+        def __init__(self): self.buf = bytearray()
+        def write(self, b):
+            self.buf.extend(b if isinstance(b, (bytes, bytearray)) else b.encode())
+        def flush(self): pass
+
+    def _fake_stream_chat(user_message, model, system_prompt_path,
+                          on_token, on_done, abort, timeout_sec):
+        on_token("hello")
+        on_done({"exit_code": 0, "elapsed_ms": 5, "tokens_emitted": 1,
+                 "aborted": False, "error": None,
+                 "total_cost_usd": 0.001, "input_tokens": 100,
+                 "output_tokens": 1, "cache_creation_input_tokens": 0,
+                 "cache_read_input_tokens": 0, "duration_api_ms": 5})
+        return 0
+    monkeypatch.setattr(cs, "stream_chat", _fake_stream_chat)
+    monkeypatch.setattr(chat.prompts, "write_frozen_prompt", lambda: Path("/tmp/sp.txt"))
+    monkeypatch.setattr(chat.prompts, "route", lambda t: {"primary": "pax-or",
+                                                            "secondary": [],
+                                                            "router_hint": ""})
+
+    # Run with bus disabled.
+    from pax_ai import config as cfg_mod
+    monkeypatch.setattr(cfg_mod, "_reload_if_stale", lambda: None)
+    monkeypatch.setattr(cfg_mod, "_CACHE", {**cfg_mod._CACHE,
+        "feature_bus": {"enabled": False, "db_path": "", "snapshot_blob_dir": "",
+            "digest_blob_dir": "", "queue_max": 2000, "writer_idle_ms": 100,
+            "retention_days": 30}})
+    w1 = _CaptureWfile()
+    chat.handle_chat_stream(w1, "test", deep=False)
+    captures.append(bytes(w1.buf))
+
+    # Run with bus enabled (any tmp dir; record_ai_turn must not corrupt the SSE).
+    import tempfile
+    td = tempfile.mkdtemp()
+    monkeypatch.setattr(cfg_mod, "_CACHE", {**cfg_mod._CACHE,
+        "feature_bus": {"enabled": True, "db_path": str(Path(td) / "bus.db"),
+            "snapshot_blob_dir": str(Path(td) / "snap"),
+            "digest_blob_dir": str(Path(td) / "dig"),
+            "queue_max": 2000, "writer_idle_ms": 100, "retention_days": 30}})
+    w2 = _CaptureWfile()
+    chat.handle_chat_stream(w2, "test", deep=False)
+    captures.append(bytes(w2.buf))
+
+    assert captures[0] == captures[1], \
+      f"SSE bytes diverge with bus enabled:\nDISABLED: {captures[0]!r}\nENABLED:  {captures[1]!r}"
+
+
+def test_chat_assembles_ai_turn_record_when_bus_enabled(monkeypatch, tmp_path):
+    """When the bus is enabled, an AiTurnRecord is built and record_ai_turn is called."""
+    from pax_ai import chat, feature_bus
+    from pax_ai import claude_stream as cs
+    from pax_ai import config as cfg_mod
+
+    monkeypatch.setattr(cfg_mod, "_reload_if_stale", lambda: None)
+    monkeypatch.setattr(cfg_mod, "_CACHE", {**cfg_mod._CACHE,
+        "feature_bus": {"enabled": True, "db_path": str(tmp_path / "b.db"),
+            "snapshot_blob_dir": str(tmp_path / "s"),
+            "digest_blob_dir": str(tmp_path / "d"),
+            "queue_max": 2000, "writer_idle_ms": 100, "retention_days": 30}})
+
+    captured = []
+    monkeypatch.setattr(feature_bus, "record_ai_turn", lambda rec: captured.append(rec))
+    monkeypatch.setattr(chat.prompts, "write_frozen_prompt", lambda: Path("/tmp/sp.txt"))
+    monkeypatch.setattr(chat.prompts, "route", lambda t: {"primary": "pax-or",
+                                                            "secondary": [],
+                                                            "router_hint": ""})
+    monkeypatch.setattr(cs, "stream_chat", lambda **kw: (kw["on_token"]("ok"),
+                                                          kw["on_done"]({"exit_code": 0}), 0)[2])
+
+    class _W:
+        def write(self, b): pass
+        def flush(self): pass
+    chat.handle_chat_stream(_W(), "hi", deep=False)
+    assert len(captured) == 1
+    rec = captured[0]
+    assert len(rec.digest_sha256) == 64
+    assert len(rec.snapshot_sha256) == 64
+    assert rec.user_text_raw == "hi"
+
+
+def test_aiturn_uses_snapshot_captured_at_prompt_build_not_post_done(monkeypatch, tmp_path):
+    """Regression: build_user_message reads poller.latest() at T0 to build the
+    digest; if the poller ticks between then and the post-done capture path,
+    chat.handle_chat_stream MUST still hash the T0 snapshot, not the newer one.
+    Otherwise digest_sha256 and snapshot_sha256 describe different states and
+    byte-exact replay is broken."""
+    import hashlib
+    from pax_ai import chat, feature_bus
+    from pax_ai import claude_stream as cs
+    from pax_ai import poller as _poller
+    from pax_ai import config as cfg_mod
+
+    snap_a = {"alias": "NQM6", "book": {"mid": 23450.5}}
+    snap_b = {"alias": "NQM6", "book": {"mid": 99999.0}}    # poller ticked
+    state = {"calls": 0}
+    def fake_latest():
+        state["calls"] += 1
+        # First call (inside build_user_message) -> snap_a.
+        # Every subsequent call -> snap_b. If chat re-polls in the post-done
+        # path, snapshot_sha256 will match canonical(snap_b) and this test
+        # catches the regression.
+        return (snap_a if state["calls"] == 1 else snap_b, 1000, 0, 0, None)
+    monkeypatch.setattr(_poller, "latest", fake_latest)
+
+    monkeypatch.setattr(cfg_mod, "_reload_if_stale", lambda: None)
+    monkeypatch.setattr(cfg_mod, "_CACHE", {**cfg_mod._CACHE,
+        "feature_bus": {"enabled": True, "db_path": str(tmp_path / "b.db"),
+            "snapshot_blob_dir": str(tmp_path / "s"),
+            "digest_blob_dir":   str(tmp_path / "d"),
+            "queue_max": 2000, "writer_idle_ms": 100, "capture_ms": 1000,
+            "retention_days": 30}})
+
+    # Force _accepting_events() True so record_ai_turn enqueues.
+    feature_bus._HEALTHY = True
+    feature_bus._RUNNING = True
+
+    captured = []
+    monkeypatch.setattr(feature_bus, "record_ai_turn",
+                          lambda rec: captured.append(rec))
+    monkeypatch.setattr(chat.prompts, "write_frozen_prompt", lambda: Path("/tmp/sp.txt"))
+    monkeypatch.setattr(chat.prompts, "route", lambda t: {"primary": "pax-or",
+                                                            "secondary": [],
+                                                            "router_hint": ""})
+    monkeypatch.setattr(cs, "stream_chat", lambda **kw: (kw["on_token"]("ok"),
+                                                          kw["on_done"]({"exit_code": 0}),
+                                                          0)[2])
+
+    class _W:
+        def write(self, b): pass
+        def flush(self): pass
+    chat.handle_chat_stream(_W(), "ping", deep=False)
+
+    assert len(captured) == 1
+    rec = captured[0]
+    expected_snapshot_json = feature_bus._canonical_snapshot_json(snap_a)
+    expected_sha = hashlib.sha256(expected_snapshot_json.encode("utf-8")).hexdigest()
+    forbidden_sha = hashlib.sha256(
+        feature_bus._canonical_snapshot_json(snap_b).encode("utf-8")).hexdigest()
+    assert rec.snapshot_json   == expected_snapshot_json, "captured the wrong snapshot"
+    assert rec.snapshot_sha256 == expected_sha
+    assert rec.snapshot_sha256 != forbidden_sha
+    # And the digest_sha256 must hash full_msg, which was built from snap_a.
+    # Indirectly verified: snap_b's mid (99999.0) must NOT appear in rec.digest_text.
+    assert "99999" not in rec.digest_text

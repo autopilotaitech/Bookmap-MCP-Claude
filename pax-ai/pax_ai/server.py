@@ -31,7 +31,7 @@ from urllib.parse import urlparse, unquote
 
 from . import DASHBOARD_URL, DEFAULT_PORT
 from . import poller, context as ctx_mod, edge_calculus, playbook, config
-from . import chat as chat_mod, claude_stream, triggers, journal
+from . import chat as chat_mod, claude_stream, triggers, journal, feature_bus
 
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -197,6 +197,7 @@ def _api_pax_health() -> Tuple[int, Dict[str, Any]]:
         "modelLive":            config.get("models.live"),
         "modelDeep":            config.get("models.deep"),
         "claudeAvailable":      claude_stream.claude_available(),
+        "feature_bus":          feature_bus.status(),
     }
 
 

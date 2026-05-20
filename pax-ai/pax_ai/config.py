@@ -69,6 +69,16 @@ DEFAULTS: Dict[str, Any] = {
         "FADE_SHORT.EXHAUSTION_UP.EXT_LEVEL":     1.6,
         "DEFAULT":                                 1.0,
     },
+    "feature_bus": {
+        "enabled":           False,
+        "db_path":           "D:/BookmapLogs/pax-bus.db",
+        "snapshot_blob_dir": "D:/BookmapLogs/pax-snapshots",
+        "digest_blob_dir":   "D:/BookmapLogs/pax-digests",
+        "queue_max":         2000,
+        "writer_idle_ms":    100,
+        "capture_ms":        1000,
+        "retention_days":    30,
+    },
 }
 
 

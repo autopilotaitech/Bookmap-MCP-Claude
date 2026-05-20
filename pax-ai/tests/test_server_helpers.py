@@ -202,3 +202,16 @@ def test_percent_encoded_plus_routes_via_unquote(patch_poller_to_or_grid):
     status, body = server._api_pax_level(decoded)
     assert status == 200
     assert body["label"] == "+2"
+
+
+def test_api_pax_health_includes_feature_bus_block():
+    from pax_ai.server import _api_pax_health
+    status, body = _api_pax_health()
+    assert status == 200
+    assert "feature_bus" in body
+    fb = body["feature_bus"]
+    assert "enabled" in fb
+    assert "healthy" in fb
+    assert "running" in fb
+    assert "queueDepth" in fb
+    assert "rowsToday" in fb

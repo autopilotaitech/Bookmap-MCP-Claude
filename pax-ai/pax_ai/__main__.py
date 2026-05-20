@@ -40,6 +40,11 @@ def main() -> int:
     # Snapshot poller starts in both modes - the API endpoints need it.
     poller.start()
 
+    # Phase-1 feature bus: passive capture, guarded by config flag (default
+    # false). The call is idempotent; when disabled, start() is a no-op.
+    from . import feature_bus
+    feature_bus.start()
+
     # Chat journal init (SQLite at D:\BookmapLogs\pax-chat.db by default).
     # No-ops if PAX_LOG_DIR is unwritable -- chat still works, history is
     # just not preserved for that session.

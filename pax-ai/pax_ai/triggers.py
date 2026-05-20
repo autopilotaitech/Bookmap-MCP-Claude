@@ -118,11 +118,17 @@ def _linger_ms() -> int:
     return max(3_000, min(60_000, v))
 
 
-def _emit_edge(state: Dict[str, Any], trig: Dict[str, Any], now_ms: int) -> None:
+def _emit_edge(state: Dict[str, Any], trig: Dict[str, Any], now_ms: int,
+                alias: Optional[str] = None) -> None:
     """Insert / refresh an edge trigger in the per-alias linger cache.
 
     Same (kind, label) refreshes lingerUntilMs but preserves the original
     firstSeenMs so the UI can sort / age-out consistently.
+
+    Phase-1 feature-bus hook (additive, fire-and-forget): when `alias` is
+    provided, call feature_bus.record_trigger() to persist the edge event.
+    The bus is lazy-imported to avoid a static circular dep
+    (feature_bus is loaded by __main__.py before journal.init()).
     """
     key = (trig["kind"], trig.get("label") or "-")
     cache = state["active_edges"]
@@ -131,6 +137,15 @@ def _emit_edge(state: Dict[str, Any], trig: Dict[str, Any], now_ms: int) -> None
     trig["lingerUntilMs"] = now_ms + _linger_ms()
     trig["bucketMs"] = trig["lingerUntilMs"] - trig["firstSeenMs"]
     cache[key] = trig
+
+    # Feature-bus capture is strictly out-of-band. Failures must NEVER
+    # reach the trigger compute path.
+    if alias:
+        try:
+            from . import feature_bus       # lazy import
+            feature_bus.record_trigger(alias, dict(trig), now_ms)
+        except Exception:
+            pass
 
 
 def _prune_expired_edges(state: Dict[str, Any], now_ms: int) -> None:
@@ -245,14 +260,14 @@ def _trig_middle_lock(state: Dict[str, Any], snap: Dict[str, Any], now_ms: int) 
             "headline": "mid is inside OR -> STAND DOWN",
             "details": "no entry while middleLock is true; wait for proximity to OR-H/OR-L",
             "asOfMs": now_ms,
-        }, now_ms)
+        }, now_ms, alias=str(snap.get("alias") or ALIAS_DEFAULT))
     else:
         _emit_edge(state, {
             "kind": "MIDDLE_LOCK_EXIT", "severity": "MED", "label": "-",
             "headline": "mid left the OR interior",
             "details": "middleLock cleared; level proximity re-enabled",
             "asOfMs": now_ms,
-        }, now_ms)
+        }, now_ms, alias=str(snap.get("alias") or ALIAS_DEFAULT))
 
 
 _RENDERABLE_TREND_KINDS = ("STRONG_BULL", "WEAK_BULL", "STRONG_BEAR", "WEAK_BEAR")
@@ -295,7 +310,7 @@ def _trig_trend_signal_fire(state: Dict[str, Any], snap: Dict[str, Any], now_ms:
                       f"bucketEnteredMs={bucket} "
                       f"eventMsSource={ts.get('eventMsSource')}",
         "asOfMs": now_ms,
-    }, now_ms)
+    }, now_ms, alias=str(snap.get("alias") or ALIAS_DEFAULT))
 
 
 def _trig_conviction_flip(state: Dict[str, Any], snap: Dict[str, Any], now_ms: int) -> None:
@@ -319,7 +334,7 @@ def _trig_conviction_flip(state: Dict[str, Any], snap: Dict[str, Any], now_ms: i
         "details":  f"prev_sign={prev_sign} new_sign={new_sign} "
                       f"trend={conv.get('trend')}",
         "asOfMs": now_ms,
-    }, now_ms)
+    }, now_ms, alias=str(snap.get("alias") or ALIAS_DEFAULT))
 
 
 def _trig_regime_change(state: Dict[str, Any], snap: Dict[str, Any], now_ms: int) -> None:
@@ -340,7 +355,7 @@ def _trig_regime_change(state: Dict[str, Any], snap: Dict[str, Any], now_ms: int
         "headline": f"regime -> {cur}" + (f" (conf {conf:.2f})" if conf is not None else ""),
         "details":  "absorption/exhaustion entered -- per Pax SKILL this is a FADE setup at the active level",
         "asOfMs": now_ms,
-    }, now_ms)
+    }, now_ms, alias=str(snap.get("alias") or ALIAS_DEFAULT))
 
 
 def _trig_micro_event(state: Dict[str, Any], snap: Dict[str, Any], now_ms: int) -> None:
@@ -377,7 +392,7 @@ def _trig_micro_event(state: Dict[str, Any], snap: Dict[str, Any], now_ms: int) 
                             (f" @ {price}" if price is not None else ""),
             "details":  f"event ts={ts_ms} age={now_ms - int(ts_ms)}ms",
             "asOfMs": now_ms,
-        }, now_ms)
+        }, now_ms, alias=str(snap.get("alias") or ALIAS_DEFAULT))
 
 
 def _trig_bridge_degraded(snap: Dict[str, Any], now_ms: int) -> List[Dict[str, Any]]:

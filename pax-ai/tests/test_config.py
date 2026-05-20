@@ -57,3 +57,16 @@ def test_deep_merge_preserves_unrelated_branches(tmp_path, monkeypatch):
     assert cfg["models"]["deep"] == "claude-opus-4-7"
     # `live` is in DEFAULTS but not in the override - must still be present
     assert cfg["models"]["live"] == "claude-haiku-4-5"
+
+
+def test_feature_bus_defaults_present_and_disabled():
+    """feature_bus.* keys must exist with safe Phase-1 defaults."""
+    from pax_ai import config
+    assert config.get("feature_bus.enabled") is False
+    assert isinstance(config.get("feature_bus.db_path"), str)
+    assert isinstance(config.get("feature_bus.snapshot_blob_dir"), str)
+    assert isinstance(config.get("feature_bus.digest_blob_dir"), str)
+    assert config.get("feature_bus.queue_max") == 2000
+    assert config.get("feature_bus.writer_idle_ms") == 100
+    assert config.get("feature_bus.capture_ms") == 1000
+    assert config.get("feature_bus.retention_days") == 30

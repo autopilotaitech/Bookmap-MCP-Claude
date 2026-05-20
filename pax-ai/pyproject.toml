@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pax-ai"
-version = "0.0.1"
+version = "0.1.0"
 description = "Pax AI - floating dark-glass quant chat over Bookmap MCP dashboard"
 requires-python = ">=3.11"
 authors = [{name = "Will (autopilotaitech)", email = "will@autopilotaitech.com"}]
