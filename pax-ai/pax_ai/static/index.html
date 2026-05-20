@@ -114,7 +114,7 @@
   /* —— WHY NOW chips —— */
   .whynow { display: flex; flex-direction: column; gap: 5px; margin-bottom: 8px; }
   .chip {
-    display: grid; grid-template-columns: auto 1fr; gap: 8px;
+    display: grid; grid-template-columns: auto 1fr auto; gap: 8px;
     align-items: center;
     padding: 6px 9px 6px 8px;
     border-radius: 6px;
@@ -122,6 +122,18 @@
     cursor: pointer;
     transition: transform 0.08s ease, box-shadow 0.12s ease;
   }
+  .chip .ask {
+    width: 22px; height: 22px; border-radius: 5px;
+    display:flex; align-items:center; justify-content:center;
+    background: rgba(54,214,255,0.10); border: 1px solid rgba(54,214,255,0.30);
+    color: var(--cyan); cursor: pointer; font-size: 12px;
+    transition: all 0.12s ease;
+  }
+  .chip .ask:hover { background: rgba(54,214,255,0.22); transform: translateX(1px); }
+  .chip.MED .ask  { background: rgba(255,155,60,0.10); border-color: rgba(255,155,60,0.30); color: var(--orange); }
+  .chip.MED .ask:hover { background: rgba(255,155,60,0.22); }
+  .chip.LOW .ask  { background: rgba(255,255,255,0.04); border-color: var(--line-2); color: var(--text-dim); }
+  .chip.LOW .ask:hover { background: rgba(255,255,255,0.08); color: var(--text); }
   .chip:hover { transform: translateX(2px); box-shadow: 0 2px 12px rgba(0,0,0,0.4); }
   .chip .sev {
     width: 32px; text-align: center; font-size: 9px; font-weight: 700;
@@ -417,6 +429,12 @@ async function pollPlaybook() {
   } catch (e) { target.textContent = 'playbook fetch error: ' + e; }
 }
 
+function _esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 async function pollWhyNow() {
   const target = document.getElementById('whynow-area');
   try {
@@ -428,19 +446,34 @@ async function pollWhyNow() {
     const html = ['<div class="whynow">'];
     for (const t of triggers) {
       const sev = (t.severity || 'LOW').toUpperCase();
+      const kind = _esc(t.kind);
+      const label = _esc(t.label);
+      const headline = _esc(t.headline);
       html.push(
         '<div class="chip ' + sev + '" onclick="this.classList.toggle(\'open\')">' +
           '<div class="sev">' + sev + '</div>' +
           '<div class="body-txt">' +
-            '<span class="kind">' + (t.kind || '') + (t.label ? ' &middot; ' + t.label : '') + '</span>' +
-            '<span class="headline">' + (t.headline || '') + '</span>' +
-            (t.details ? '<div class="details">' + t.details + '</div>' : '') +
+            '<span class="kind">' + kind + (t.label ? ' &middot; ' + label : '') + '</span>' +
+            '<span class="headline">' + headline + '</span>' +
+            (t.details ? '<div class="details">' + _esc(t.details) + '</div>' : '') +
           '</div>' +
+          '<div class="ask" title="ask Pax about this trigger" ' +
+                'data-kind="'     + kind     + '" ' +
+                'data-label="'    + label    + '" ' +
+                'data-headline="' + headline + '">&#10148;</div>' +
         '</div>'
       );
     }
     html.push('</div>');
     target.innerHTML = html.join('');
+    // Wire ask buttons. Listeners are re-attached every tick (innerHTML
+    // replaces the DOM nodes) -- cheap and avoids stale refs.
+    target.querySelectorAll('.chip .ask').forEach(btn => {
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        askAboutTrigger(btn.dataset.kind, btn.dataset.label, btn.dataset.headline);
+      });
+    });
   } catch (e) { /* keep prior render on transient errors */ }
 }
 
@@ -479,12 +512,8 @@ function appendMeta(parent, metaText) {
   parent.appendChild(m);
 }
 
-async function sendChat() {
-  if (_chatInFlight) return;
-  const ta = document.getElementById('chat-input');
-  const msg = (ta.value || '').trim();
-  if (!msg) return;
-  ta.value = '';                          // clear-on-send per spec
+async function _streamChatMessage(msg) {
+  if (_chatInFlight || !msg) return;
   appendTurn('you', 'YOU', msg, false);
   _chatInFlight = true;
   document.getElementById('send-btn').classList.add('disabled');
@@ -499,10 +528,7 @@ async function sendChat() {
     });
     if (!r.ok || !r.body) {
       msgEl.textContent = 'request failed: ' + r.status;
-      _streamingPaxBubble.classList.remove('streaming');
       _streamingPaxBubble.classList.add('error');
-      _chatInFlight = false;
-      document.getElementById('send-btn').classList.remove('disabled');
       return;
     }
     const reader = r.body.getReader();
@@ -529,6 +555,25 @@ async function sendChat() {
     document.getElementById('send-btn').classList.remove('disabled');
     _streamingPaxBubble = null;
   }
+}
+
+async function sendChat() {
+  if (_chatInFlight) return;
+  const ta = document.getElementById('chat-input');
+  const msg = (ta.value || '').trim();
+  if (!msg) return;
+  ta.value = '';                          // clear-on-send per spec
+  await _streamChatMessage(msg);
+}
+
+function askAboutTrigger(kind, label, headline) {
+  if (_chatInFlight) return;
+  // Build a one-line prefilled prompt referencing the trigger. The
+  // SNAPSHOT DIGEST in the system message already gives Claude the
+  // full state; this prompt just tells it which trigger to focus on.
+  const tag = '[WHY NOW: ' + (kind || '?') + (label ? ' · ' + label : '') + ']';
+  const msg = tag + ' ' + (headline || '') + ' — quant read?';
+  _streamChatMessage(msg);
 }
 
 function handleSseEvent(raw, msgEl) {
