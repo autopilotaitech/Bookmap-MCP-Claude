@@ -627,3 +627,63 @@ this quarantine; the indicator builds do not.
 Background: the build.ps1 scripts output into `build/libs/` which sits
 under `C:\Bookmap\addons\**`. Until those scripts are changed to write
 outside the scan tree, this stays a manual hygiene step.
+
+### /deep mode + cost footer + UX bundle (locked 2026-05-20)
+
+Pax AI got a `/deep` chat escalation, a cost / latency footer, abort +
+regenerate + keyboard shortcuts, plus pre-open hardening. The contracts
+below are now part of the production invariants — do not regress.
+
+- **/deep is a MODEL SWAP only.** Routes:
+    - normal chat -> `models.live` (default `claude-haiku-4-5`)
+    - `/deep <q>` -> `models.deep` (default `claude-sonnet-4-6`)
+    - `/deep <q>` + `models.opus_opt_in == true` -> `models.deep_when_opus`
+      (default `claude-opus-4-7`)
+  /deep does NOT unlock an agentic loop. `--tools ""` and
+  `--max-turns 1` remain unconditional in BOTH live and deep paths.
+
+- **Strict /deep boolean parsing.** `server.py::_handle_chat_stream`
+  must parse with `payload.get("deep") is True` — identity check, not
+  `bool(...)`. Strings (`"true"`, `"false"`), numbers (`1`, `0`),
+  arrays, dicts, and missing fields must NEVER escalate the model.
+  The earlier `bool(...)` form was a real bug: JSON `"false"` is a
+  truthy Python string and silently turned normal chats into Sonnet
+  calls. Pinned by tests in `pax-ai/tests/test_server_helpers.py`
+  (`test_strict_deep_parsing` + `test_server_uses_strict_deep_predicate_not_bool`).
+
+- **Deep timeout env-overridable.** `claude_stream.py::DEEP_CHAT_TIMEOUT_SEC`
+  is read from `PAX_AI_DEEP_CHAT_TIMEOUT` (default 60 s); the live
+  timeout (`CHAT_TIMEOUT_SEC` / `PAX_AI_CHAT_TIMEOUT`, default 30 s) is
+  independent and unchanged. A per-call `timeout_sec` arg on
+  `stream_chat()` wins over both. Helper `_parse_timeout` parses env
+  with garbage-tolerant fallback (zero / negative / non-float -> default).
+
+- **Regenerate does NOT duplicate the YOU bubble.** `_streamChatMessage`
+  reads `suppressUserEcho` from the request object; `regenerateLastPax`
+  sets it to `true` so the original user prompt stays in place and only
+  the Pax answer is re-streamed. Normal `sendChat` does NOT set the
+  flag — the YOU echo path for first-time sends is unchanged. Regenerate
+  must preserve `deep: _lastRequest.deep` so a `/deep` turn stays deep
+  on replay.
+
+- **Cost / latency footer comes from the Claude CLI's `result` event.**
+  `claude_stream.py::_extract_result_info` reads `total_cost_usd` +
+  `usage.{input_tokens, output_tokens, cache_creation_input_tokens,
+  cache_read_input_tokens}` + `duration_ms / duration_api_ms` from the
+  CLI's final stream-json `result` line. Pax AI's `done` SSE event and
+  journal `meta` carry these fields when present. The UI footer
+  cumulates them.
+  **The client NEVER computes pricing locally.** `total_cost_usd` from
+  the CLI is the only USD source. When the CLI omits `total_cost_usd`
+  (e.g. some auth/version combinations), the footer renders the
+  literal `"subscription"` label instead of $0. Pinned by
+  `test_ui_escape.py::test_cost_footer_no_client_side_pricing`.
+
+- **Abort + keyboard shortcuts.** `body.in-flight` toggles a red abort
+  button in place of send. `POST /api/pax/chat/abort` is the
+  authoritative kill switch (server.py terminates the subprocess).
+  `Esc` aborts in flight, otherwise clears the input.
+  `Ctrl/Cmd+Enter` is an alternate send. `ArrowUp` in an empty
+  textarea recalls the last user prompt and re-prepends `/deep ` when
+  the prior request was deep. `Ctrl/Cmd+L` scrolls the transcript to
+  the bottom.

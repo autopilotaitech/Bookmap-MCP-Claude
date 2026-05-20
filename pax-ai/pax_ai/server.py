@@ -287,6 +287,11 @@ class _Handler(BaseHTTPRequestHandler):
         if not user_text:
             self._send_json(400, {"error": "missing 'message'"})
             return
+        # Strict /deep parsing: only an honest JSON `true` escalates the
+        # model. `bool(...)` would treat the string "false" (truthy) or
+        # integer 1 as deep, which can silently turn a normal chat into
+        # a Sonnet/Opus call. Hard identity check is the safe contract.
+        deep = payload.get("deep") is True
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache, no-store")
@@ -299,7 +304,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         # SSE body written by chat_mod
         try:
-            chat_mod.handle_chat_stream(self.wfile, user_text)
+            chat_mod.handle_chat_stream(self.wfile, user_text, deep=deep)
         except (BrokenPipeError, ConnectionResetError):
             return
         # Tell BaseHTTPRequestHandler not to try to reuse this connection.

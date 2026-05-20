@@ -31,6 +31,27 @@ _ABORT_LOCK = threading.Lock()
 _CURRENT_ABORT: Optional[threading.Event] = None
 
 
+def _select_model(deep: bool) -> str:
+    """Resolve the Claude model id from config.
+
+    Priority:
+      * deep=False           -> models.live  (default: claude-haiku-4-5)
+      * deep=True,
+        models.opus_opt_in   -> models.deep_when_opus (default: claude-opus-4-7)
+      * deep=True (default)  -> models.deep  (default: claude-sonnet-4-6)
+
+    `--tools ""` + `--max-turns 1` invariants apply in ALL paths (set in
+    claude_stream._build_argv). /deep is a model swap, not an
+    agentic-loop unlock.
+    """
+    if not deep:
+        return config.get("models.live", "claude-haiku-4-5") or "claude-haiku-4-5"
+    if config.get("models.opus_opt_in", False):
+        return (config.get("models.deep_when_opus", "claude-opus-4-7")
+                  or "claude-opus-4-7")
+    return config.get("models.deep", "claude-sonnet-4-6") or "claude-sonnet-4-6"
+
+
 def request_abort() -> bool:
     """Set the abort flag for the chat currently in flight (if any).
 
@@ -166,11 +187,20 @@ def _clear_abort_if_owned(abort: threading.Event) -> None:
             _CURRENT_ABORT = None
 
 
-def handle_chat_stream(wfile, user_text: str) -> None:
+def handle_chat_stream(wfile, user_text: str, deep: bool = False) -> None:
     """SSE handler. Called by server.py after sending the status + headers.
 
     Writes a sequence of SSE events to wfile and flushes after each.
     Closes the chat after the subprocess exits or aborts.
+
+    Args:
+      wfile     - response writer to stream SSE events into.
+      user_text - the user message (already had any /deep prefix stripped
+                  client-side; this function does NOT re-interpret slash
+                  commands).
+      deep      - when True, escalate model selection via _select_model
+                  and use a longer per-call timeout. --tools "" and
+                  --max-turns 1 stay enforced.
 
     The _CURRENT_ABORT flag is set on entry and cleared on EVERY exit
     path via try/finally so that a follow-up POST /api/pax/chat/abort
@@ -193,6 +223,7 @@ def handle_chat_stream(wfile, user_text: str) -> None:
             "router_primary":  meta["router_primary"],
             "snapshot_stale":  meta["snapshot_stale"],
             "snapshot_age_ms": meta["snapshot_age_ms"],
+            "deep":            deep,
         })
 
         # System prompt path - rendered at boot, cached on disk
@@ -206,13 +237,16 @@ def handle_chat_stream(wfile, user_text: str) -> None:
                 pass
             return
 
-        model = config.get("models.live", "claude-haiku-4-5")
+        model = _select_model(deep)
+        chat_timeout = (claude_stream.DEEP_CHAT_TIMEOUT_SEC if deep
+                          else claude_stream.CHAT_TIMEOUT_SEC)
         pax_collected: List[str] = []
 
         # Tell the UI the chat is starting + which skill is leading.
         try:
             wfile.write(_sse_event("start", {
                 "model":            model,
+                "deep":             deep,
                 "router_primary":   meta["router_primary"],
                 "router_secondary": meta["router_secondary"],
                 "snapshot_stale":   meta["snapshot_stale"],
@@ -242,20 +276,31 @@ def handle_chat_stream(wfile, user_text: str) -> None:
             on_token=on_token,
             on_done=on_done,
             abort=abort,
+            timeout_sec=chat_timeout,
         )
         elapsed_ms = int((time.monotonic() - t0) * 1000)
 
         # Journal the assistant turn (even on partial / aborted / errored
-        # runs so the audit trail is complete).
+        # runs so the audit trail is complete). Cost/usage fields are
+        # captured when the CLI's `result` event provides them; absent
+        # otherwise (subscription auth may omit on some versions).
         pax_text = "".join(pax_collected)
         journal.record("PAX", pax_text, meta={
             "model":          model,
+            "deep":           deep,
             "exit_code":      rc,
             "elapsed_ms":     elapsed_ms,
             "tokens_emitted": final_info.get("tokens_emitted", 0),
             "aborted":        final_info.get("aborted", abort.is_set()),
             "error":          final_info.get("error"),
             "router_primary": meta["router_primary"],
+            # Optional cost/usage -- pass through whatever the CLI gave us.
+            "total_cost_usd":              final_info.get("total_cost_usd"),
+            "input_tokens":                final_info.get("input_tokens"),
+            "output_tokens":               final_info.get("output_tokens"),
+            "cache_creation_input_tokens": final_info.get("cache_creation_input_tokens"),
+            "cache_read_input_tokens":     final_info.get("cache_read_input_tokens"),
+            "duration_api_ms":             final_info.get("duration_api_ms"),
         })
 
         try:
@@ -267,7 +312,17 @@ def handle_chat_stream(wfile, user_text: str) -> None:
                 "error":          final_info.get("error"),
                 "stderr_tail":    final_info.get("stderr_tail"),
                 "model":          model,
+                "deep":           deep,
                 "router_primary": meta["router_primary"],
+                # Optional cost/usage from the CLI's final `result` event.
+                # The client must treat each field as optional -- some
+                # auth/version combinations omit total_cost_usd entirely.
+                "total_cost_usd":              final_info.get("total_cost_usd"),
+                "input_tokens":                final_info.get("input_tokens"),
+                "output_tokens":               final_info.get("output_tokens"),
+                "cache_creation_input_tokens": final_info.get("cache_creation_input_tokens"),
+                "cache_read_input_tokens":     final_info.get("cache_read_input_tokens"),
+                "duration_api_ms":             final_info.get("duration_api_ms"),
             }))
             wfile.flush()
         except (BrokenPipeError, ConnectionResetError):

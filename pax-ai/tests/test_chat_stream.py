@@ -134,3 +134,133 @@ def test_stream_chat_missing_binary_reports_error(tmp_path, monkeypatch):
     )
     assert rc == 127
     assert "not found" in done_info.get("error", "").lower() or done_info.get("error")
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: result-event parsing (cost / usage footer)
+# ---------------------------------------------------------------------------
+
+def test_extract_result_info_full_payload():
+    line = ('{"type":"result","subtype":"success","duration_ms":1234,'
+            '"duration_api_ms":1100,"num_turns":1,"total_cost_usd":0.0012,'
+            '"usage":{"input_tokens":800,"output_tokens":42,'
+            '"cache_creation_input_tokens":0,"cache_read_input_tokens":720}}')
+    out = claude_stream._extract_result_info(line)
+    assert out is not None
+    assert out["total_cost_usd"] == 0.0012
+    assert out["input_tokens"] == 800
+    assert out["output_tokens"] == 42
+    assert out["cache_creation_input_tokens"] == 0
+    assert out["cache_read_input_tokens"] == 720
+    assert out["duration_ms"] == 1234
+    assert out["duration_api_ms"] == 1100
+    assert out["num_turns"] == 1
+
+
+def test_extract_result_info_partial_payload_ok():
+    """When the CLI omits total_cost_usd (subscription-mode on some
+    versions), we still return whatever usage fields exist."""
+    line = ('{"type":"result","subtype":"success",'
+            '"usage":{"input_tokens":500,"output_tokens":20}}')
+    out = claude_stream._extract_result_info(line)
+    assert out is not None
+    assert "total_cost_usd" not in out
+    assert out["input_tokens"] == 500
+    assert out["output_tokens"] == 20
+
+
+@pytest.mark.parametrize("line", [
+    "",
+    "   ",
+    "not json",
+    '{"type":"stream_event"}',
+    '{"type":"system","subtype":"init"}',
+    '{}',
+])
+def test_extract_result_info_returns_none_for_non_result_lines(line):
+    assert claude_stream._extract_result_info(line) is None
+
+
+def test_result_event_parsed_into_done_info(tmp_path, patch_argv, monkeypatch):
+    """End-to-end via fake_claude.py with FAKE_CLAUDE_RESULT=1: stream-json
+    text deltas come through first, then a final result event populates
+    the cost + usage fields in on_done."""
+    monkeypatch.setenv("FAKE_CLAUDE_TEXTS", "ok|")
+    monkeypatch.setenv("FAKE_CLAUDE_RESULT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_RESULT_COST_USD", "0.00345")
+    monkeypatch.setenv("FAKE_CLAUDE_RESULT_INPUT_TOKENS", "1234")
+    monkeypatch.setenv("FAKE_CLAUDE_RESULT_OUTPUT_TOKENS", "67")
+    monkeypatch.setenv("FAKE_CLAUDE_RESULT_CACHE_READ", "900")
+
+    sp = tmp_path / "sp.txt"; sp.write_text("sp", encoding="utf-8")
+    done_info: dict = {}
+    rc = claude_stream.stream_chat(
+        user_message="q", model="claude-haiku-4-5", system_prompt_path=sp,
+        on_token=lambda t: None, on_done=lambda i: done_info.update(i),
+    )
+    assert rc == 0
+    assert done_info["total_cost_usd"] == pytest.approx(0.00345)
+    assert done_info["input_tokens"] == 1234
+    assert done_info["output_tokens"] == 67
+    assert done_info["cache_read_input_tokens"] == 900
+
+
+def test_stream_without_result_event_does_not_populate_cost(tmp_path, patch_argv, monkeypatch):
+    """Legacy fake_claude (no FAKE_CLAUDE_RESULT=1) must keep working.
+    Cost / usage keys are absent from on_done -- the UI footer renders
+    the 'subscription' fallback in that case."""
+    monkeypatch.setenv("FAKE_CLAUDE_TEXTS", "ok|")
+    monkeypatch.delenv("FAKE_CLAUDE_RESULT", raising=False)
+    sp = tmp_path / "sp.txt"; sp.write_text("sp", encoding="utf-8")
+    done_info: dict = {}
+    claude_stream.stream_chat(
+        user_message="q", model="m", system_prompt_path=sp,
+        on_token=lambda t: None, on_done=lambda i: done_info.update(i),
+    )
+    assert "total_cost_usd" not in done_info
+    assert "input_tokens" not in done_info
+
+
+def test_result_cost_omitted_when_subscription_mode(tmp_path, patch_argv, monkeypatch):
+    """FAKE_CLAUDE_RESULT_OMIT_COST=1 simulates subscription-mode CLI:
+    result event present, usage present, but no total_cost_usd."""
+    monkeypatch.setenv("FAKE_CLAUDE_TEXTS", "ok|")
+    monkeypatch.setenv("FAKE_CLAUDE_RESULT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_RESULT_OMIT_COST", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_RESULT_INPUT_TOKENS", "111")
+    sp = tmp_path / "sp.txt"; sp.write_text("sp", encoding="utf-8")
+    done_info: dict = {}
+    claude_stream.stream_chat(
+        user_message="q", model="m", system_prompt_path=sp,
+        on_token=lambda t: None, on_done=lambda i: done_info.update(i),
+    )
+    assert "total_cost_usd" not in done_info
+    assert done_info.get("input_tokens") == 111
+
+
+# ---------------------------------------------------------------------------
+# Pre-open hardening fix 3: deep timeout env override
+# ---------------------------------------------------------------------------
+
+def test_parse_timeout_default_when_env_absent(monkeypatch):
+    monkeypatch.delenv("PAX_AI_DEEP_CHAT_TIMEOUT", raising=False)
+    assert claude_stream._parse_timeout("PAX_AI_DEEP_CHAT_TIMEOUT", 60.0) == 60.0
+
+
+def test_parse_timeout_honours_env_override(monkeypatch):
+    monkeypatch.setenv("PAX_AI_DEEP_CHAT_TIMEOUT", "120")
+    assert claude_stream._parse_timeout("PAX_AI_DEEP_CHAT_TIMEOUT", 60.0) == 120.0
+
+
+@pytest.mark.parametrize("bad", ["", "abc", "0", "-5", "1e", "  "])
+def test_parse_timeout_falls_back_on_garbage(monkeypatch, bad):
+    monkeypatch.setenv("PAX_AI_DEEP_CHAT_TIMEOUT", bad)
+    assert claude_stream._parse_timeout("PAX_AI_DEEP_CHAT_TIMEOUT", 60.0) == 60.0
+
+
+def test_live_timeout_env_independent_of_deep(monkeypatch):
+    """Live and deep envs must not cross-pollinate."""
+    monkeypatch.setenv("PAX_AI_CHAT_TIMEOUT", "15")
+    monkeypatch.delenv("PAX_AI_DEEP_CHAT_TIMEOUT", raising=False)
+    assert claude_stream._parse_timeout("PAX_AI_CHAT_TIMEOUT", 30.0) == 15.0
+    assert claude_stream._parse_timeout("PAX_AI_DEEP_CHAT_TIMEOUT", 60.0) == 60.0

@@ -33,8 +33,25 @@ from pathlib import Path
 from typing import Callable, Optional
 
 
-# Hard ceiling so a runaway CLI call cannot hang the server forever.
-CHAT_TIMEOUT_SEC = float(os.environ.get("PAX_AI_CHAT_TIMEOUT", "30"))
+# Hard ceilings so a runaway CLI call cannot hang the server forever.
+# Live (haiku) chats default to 30 s; /deep mode defaults to 60 s. Both
+# are env-overridable so the operator can tighten or loosen without
+# editing source. The per-call `timeout_sec` argument on stream_chat()
+# wins over both globals when explicitly passed.
+def _parse_timeout(env_var: str, default: float) -> float:
+    """Parse a positive float from env; fall back to default on garbage."""
+    raw = os.environ.get(env_var)
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return v if v > 0 else default
+
+
+CHAT_TIMEOUT_SEC = _parse_timeout("PAX_AI_CHAT_TIMEOUT", 30.0)
+DEEP_CHAT_TIMEOUT_SEC = _parse_timeout("PAX_AI_DEEP_CHAT_TIMEOUT", 60.0)
 
 CLAUDE_BIN = os.environ.get("CLAUDE_CLI", "claude")
 
@@ -106,6 +123,52 @@ def _extract_text_delta(line: str) -> Optional[str]:
     return text if isinstance(text, str) else None
 
 
+def _extract_result_info(line: str) -> Optional[dict]:
+    """Pull cost + usage fields out of a single stream-json `result` line.
+
+    The Anthropic Claude CLI's `--output-format stream-json` emits a
+    final `{"type":"result", ...}` event with cost + usage metadata.
+    Per the audit, total_cost_usd is documented for `--output-format json`
+    but may be absent under some auth/version combinations on
+    stream-json; treat every field as optional.
+
+    Returns None for non-result lines so callers can chain alongside
+    `_extract_text_delta`. Returns a dict (possibly partial) when the
+    line is a result event.
+    """
+    line = line.strip()
+    if not line:
+        return None
+    if line[0] != "{":
+        return None
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    if obj.get("type") != "result":
+        return None
+    usage = obj.get("usage") or {}
+    if not isinstance(usage, dict):
+        usage = {}
+    out: dict = {}
+    cost = obj.get("total_cost_usd")
+    if isinstance(cost, (int, float)):
+        out["total_cost_usd"] = float(cost)
+    for key in ("input_tokens", "output_tokens",
+                  "cache_creation_input_tokens",
+                  "cache_read_input_tokens"):
+        v = usage.get(key)
+        if isinstance(v, (int, float)):
+            out[key] = int(v)
+    for key in ("duration_ms", "duration_api_ms", "num_turns"):
+        v = obj.get(key)
+        if isinstance(v, (int, float)):
+            out[key] = int(v)
+    return out
+
+
 def stream_chat(
     user_message: str,
     model: str,
@@ -113,18 +176,26 @@ def stream_chat(
     on_token: Callable[[str], None],
     on_done: Callable[[dict], None],
     abort: Optional[threading.Event] = None,
+    timeout_sec: Optional[float] = None,
 ) -> int:
     """Run one Claude CLI call. Returns the process exit code.
 
     on_token(text)   - invoked for every text_delta chunk
     on_done(info)    - invoked exactly once at end with metadata dict
     abort            - if set during the call, the process is terminated
+    timeout_sec      - per-call hard ceiling (seconds). Defaults to the
+                       module-level CHAT_TIMEOUT_SEC (30 s live). /deep
+                       mode passes 60 s. Does NOT mutate the module
+                       global -- a long-running deep call cannot stretch
+                       the timeout for the next live call.
 
     Errors (FileNotFoundError for missing claude binary, OS errors, JSON
     parse errors) are converted to a final on_done({"error": "..."}) and
     a non-zero return code rather than raising.
     """
     abort = abort or threading.Event()
+    effective_timeout = (CHAT_TIMEOUT_SEC if timeout_sec is None
+                          else float(timeout_sec))
     argv = _build_argv(user_message, model, system_prompt_path)
     start = time.monotonic()
     try:
@@ -148,7 +219,7 @@ def stream_chat(
 
     # Watchdog: abort thread terminates the process on timeout or abort flag.
     def _watchdog() -> None:
-        deadline = time.monotonic() + CHAT_TIMEOUT_SEC
+        deadline = time.monotonic() + effective_timeout
         while True:
             if proc.poll() is not None:
                 return
@@ -166,6 +237,7 @@ def stream_chat(
     wd.start()
 
     tokens_emitted = 0
+    result_info: dict = {}
     try:
         if proc.stdout is not None:
             for line in proc.stdout:
@@ -175,6 +247,14 @@ def stream_chat(
                 if text:
                     on_token(text)
                     tokens_emitted += 1
+                    continue
+                # Not a text-delta -- check whether this is the final
+                # result event (cost/usage). The same line cannot be both
+                # a text_delta and a result, so the continue above is
+                # safe; we only fall through for non-text-delta lines.
+                ri = _extract_result_info(line)
+                if ri:
+                    result_info.update(ri)
     except (BrokenPipeError, ConnectionResetError):
         pass
     except Exception as exc:
@@ -188,6 +268,10 @@ def stream_chat(
         "tokens_emitted": tokens_emitted,
         "aborted":        abort.is_set(),
     }
+    # Merge cost/usage fields from the CLI's `result` event when present.
+    # Real CLI runs may omit total_cost_usd depending on auth/version;
+    # downstream consumers must treat each field as optional.
+    info.update(result_info)
     if exit_code != 0:
         # Try to surface stderr for diagnostics (capped length).
         try:

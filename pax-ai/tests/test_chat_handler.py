@@ -145,3 +145,106 @@ def test_request_abort_is_false_when_no_chat_in_flight(monkeypatch):
     with chat._ABORT_LOCK:
         chat._CURRENT_ABORT = None
     assert chat.request_abort() is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: /deep mode model selection
+# ---------------------------------------------------------------------------
+
+def test_select_model_live_default():
+    """Default config: deep=False resolves to models.live (Haiku)."""
+    assert chat._select_model(False).startswith("claude-haiku")
+
+
+def test_select_model_deep_default_sonnet():
+    """opus_opt_in unset (default false): deep=True resolves to Sonnet."""
+    assert chat._select_model(True).startswith("claude-sonnet")
+
+
+def test_select_model_deep_with_opus_opt_in(monkeypatch):
+    """opus_opt_in=true: deep=True resolves to deep_when_opus (Opus)."""
+    real_get = chat.config.get
+    def fake_get(path, default=None):
+        if path == "models.opus_opt_in": return True
+        return real_get(path, default)
+    monkeypatch.setattr(chat.config, "get", fake_get)
+    assert chat._select_model(True).startswith("claude-opus")
+
+
+def _capture_argv(monkeypatch):
+    """Helper: monkeypatch claude_stream so we capture the argv passed
+    to subprocess.Popen without actually spawning the binary. Returns a
+    list that will hold the captured argv after handle_chat_stream runs."""
+    captured: list = []
+    def fake_build_argv(user_message, model, system_prompt_path):
+        argv = ["fake_claude_stub", "--model", model,
+                "--tools", "",
+                "--max-turns", "1"]
+        captured.append({"argv": argv, "model": model})
+        # Return a path that does not exist so Popen raises FileNotFoundError
+        # and stream_chat bails fast via the missing-binary branch.
+        return ["this_binary_does_not_exist_xyz_deep.exe",
+                 "--model", model, "--tools", "", "--max-turns", "1"]
+    monkeypatch.setattr(chat.claude_stream, "_build_argv", fake_build_argv)
+    return captured
+
+
+def test_handle_chat_stream_deep_false_uses_live_model(monkeypatch):
+    with chat._ABORT_LOCK: chat._CURRENT_ABORT = None
+    captured = _capture_argv(monkeypatch)
+    buf = io.BytesIO()
+    chat.handle_chat_stream(buf, "what regime?", deep=False)
+    assert captured, "stream_chat should have been called once"
+    assert captured[0]["model"].startswith("claude-haiku")
+
+
+def test_handle_chat_stream_deep_true_uses_sonnet(monkeypatch):
+    with chat._ABORT_LOCK: chat._CURRENT_ABORT = None
+    captured = _capture_argv(monkeypatch)
+    buf = io.BytesIO()
+    chat.handle_chat_stream(buf, "explain absorption at -1", deep=True)
+    assert captured and captured[0]["model"].startswith("claude-sonnet")
+
+
+def test_handle_chat_stream_deep_true_with_opus_opt_in(monkeypatch):
+    with chat._ABORT_LOCK: chat._CURRENT_ABORT = None
+    real_get = chat.config.get
+    def fake_get(path, default=None):
+        if path == "models.opus_opt_in": return True
+        return real_get(path, default)
+    monkeypatch.setattr(chat.config, "get", fake_get)
+    captured = _capture_argv(monkeypatch)
+    buf = io.BytesIO()
+    chat.handle_chat_stream(buf, "deep review", deep=True)
+    assert captured and captured[0]["model"].startswith("claude-opus")
+
+
+def test_handle_chat_stream_deep_keeps_tools_empty_and_max_turns_one(monkeypatch):
+    """Both invariants must be enforced in /deep mode too."""
+    with chat._ABORT_LOCK: chat._CURRENT_ABORT = None
+    captured: list = []
+    real_build = chat.claude_stream._build_argv
+    def spy_build(user_message, model, system_prompt_path):
+        argv = real_build(user_message, model, system_prompt_path)
+        captured.append(list(argv))
+        # Redirect to a missing binary so Popen returns 127 fast.
+        return ["this_binary_does_not_exist_xyz_deep.exe"] + list(argv[1:])
+    monkeypatch.setattr(chat.claude_stream, "_build_argv", spy_build)
+    buf = io.BytesIO()
+    chat.handle_chat_stream(buf, "deep query", deep=True)
+    assert captured, "_build_argv must have been called"
+    argv = captured[0]
+    # Find adjacent ('--tools', '') and ('--max-turns', '1') pairs.
+    pairs = list(zip(argv, argv[1:]))
+    assert ("--tools", "") in pairs, (
+        "--tools \"\" must remain in argv under /deep mode")
+    assert ("--max-turns", "1") in pairs, (
+        "--max-turns 1 must remain in argv under /deep mode")
+
+
+def test_handle_chat_stream_deep_default_param_is_false():
+    """The deep parameter must default to False so legacy callers
+    (every existing test) keep getting the live model."""
+    import inspect
+    sig = inspect.signature(chat.handle_chat_stream)
+    assert sig.parameters["deep"].default is False

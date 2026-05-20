@@ -209,6 +209,11 @@
   .turn .meta { font-size: 9.5px; color: var(--text-faint);
     font-family: 'JetBrains Mono', 'Consolas', monospace; margin-top: 3px; }
   .turn.error .msg { color: var(--red); font-size: 11px; }
+  /* —— /deep marker (Phase 2) —— */
+  .turn .deep-tag { color: var(--cyan); letter-spacing: 0.6px;
+    font-size: 9.5px; font-weight: 700; }
+  .turn.deep.pax .msg { border-left: 2px solid rgba(54,214,255,0.30);
+    padding-left: 8px; }
   /* —— history —— */
   .turn.historical { opacity: 0.55; }
   .turn.historical .who::after { content: ' \B7 history'; color: var(--text-faint);
@@ -224,6 +229,20 @@
     opacity: 0; transition: opacity 0.2s ease;
     pointer-events: none; z-index: 50; }
   .toast.show { opacity: 1; }
+  /* —— cost / latency footer (Phase 1) —— */
+  .cost-footer[hidden] { display: none; }
+  .cost-footer {
+    font-family: 'JetBrains Mono', 'Consolas', monospace;
+    font-size: 9.5px; letter-spacing: 0.4px;
+    color: var(--text-faint); text-align: right;
+    padding: 2px 12px 4px; background: var(--bg-1);
+    border-top: 1px dashed var(--line-2);
+  }
+  .cost-footer .turns { color: var(--text-dim); }
+  .cost-footer .usd   { color: var(--cyan); }
+  .cost-footer .toks  { color: var(--text-dim); }
+  .cost-footer .lat   { color: var(--text-faint); }
+  .cost-footer .sub   { color: var(--text-faint); font-style: italic; }
   /* —— input —— */
   .input {
     display: grid; grid-template-columns: 1fr auto auto;
@@ -257,6 +276,27 @@
   .icon-btn.mic.listening { color: var(--red); border-color: rgba(255,90,106,0.4);
     background: rgba(255,90,106,0.10);
     animation: pulse 1s infinite; }
+  /* —— abort button (Phase 3) —— */
+  .icon-btn.abort { color: var(--red); border-color: rgba(255,90,106,0.4);
+    background: linear-gradient(180deg, rgba(255,90,106,0.18), rgba(255,90,106,0.06));
+    display: none; }
+  .icon-btn.abort:hover { background: rgba(255,90,106,0.30); color: #fff; }
+  body.in-flight .icon-btn.send  { display: none; }
+  body.in-flight .icon-btn.abort { display: flex; }
+  /* —— regenerate button (Phase 3) —— */
+  .turn .regen-btn {
+    display: none; position: absolute; right: 4px; bottom: 4px;
+    background: rgba(54,214,255,0.10);
+    border: 1px solid rgba(54,214,255,0.30);
+    color: var(--cyan); border-radius: 5px;
+    width: 20px; height: 20px;
+    align-items: center; justify-content: center;
+    font-size: 13px; cursor: pointer;
+    transition: all 0.12s ease;
+  }
+  .turn .regen-btn:hover { background: rgba(54,214,255,0.22); }
+  .turn.pax { position: relative; padding-bottom: 4px; }
+  .turn.pax.last-completed .regen-btn { display: flex; }
   @keyframes pulse { 50% { background: rgba(255,90,106,0.25); } }
   svg { width: 14px; height: 14px; }
 </style></head>
@@ -305,6 +345,8 @@
     </div>
     <div class="toast" id="toast"></div>
 
+    <div class="cost-footer" id="cost-footer" hidden></div>
+
     <div class="input">
       <textarea id="chat-input" placeholder="ask about flow, levels, or tap the mic..." rows="1"></textarea>
       <button class="icon-btn mic" id="mic-btn" title="voice (Web Speech API)"
@@ -317,6 +359,12 @@
               onclick="sendChat()">
         <svg viewBox="0 0 16 16" fill="currentColor">
           <path d="M1.5 1.5l13 6.5-13 6.5 2.5-6.5-2.5-6.5z"/>
+        </svg>
+      </button>
+      <button class="icon-btn abort" id="abort-btn" title="abort (Esc)"
+              onclick="abortChat()">
+        <svg viewBox="0 0 16 16" fill="currentColor">
+          <rect x="3.5" y="3.5" width="9" height="9" rx="1"/>
         </svg>
       </button>
     </div>
@@ -360,6 +408,72 @@ function _esc(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// ---------- cost / latency footer (Phase 1) ----------
+// Cumulative session counters. Reset only on page reload (which happens
+// when the user disables + re-enables the Pax AI addon). The CLI's
+// `total_cost_usd` field is authoritative -- we never compute pricing
+// client-side. When the CLI omits cost (subscription-mode on some
+// versions) we display "subscription" rather than $0.
+const _costState = {
+  turns:           0,
+  costUsd:         0,
+  costSeen:        false,   // true once any done event carried a cost
+  totalTokens:     0,
+  lastLatencyMs:   0,
+};
+function updateCostFooter(done) {
+  _costState.turns += 1;
+  _costState.lastLatencyMs = (done && typeof done.elapsed_ms === 'number')
+    ? done.elapsed_ms : 0;
+  if (done && typeof done.total_cost_usd === 'number') {
+    _costState.costUsd += done.total_cost_usd;
+    _costState.costSeen = true;
+  }
+  // Sum visible-token-ish fields when present. input + output dominate;
+  // cache_read is also charged (at a discount) so we include it.
+  let turnTokens = 0;
+  for (const k of ['input_tokens', 'output_tokens',
+                     'cache_creation_input_tokens',
+                     'cache_read_input_tokens']) {
+    if (done && typeof done[k] === 'number') turnTokens += done[k];
+  }
+  _costState.totalTokens += turnTokens;
+
+  const footer = document.getElementById('cost-footer');
+  if (!footer) return;
+  // Render via textContent on a fresh span graph -- no innerHTML so
+  // there's no XSS vector even if a future field becomes user-shaped.
+  while (footer.firstChild) footer.removeChild(footer.firstChild);
+  const turnsSpan = document.createElement('span');
+  turnsSpan.className = 'turns';
+  turnsSpan.textContent = _costState.turns + ' turns';
+  footer.appendChild(turnsSpan);
+  footer.appendChild(document.createTextNode(' · '));
+  const usdSpan = document.createElement('span');
+  if (_costState.costSeen) {
+    usdSpan.className = 'usd';
+    usdSpan.textContent = '$' + _costState.costUsd.toFixed(4);
+  } else {
+    usdSpan.className = 'sub';
+    usdSpan.textContent = 'subscription';
+  }
+  footer.appendChild(usdSpan);
+  if (_costState.totalTokens > 0) {
+    footer.appendChild(document.createTextNode(' · '));
+    const tokSpan = document.createElement('span');
+    tokSpan.className = 'toks';
+    const k = Math.round(_costState.totalTokens / 100) / 10;
+    tokSpan.textContent = '~' + k.toFixed(1) + 'k tok';
+    footer.appendChild(tokSpan);
+  }
+  footer.appendChild(document.createTextNode(' · '));
+  const latSpan = document.createElement('span');
+  latSpan.className = 'lat';
+  latSpan.textContent = 'last ' + (_costState.lastLatencyMs / 1000).toFixed(1) + 's';
+  footer.appendChild(latSpan);
+  footer.hidden = false;
 }
 
 // ---------- strip + edge + playbook polling ----------
@@ -520,18 +634,43 @@ setInterval(tick, 1000);
 let _streamingPaxBubble = null;   // currently-streaming Pax turn DOM
 let _chatInFlight = false;
 
-function appendTurn(kind, who, text, isStreaming) {
+function appendTurn(kind, who, text, isStreaming, opts) {
   const t = document.getElementById('transcript');
   const div = document.createElement('div');
   div.className = 'turn ' + kind + (isStreaming ? ' streaming' : '');
   const whoEl = document.createElement('div');
   whoEl.className = 'who ' + (kind === 'pax' ? 'pax' : 'you');
-  whoEl.innerHTML = '<b>' + who + '</b> &middot; ' + nowHHMMSS();
+  // Build the WHO line with textContent fragments so the only HTML
+  // structure is the <b> we control. `who` is hard-coded by callers
+  // ('YOU' / 'PAX'), but the deep marker is appended as a separate
+  // styled span via DOM nodes -- no innerHTML.
+  const whoB = document.createElement('b');
+  whoB.textContent = who;
+  whoEl.appendChild(whoB);
+  whoEl.appendChild(document.createTextNode(' · ' + nowHHMMSS()));
+  if (opts && opts.deep) {
+    div.classList.add('deep');
+    const deepTag = document.createElement('span');
+    deepTag.className = 'deep-tag';
+    deepTag.textContent = ' · DEEP';
+    whoEl.appendChild(deepTag);
+  }
   div.appendChild(whoEl);
   const msgEl = document.createElement('div');
   msgEl.className = 'msg';
   msgEl.textContent = text || '';
   div.appendChild(msgEl);
+  // Phase 3 regenerate: each Pax bubble gets a ↻ button that surfaces
+  // only when `.last-completed` is set (via CSS), wired up in the
+  // _streamChatMessage finally branch.
+  if (kind === 'pax') {
+    const regen = document.createElement('button');
+    regen.className = 'regen-btn';
+    regen.type = 'button';
+    regen.title = 'regenerate against current snapshot';
+    regen.textContent = '↻';   // ↻
+    div.appendChild(regen);
+  }
   t.appendChild(div);
   div.scrollIntoView({block: 'end', behavior: 'smooth'});
   return div;
@@ -544,19 +683,47 @@ function appendMeta(parent, metaText) {
   parent.appendChild(m);
 }
 
-async function _streamChatMessage(msg) {
-  if (_chatInFlight || !msg) return;
-  appendTurn('you', 'YOU', msg, false);
+// Last-request snapshot, used by Phase 3 regenerate. Captured BEFORE
+// the fetch so it survives any error path. Shape:
+//   { message, deep, displayText }
+let _lastRequest = null;
+
+async function _streamChatMessage(request) {
+  if (_chatInFlight) return;
+  // Backwards-compat: accept either a plain string (legacy callers) or
+  // a {message, deep, displayText, suppressUserEcho} request object.
+  if (typeof request === 'string') request = {message: request};
+  const msg = request && request.message;
+  if (!msg) return;
+  const deep = !!(request && request.deep);
+  const displayText = (request && request.displayText) || msg;
+  // suppressUserEcho is set by regenerateLastPax so the original YOU
+  // bubble in the transcript is preserved and only the Pax response is
+  // re-streamed. _lastRequest is still updated so the regenerate target
+  // tracks the latest answer.
+  const suppressUserEcho = !!(request && request.suppressUserEcho);
+  _lastRequest = {message: msg, deep: deep, displayText: displayText};
+
+  // Clear the "last-completed" marker on the prior Pax bubble (regenerate
+  // is only ever offered on the most recent finished turn).
+  for (const el of document.querySelectorAll('.turn.pax.last-completed')) {
+    el.classList.remove('last-completed');
+  }
+
+  if (!suppressUserEcho) {
+    appendTurn('you', 'YOU', displayText, false, {deep: deep});
+  }
   _chatInFlight = true;
+  document.body.classList.add('in-flight');
   document.getElementById('send-btn').classList.add('disabled');
-  _streamingPaxBubble = appendTurn('pax', 'PAX', '', true);
+  _streamingPaxBubble = appendTurn('pax', 'PAX', '', true, {deep: deep});
   const msgEl = _streamingPaxBubble.querySelector('.msg');
 
   try {
     const r = await fetch('/api/pax/chat/stream', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({message: msg}),
+      body: JSON.stringify({message: msg, deep: deep}),
     });
     if (!r.ok || !r.body) {
       msgEl.textContent = 'request failed: ' + r.status;
@@ -580,28 +747,82 @@ async function _streamChatMessage(msg) {
     msgEl.textContent += '\n[stream error: ' + e + ']';
     _streamingPaxBubble.classList.add('error');
   } finally {
-    if (_streamingPaxBubble) {
-      _streamingPaxBubble.classList.remove('streaming');
+    const finished = _streamingPaxBubble;
+    if (finished) {
+      finished.classList.remove('streaming');
+      // Mark this Pax bubble as the last-completed turn so the
+      // regenerate (↻) button surfaces only here.
+      finished.classList.add('last-completed');
+      // Attach the regenerate handler once (idempotent for re-flows).
+      const btn = finished.querySelector('.regen-btn');
+      if (btn && !btn.dataset.wired) {
+        btn.dataset.wired = '1';
+        btn.addEventListener('click', regenerateLastPax);
+      }
     }
     _chatInFlight = false;
+    document.body.classList.remove('in-flight');
     document.getElementById('send-btn').classList.remove('disabled');
     _streamingPaxBubble = null;
   }
 }
 
+// ---------- abort (Phase 3) ----------
+async function abortChat() {
+  if (!_chatInFlight) return;
+  try {
+    await fetch('/api/pax/chat/abort', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}',
+    });
+  } catch (e) { /* server-side abort is source of truth; ignore network errors */ }
+}
+
+// ---------- regenerate (Phase 3) ----------
+async function regenerateLastPax() {
+  if (_chatInFlight || !_lastRequest) return;
+  // Remove the last completed Pax bubble so the regenerated stream
+  // takes its place in the transcript. The matching YOU bubble stays;
+  // suppressUserEcho=true tells _streamChatMessage not to append a
+  // second one (the original bug duplicated the YOU bubble on every
+  // regen click).
+  const last = document.querySelector('.turn.pax.last-completed');
+  if (last && last.parentElement) last.parentElement.removeChild(last);
+  // Re-send the same request (preserves deep flag) against the CURRENT
+  // snapshot -- digest is rebuilt by the server.
+  await _streamChatMessage({
+    message:           _lastRequest.message,
+    deep:              _lastRequest.deep,
+    displayText:       _lastRequest.displayText,
+    suppressUserEcho:  true,
+  });
+}
+
 async function sendChat() {
   if (_chatInFlight) return;
   const ta = document.getElementById('chat-input');
-  const msg = (ta.value || '').trim();
-  if (!msg) return;
+  const raw = (ta.value || '').trim();
+  if (!raw) return;
   ta.value = '';                          // clear-on-send per spec
   // Slash commands intercepted client-side. /forget wipes current run's
-  // history on the server AND clears the live transcript DOM.
-  if (msg === '/forget') {
+  // history on the server AND clears the live transcript DOM. /forget
+  // is checked before /deep so "/forget" never gets reinterpreted as a
+  // deep prompt.
+  if (raw === '/forget') {
     await runForget();
     return;
   }
-  await _streamChatMessage(msg);
+  // /deep mode: strip exactly one "/deep " prefix and flip the model
+  // selector server-side. Empty after strip -> no-op (do not send).
+  let deep = false;
+  let msg = raw;
+  if (raw.startsWith('/deep ')) {
+    deep = true;
+    msg = raw.slice(6).trim();
+    if (!msg) return;
+  }
+  await _streamChatMessage({message: msg, deep: deep});
 }
 
 async function runForget() {
@@ -708,15 +929,55 @@ function handleSseEvent(raw, msgEl) {
       msgEl.textContent += '\n[' + obj.error + ']';
       _streamingPaxBubble.classList.add('error');
     }
+    updateCostFooter(obj);
   } else if (event === 'error') {
     msgEl.textContent += '\n[error: ' + (obj.error || data) + ']';
     _streamingPaxBubble.classList.add('error');
   }
 }
 
+// ---------- keyboard shortcuts (Phase 3) ----------
+//   Enter            -> send
+//   Shift+Enter      -> newline
+//   Ctrl/Cmd+Enter   -> send (alternate)
+//   Esc              -> abort if in flight, else clear input
+//   ArrowUp          -> recall last user prompt (only when textarea empty)
+//   Ctrl/Cmd+L       -> scroll transcript to bottom
 document.getElementById('chat-input').addEventListener('keydown', (e) => {
+  // Ctrl/Cmd + Enter always sends (regardless of shift).
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault(); sendChat(); return;
+  }
+  // Plain Enter sends; Shift+Enter inserts a newline.
   if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault(); sendChat();
+    e.preventDefault(); sendChat(); return;
+  }
+  // Esc: abort an in-flight chat, otherwise clear the input.
+  if (e.key === 'Escape') {
+    if (_chatInFlight) {
+      e.preventDefault(); abortChat(); return;
+    }
+    if (e.target && typeof e.target.value === 'string' && e.target.value !== '') {
+      e.preventDefault(); e.target.value = ''; return;
+    }
+    return;
+  }
+  // ArrowUp recalls the last user prompt -- only when the textarea is
+  // empty so it never interferes with normal cursor navigation.
+  if (e.key === 'ArrowUp' && e.target && e.target.value === '' && _lastRequest) {
+    e.preventDefault();
+    // Preserve a /deep prefix so the user can edit + resend in deep mode.
+    e.target.value = _lastRequest.deep
+      ? '/deep ' + _lastRequest.message
+      : _lastRequest.message;
+    return;
+  }
+  // Ctrl/Cmd + L scrolls the transcript to the bottom (crowded sessions).
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'l' || e.key === 'L')) {
+    e.preventDefault();
+    const wrap = document.querySelector('.transcript-wrap');
+    if (wrap) wrap.scrollTop = wrap.scrollHeight;
+    return;
   }
 });
 
