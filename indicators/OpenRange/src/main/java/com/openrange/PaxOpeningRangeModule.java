@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 import javax.swing.JCheckBox;
 import javax.swing.JLabel;
@@ -48,6 +49,11 @@ import velox.api.layer1.common.Log;
 import velox.api.layer1.data.InstrumentInfo;
 import velox.api.layer1.data.TradeInfo;
 import velox.api.layer1.datastructure.events.TradeAggregationEvent;
+import velox.api.layer1.layers.strategies.interfaces.CalculatedResultListener;
+import velox.api.layer1.layers.strategies.interfaces.InvalidateInterface;
+import velox.api.layer1.layers.strategies.interfaces.OnlineCalculatable;
+import velox.api.layer1.layers.strategies.interfaces.OnlineCalculatable.Marker;
+import velox.api.layer1.layers.strategies.interfaces.OnlineValueCalculatorAdapter;
 import velox.api.layer1.layers.strategies.interfaces.ScreenSpaceCanvas;
 import velox.api.layer1.layers.strategies.interfaces.ScreenSpaceCanvas.CanvasIcon;
 import velox.api.layer1.layers.strategies.interfaces.ScreenSpaceCanvas.CompositeCoordinateBase;
@@ -63,7 +69,14 @@ import velox.api.layer1.messages.UserMessageLayersChainCreatedTargeted;
 import velox.api.layer1.messages.indicators.DataStructureInterface;
 import velox.api.layer1.messages.indicators.DataStructureInterface.StandardEvents;
 import velox.api.layer1.messages.indicators.DataStructureInterface.TreeResponseInterval;
+import velox.api.layer1.messages.indicators.IndicatorColorScheme;
+import velox.api.layer1.messages.indicators.IndicatorColorScheme.ColorDescription;
+import velox.api.layer1.messages.indicators.IndicatorColorScheme.ColorIntervalResponse;
+import velox.api.layer1.messages.indicators.IndicatorLineStyle;
 import velox.api.layer1.messages.indicators.Layer1ApiDataInterfaceRequestMessage;
+import velox.api.layer1.messages.indicators.Layer1ApiUserMessageModifyIndicator;
+import velox.api.layer1.messages.indicators.Layer1ApiUserMessageModifyIndicator.GraphType;
+import velox.api.layer1.messages.indicators.Layer1ApiUserMessageModifyIndicator.LayerRenderPriority;
 import velox.api.layer1.messages.indicators.Layer1ApiUserMessageModifyScreenSpacePainter;
 import velox.api.layer1.messages.indicators.SettingsAccess;
 import velox.api.layer1.settings.Layer1ConfigSettingsInterface;
@@ -83,6 +96,8 @@ public class PaxOpeningRangeModule implements
         Layer1ConfigSettingsInterface {
 
     private static final String INDICATOR_NAME = "OpenRange";
+    private static final String SIGNAL_MARKER_INDICATOR_NAME = "OpenRange Signals";
+    private static final String SIGNAL_MARKER_COLOR_NAME = "OpenRange signal markers";
     private static final ZoneId EXCHANGE_ZONE = ZoneId.of("America/Chicago");
     private static final int LABEL_X_OFFSET = 5;
     private static final int LABEL_Y_OFFSET = -8;
@@ -129,7 +144,8 @@ public class PaxOpeningRangeModule implements
      *       hydrated, high/low/mid drift), on {@code onMoveEnd}, or on
      *       explicit rebuild/backfill paths. <b>Never</b> on a market tick
      *       or dashboard poll by itself.</li>
-     *   <li>trend triangles redraw on {@code trendSignalDirty}.</li>
+     *   <li>dashboard conviction triangles redraw on {@code trendSignalDirty};
+     *       OpenRange buy/sell markers use Bookmap's native Indicator API.</li>
      *   <li>volatile overlay redraws on {@code heatwaveDirty}.</li>
      * </ul>
      */
@@ -171,11 +187,45 @@ public class PaxOpeningRangeModule implements
         }
     }
 
+    static PaxTrendSignalModel.Kind openingRangeMarkerKind(PaxOpeningRangeSignal signal) {
+        if (!isOpeningRangeMarkerCandidate(signal)) {
+            return PaxTrendSignalModel.Kind.NONE;
+        }
+        boolean strong = signal.confidence() == PaxOpeningRangeSignalConfidence.HIGH;
+        if (signal.bias() == PaxOpeningRangeSignalBias.LONG) {
+            return strong ? PaxTrendSignalModel.Kind.STRONG_BULL : PaxTrendSignalModel.Kind.WEAK_BULL;
+        }
+        if (signal.bias() == PaxOpeningRangeSignalBias.SHORT) {
+            return strong ? PaxTrendSignalModel.Kind.STRONG_BEAR : PaxTrendSignalModel.Kind.WEAK_BEAR;
+        }
+        return PaxTrendSignalModel.Kind.NONE;
+    }
+
+    static boolean isOpeningRangeMarkerCandidate(PaxOpeningRangeSignal signal) {
+        return signal != null
+                && signal.action() == PaxOpeningRangeSignalAction.ALLOW_SIGNAL
+                && (signal.bias() == PaxOpeningRangeSignalBias.LONG
+                    || signal.bias() == PaxOpeningRangeSignalBias.SHORT);
+    }
+
+    static String openingRangeMarkerKey(String symbol, PaxOpeningRangeFeatureSnapshot snapshot) {
+        if (snapshot == null || !isOpeningRangeMarkerCandidate(snapshot.signal())) {
+            return "";
+        }
+        PaxOpeningRangeSignal signal = snapshot.signal();
+        String safeSymbol = symbol == null ? "" : symbol;
+        String evidence = signal.evidence() == null ? "" : signal.evidence();
+        return safeSymbol + "|" + signal.bias() + "|" + signal.action() + "|"
+                + signal.confidence() + "|" + signal.score() + "|" + evidence;
+    }
+
     private final Layer1ApiProvider provider;
     private final Map<String, InstrumentState> instruments = new ConcurrentHashMap<>();
     private final Map<String, PaxPainter> painters = new ConcurrentHashMap<>();
     private final Map<String, String> indicatorsFullNameToUserName = new HashMap<>();
+    private final Map<String, String> markerIndicatorFullNameToUserName = new HashMap<>();
     private final PaxOpeningRangeCrossMarketState crossMarketState = new PaxOpeningRangeCrossMarketState();
+    private final NativeSignalMarkerIndicator nativeSignalMarkers = new NativeSignalMarkerIndicator();
     private final PaxHeatwaveFetcher heatwave;
     private final AtomicBoolean heatwaveDirty = new AtomicBoolean(false);
     private final PaxTrendSignalFetcher trendSignals;
@@ -204,6 +254,14 @@ public class PaxOpeningRangeModule implements
             }
             indicatorsFullNameToUserName.clear();
         }
+        synchronized (markerIndicatorFullNameToUserName) {
+            for (String userName : markerIndicatorFullNameToUserName.values()) {
+                provider.sendUserMessage(new Layer1ApiUserMessageModifyIndicator(
+                        PaxOpeningRangeModule.class, userName, false));
+            }
+            markerIndicatorFullNameToUserName.clear();
+        }
+        nativeSignalMarkers.clear();
         painters.values().forEach(PaxPainter::dispose);
         painters.clear();
         instruments.values().forEach(InstrumentState::dispose);
@@ -228,6 +286,7 @@ public class PaxOpeningRangeModule implements
                     backfillAll();
                 }));
                 addPainter();
+                addNativeSignalMarkerIndicator();
             }
         }
     }
@@ -327,6 +386,46 @@ public class PaxOpeningRangeModule implements
             indicatorsFullNameToUserName.put(message.fullName, message.userName);
         }
         provider.sendUserMessage(message);
+    }
+
+    private void addNativeSignalMarkerIndicator() {
+        Layer1ApiUserMessageModifyIndicator message = Layer1ApiUserMessageModifyIndicator
+                .builder(PaxOpeningRangeModule.class, SIGNAL_MARKER_INDICATOR_NAME)
+                .setIsAdd(true)
+                .setIndicatorColorScheme(signalMarkerColorScheme())
+                .setGraphType(GraphType.PRIMARY)
+                .setIndicatorLineStyle(IndicatorLineStyle.NONE)
+                .setOnlineCalculatable(nativeSignalMarkers)
+                .setIconLayerRanderPriotity(LayerRenderPriority.ABSOLUTE_TOP)
+                .setIsLineEnabledByDefault(false)
+                .build();
+        synchronized (markerIndicatorFullNameToUserName) {
+            markerIndicatorFullNameToUserName.put(message.fullName, message.userName);
+        }
+        provider.sendUserMessage(message);
+    }
+
+    private static IndicatorColorScheme signalMarkerColorScheme() {
+        return new IndicatorColorScheme() {
+            @Override
+            public ColorDescription[] getColors() {
+                return new ColorDescription[] {
+                        new ColorDescription(PaxOpeningRangeModule.class,
+                                SIGNAL_MARKER_COLOR_NAME, Color.WHITE, false)
+                };
+            }
+
+            @Override
+            public String getColorFor(Double value) {
+                return SIGNAL_MARKER_COLOR_NAME;
+            }
+
+            @Override
+            public ColorIntervalResponse getColorIntervalsList(double valueFrom, double valueTo) {
+                return new ColorIntervalResponse(new String[] { SIGNAL_MARKER_COLOR_NAME },
+                        new double[] {});
+            }
+        };
     }
 
     private static LocalDateTime toLocalDateTime(long nanos) {
@@ -433,6 +532,59 @@ public class PaxOpeningRangeModule implements
             range = range.include(trades.lastPrice * pips);
         }
         return range;
+    }
+
+    private final class NativeSignalMarkerIndicator implements OnlineCalculatable {
+        private final Map<String, Consumer<Object>> consumersByAlias = new ConcurrentHashMap<>();
+
+        @Override
+        public void calculateValuesInRange(String indicatorName, String alias, long t0,
+                long intervalWidth, int intervalsNumber, CalculatedResultListener listener) {
+            listener.setCompleted();
+        }
+
+        @Override
+        public OnlineValueCalculatorAdapter createOnlineValueCalculator(String indicatorName,
+                String indicatorAlias, long time, Consumer<Object> listener,
+                InvalidateInterface invalidateInterface) {
+            consumersByAlias.put(indicatorAlias, listener);
+            return new OnlineValueCalculatorAdapter() {};
+        }
+
+        boolean publish(String symbol, double pips, PaxOpeningRangeFeatureSnapshot snapshot) {
+            if (snapshot == null || snapshot.market() == null || snapshot.signal() == null) {
+                return false;
+            }
+            Consumer<Object> consumer = consumersByAlias.get(symbol);
+            if (consumer == null) {
+                return false;
+            }
+            PaxTrendSignalModel.Kind kind = openingRangeMarkerKind(snapshot.signal());
+            if (!kind.isRenderable() || !Double.isFinite(pips) || pips <= 0.0) {
+                return false;
+            }
+            double price = snapshot.market().lastPrice();
+            if (!Double.isFinite(price) || price <= 0.0) {
+                return false;
+            }
+            BufferedImage icon = signalMarkerIcon(kind);
+            int xOffset = -icon.getWidth() / 2;
+            int yOffset = kind.isBull() ? 4 : -icon.getHeight() - 4;
+            consumer.accept(new Marker(price / pips, xOffset, yOffset, icon));
+            try {
+                Log.info("OpenRange native signal marker emitted"
+                        + " symbol=" + symbol
+                        + " bias=" + snapshot.signal().bias()
+                        + " confidence=" + snapshot.signal().confidence()
+                        + " price=" + price
+                        + " dataPrice=" + (price / pips));
+            } catch (Throwable ignored) { /* Log unavailable in tests */ }
+            return true;
+        }
+
+        void clear() {
+            consumersByAlias.clear();
+        }
     }
 
     @Override
@@ -806,13 +958,14 @@ public class PaxOpeningRangeModule implements
         volatile long fallbackLoadedAtMs;
         volatile String fallbackCsvPath = "";
         volatile String fallbackLoggedKey = "";
-        // Trend triangle dedup + history. Mutated only by PaxPainter.update()
+        // Triangle marker dedup + history. Mutated only by PaxPainter.update()
         // (Bookmap callback thread). The deque holds visible triangle events
         // so a full `clear()` + redraw on every repaint preserves the chart
         // across pans/zooms. Cap at 8 keeps the chart readable.
         final Deque<TrendTriangleEvent> liveTriangles = new ArrayDeque<>(MAX_LIVE_TRIANGLES + 1);
         String lastEmittedKind = "";
         long lastEmittedBucketEnteredMs = 0L;
+        String lastNativeSignalMarkerKey = "";
 
         InstrumentState(InstrumentInfo info, double pips, PaxOpeningRangeSettings settings) {
             this.info = info;
@@ -857,6 +1010,7 @@ public class PaxOpeningRangeModule implements
                 setWaitingSignal();
                 this.orderFlowDate = null;
                 this.lastRepaintTime = 0;
+                this.lastNativeSignalMarkerKey = "";
             }
         }
 
@@ -890,6 +1044,17 @@ public class PaxOpeningRangeModule implements
                 if (day.isComplete()) {
                     signalLogger.logIfChanged(info.symbol, time, day.getHigh(), day.getLow(), snapshot.market(), snapshot.signal());
                 }
+                publishNativeSignalMarkerIfNeeded(snapshot);
+            }
+        }
+
+        private void publishNativeSignalMarkerIfNeeded(PaxOpeningRangeFeatureSnapshot snapshot) {
+            String key = openingRangeMarkerKey(info.symbol, snapshot);
+            if (key.isEmpty() || key.equals(lastNativeSignalMarkerKey)) {
+                return;
+            }
+            if (nativeSignalMarkers.publish(info.symbol, pips, snapshot)) {
+                lastNativeSignalMarkerKey = key;
             }
         }
 
@@ -1145,8 +1310,8 @@ public class PaxOpeningRangeModule implements
             }
         }
 
-        /** Trend triangle shapes only. Fired on trendSignalDirty so a fresh
-         *  eligible signal renders immediately without rebuilding OR lines. */
+        /** Dashboard conviction triangle shapes only. OpenRange buy/sell
+         *  markers are emitted through the native Indicator API. */
         synchronized void updateTriangles() {
             InstrumentState state = instruments.get(alias);
             if (state == null) return;
@@ -1606,6 +1771,13 @@ public class PaxOpeningRangeModule implements
         graphics.drawString(glyph, 2, baselineY);
         graphics.dispose();
         return new PreparedImage(image);
+    }
+
+    static BufferedImage signalMarkerIcon(PaxTrendSignalModel.Kind kind) {
+        int fontSize = kind != null && kind.isStrong()
+                ? TRIANGLE_FONT_STRONG
+                : TRIANGLE_FONT_WEAK;
+        return trendGlyphImage(kind, fontSize).getReadOnlyImage();
     }
 
     private static PreparedImage labelImage(String text, Color color, int fontSize) {
