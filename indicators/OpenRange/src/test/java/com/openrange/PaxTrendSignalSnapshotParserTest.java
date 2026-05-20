@@ -20,6 +20,8 @@ public class PaxTrendSignalSnapshotParserTest {
         eligibleFlagParsesFalseExplicit();
         missingEligibleFieldDefaultsFalseForSafety();
         blockedReasonAndEventMsSourceParse();
+        paxEnterDecisionOverridesTrendSignalForMarker();
+        paxWaitDoesNotOverrideTrendSignal();
         System.out.println("PaxTrendSignalSnapshotParserTest OK");
     }
 
@@ -74,6 +76,36 @@ public class PaxTrendSignalSnapshotParserTest {
             throw new AssertionError("blockedReason mismatch: " + m.blockedReason);
         if (!"wall_clock_fallback".equals(m.eventMsSource))
             throw new AssertionError("eventMsSource mismatch: " + m.eventMsSource);
+    }
+
+    private static void paxEnterDecisionOverridesTrendSignalForMarker() {
+        String body = ""
+                + "{\"health\":\"ok\",\"alias\":\"NQM6.CME@RITHMIC\","
+                + "\"pax\":{\"decision\":\"ENTER_SHORT_FADE\",\"size_tier\":\"FULL\","
+                + "\"level_label\":\"+1\",\"entry\":28998.5},"
+                + "\"trend_signal\":{\"kind\":\"NONE\",\"mid\":28970.0,\"eligible\":false}"
+                + "}";
+        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1000L);
+        if (m.kind != PaxTrendSignalModel.Kind.STRONG_BEAR)
+            throw new AssertionError("Pax ENTER_SHORT/FULL must map to STRONG_BEAR, got " + m.kind);
+        if (!m.eligible)
+            throw new AssertionError("Pax ENTER marker must be eligible");
+        if (Math.abs(m.mid - 28998.5) > 1e-9)
+            throw new AssertionError("Pax marker must use entry price");
+        if (!"pax_decision".equals(m.eventMsSource))
+            throw new AssertionError("Pax marker source mismatch: " + m.eventMsSource);
+    }
+
+    private static void paxWaitDoesNotOverrideTrendSignal() {
+        String body = ""
+                + "{\"health\":\"ok\","
+                + "\"pax\":{\"decision\":\"WAIT\",\"size_tier\":\"NONE\",\"entry\":0},"
+                + "\"trend_signal\":{\"kind\":\"WEAK_BEAR\",\"mid\":28970.0,"
+                + "\"eventMs\":2,\"eligible\":true}"
+                + "}";
+        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1000L);
+        if (m.kind != PaxTrendSignalModel.Kind.WEAK_BEAR)
+            throw new AssertionError("Pax WAIT must not override trend signal");
     }
 
     private static void healthOfflineSuppressesKind() {

@@ -10,6 +10,7 @@ public class PaxNativeSignalMarkerPolicyTest {
         blockedOrNeutralDoesNotRender();
         markerKeyDedupsLikeSignalLogger();
         markerIconHasPixels();
+        markerIconIncludesPriceBadge();
         System.out.println("PaxNativeSignalMarkerPolicyTest OK");
         System.exit(0);
     }
@@ -65,6 +66,61 @@ public class PaxNativeSignalMarkerPolicyTest {
         if (opaque < 10) {
             throw new AssertionError("native marker icon is transparent");
         }
+    }
+
+    private static void markerIconIncludesPriceBadge() {
+        BufferedImage bull = PaxOpeningRangeModule.signalMarkerIcon(
+                PaxTrendSignalModel.Kind.STRONG_BULL, 28909.25, "TRD");
+        BufferedImage bear = PaxOpeningRangeModule.signalMarkerIcon(
+                PaxTrendSignalModel.Kind.WEAK_BEAR, 28909.25, "OR");
+        if (bull.getWidth() < 60 || bull.getHeight() < 28) {
+            throw new AssertionError("bull marker badge too small for source+price");
+        }
+        if (bear.getWidth() < 60 || bear.getHeight() < 28) {
+            throw new AssertionError("bear marker badge too small for source+price");
+        }
+        int bullCyan = countColorDominant(bull, true);
+        int bearOrange = countOrangeDominant(bear);
+        if (bullCyan <= 0) {
+            throw new AssertionError("bull marker must contain cyan-dominant pixels");
+        }
+        if (bearOrange <= 0) {
+            throw new AssertionError("bear marker must contain orange-dominant pixels");
+        }
+    }
+
+    private static int countColorDominant(BufferedImage image, boolean cyan) {
+        int hits = 0;
+        for (int x = 0; x < image.getWidth(); x++) {
+            for (int y = 0; y < image.getHeight(); y++) {
+                int rgb = image.getRGB(x, y);
+                int alpha = (rgb >>> 24) & 0xFF;
+                int red = (rgb >>> 16) & 0xFF;
+                int green = (rgb >>> 8) & 0xFF;
+                int blue = rgb & 0xFF;
+                if (alpha >= 180 && cyan && blue > red + 60 && green > red + 40) {
+                    hits++;
+                }
+            }
+        }
+        return hits;
+    }
+
+    private static int countOrangeDominant(BufferedImage image) {
+        int hits = 0;
+        for (int x = 0; x < image.getWidth(); x++) {
+            for (int y = 0; y < image.getHeight(); y++) {
+                int rgb = image.getRGB(x, y);
+                int alpha = (rgb >>> 24) & 0xFF;
+                int red = (rgb >>> 16) & 0xFF;
+                int green = (rgb >>> 8) & 0xFF;
+                int blue = rgb & 0xFF;
+                if (alpha >= 180 && red > blue + 80 && green > blue + 40) {
+                    hits++;
+                }
+            }
+        }
+        return hits;
     }
 
     private static PaxOpeningRangeSignal signal(PaxOpeningRangeSignalAction action,

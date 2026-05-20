@@ -48,6 +48,10 @@ final class PaxTrendSignalSnapshotParser {
         if (healthObj instanceof String && !"ok".equalsIgnoreCase((String) healthObj)) {
             return PaxTrendSignalModel.none(fetchedAtMs);
         }
+        PaxTrendSignalModel paxMarker = paxDecisionMarker(root, fetchedAtMs);
+        if (paxMarker != null) {
+            return paxMarker;
+        }
         Map<?, ?> ts = asMap(root.get("trend_signal"));
         if (ts == null) {
             // Missing entirely (older dashboard, error path) → NONE.
@@ -76,6 +80,41 @@ final class PaxTrendSignalSnapshotParser {
     }
 
     // ─── Shape helpers ─────────────────────────────────────────────────────
+
+    private static PaxTrendSignalModel paxDecisionMarker(Map<?, ?> root, long fetchedAtMs) {
+        Map<?, ?> pax = asMap(root.get("pax"));
+        if (pax == null) {
+            return null;
+        }
+        String decision = asString(pax.get("decision"));
+        if (decision == null || !decision.startsWith("ENTER_")) {
+            return null;
+        }
+        String sizeTier = asString(pax.get("size_tier"));
+        if (!"FULL".equals(sizeTier) && !"HALF".equals(sizeTier)) {
+            return null;
+        }
+        Double entry = asDouble(pax.get("entry"));
+        if (entry == null || entry.doubleValue() <= 0.0) {
+            return null;
+        }
+        boolean isLong = decision.contains("LONG");
+        boolean isShort = decision.contains("SHORT");
+        if (!isLong && !isShort) {
+            return null;
+        }
+        boolean strong = "FULL".equals(sizeTier);
+        PaxTrendSignalModel.Kind kind = isLong
+                ? (strong ? PaxTrendSignalModel.Kind.STRONG_BULL : PaxTrendSignalModel.Kind.WEAK_BULL)
+                : (strong ? PaxTrendSignalModel.Kind.STRONG_BEAR : PaxTrendSignalModel.Kind.WEAK_BEAR);
+        String alias = asString(root.get("alias"));
+        String level = asString(pax.get("level_label"));
+        String key = decision + "|" + (level == null ? "" : level) + "|" + sizeTier;
+        long bucket = Integer.toUnsignedLong(key.hashCode());
+        return new PaxTrendSignalModel(kind, alias, entry.doubleValue(),
+                fetchedAtMs, fetchedAtMs, bucket, true, fetchedAtMs,
+                true, decision, "pax_decision");
+    }
 
     private static Map<?, ?> asMap(Object o) {
         return (o instanceof Map) ? (Map<?, ?>) o : null;

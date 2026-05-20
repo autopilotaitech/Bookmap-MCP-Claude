@@ -1,6 +1,7 @@
 package com.openrange;
 
 import java.awt.Color;
+import java.awt.BasicStroke;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Font;
@@ -294,7 +295,7 @@ public class PaxOpeningRangeModule implements
     @Override
     public void onInstrumentAdded(String alias, InstrumentInfo instrumentInfo) {
         double pips = instrumentInfo.pips <= 0 ? 1 : instrumentInfo.pips;
-        InstrumentState state = new InstrumentState(instrumentInfo, pips, getCalculatorSettings());
+        InstrumentState state = new InstrumentState(alias, instrumentInfo, pips, getCalculatorSettings());
         instruments.put(alias, state);
         backfill(alias);
         PaxPainter painter = painters.get(alias);
@@ -397,7 +398,7 @@ public class PaxOpeningRangeModule implements
                 .setIndicatorLineStyle(IndicatorLineStyle.NONE)
                 .setOnlineCalculatable(nativeSignalMarkers)
                 .setIconLayerRanderPriotity(LayerRenderPriority.ABSOLUTE_TOP)
-                .setIsLineEnabledByDefault(false)
+                .setIsLineEnabledByDefault(true)
                 .build();
         synchronized (markerIndicatorFullNameToUserName) {
             markerIndicatorFullNameToUserName.put(message.fullName, message.userName);
@@ -557,6 +558,9 @@ public class PaxOpeningRangeModule implements
             }
             Consumer<Object> consumer = consumersByAlias.get(symbol);
             if (consumer == null) {
+                try {
+                    Log.info("OpenRange native signal marker skipped reason=no_consumer alias=" + symbol);
+                } catch (Throwable ignored) { /* Log unavailable in tests */ }
                 return false;
             }
             PaxTrendSignalModel.Kind kind = openingRangeMarkerKind(snapshot.signal());
@@ -567,9 +571,9 @@ public class PaxOpeningRangeModule implements
             if (!Double.isFinite(price) || price <= 0.0) {
                 return false;
             }
-            BufferedImage icon = signalMarkerIcon(kind);
+            BufferedImage icon = signalMarkerIcon(kind, price, "OR");
             int xOffset = -icon.getWidth() / 2;
-            int yOffset = kind.isBull() ? 4 : -icon.getHeight() - 4;
+            int yOffset = kind.isBull() ? 12 : -icon.getHeight() - 12;
             consumer.accept(new Marker(price / pips, xOffset, yOffset, icon));
             try {
                 Log.info("OpenRange native signal marker emitted"
@@ -578,6 +582,35 @@ public class PaxOpeningRangeModule implements
                         + " confidence=" + snapshot.signal().confidence()
                         + " price=" + price
                         + " dataPrice=" + (price / pips));
+            } catch (Throwable ignored) { /* Log unavailable in tests */ }
+            return true;
+        }
+
+        boolean publishTrend(String alias, double pips, PaxTrendSignalModel signal) {
+            if (signal == null || signal.kind == null || !signal.kind.isRenderable()
+                    || !Double.isFinite(pips) || pips <= 0.0
+                    || !Double.isFinite(signal.mid) || signal.mid <= 0.0) {
+                return false;
+            }
+            Consumer<Object> consumer = consumersByAlias.get(alias);
+            if (consumer == null) {
+                try {
+                    Log.info("OpenRange native trend marker skipped reason=no_consumer alias=" + alias);
+                } catch (Throwable ignored) { /* Log unavailable in tests */ }
+                return false;
+            }
+            String source = signal.eventMsSource != null && signal.eventMsSource.startsWith("pax_decision")
+                    ? "PAX" : "TRD";
+            BufferedImage icon = signalMarkerIcon(signal.kind, signal.mid, source);
+            int xOffset = -icon.getWidth() / 2;
+            int yOffset = signal.kind.isBull() ? 12 : -icon.getHeight() - 12;
+            consumer.accept(new Marker(signal.mid / pips, xOffset, yOffset, icon));
+            try {
+                Log.info("OpenRange native trend marker emitted"
+                        + " alias=" + alias
+                        + " kind=" + signal.kind
+                        + " mid=" + signal.mid
+                        + " dataPrice=" + (signal.mid / pips));
             } catch (Throwable ignored) { /* Log unavailable in tests */ }
             return true;
         }
@@ -926,6 +959,7 @@ public class PaxOpeningRangeModule implements
     }
 
     private final class InstrumentState {
+        final String alias;
         final InstrumentInfo info;
         final double pips;
         final Object lock = new Object();
@@ -967,7 +1001,8 @@ public class PaxOpeningRangeModule implements
         long lastEmittedBucketEnteredMs = 0L;
         String lastNativeSignalMarkerKey = "";
 
-        InstrumentState(InstrumentInfo info, double pips, PaxOpeningRangeSettings settings) {
+        InstrumentState(String alias, InstrumentInfo info, double pips, PaxOpeningRangeSettings settings) {
+            this.alias = alias;
             this.info = info;
             this.pips = pips;
             this.calculator = new PaxOpeningRangeCalculator(settings, info.symbol, pips);
@@ -1049,11 +1084,11 @@ public class PaxOpeningRangeModule implements
         }
 
         private void publishNativeSignalMarkerIfNeeded(PaxOpeningRangeFeatureSnapshot snapshot) {
-            String key = openingRangeMarkerKey(info.symbol, snapshot);
+            String key = openingRangeMarkerKey(alias, snapshot);
             if (key.isEmpty() || key.equals(lastNativeSignalMarkerKey)) {
                 return;
             }
-            if (nativeSignalMarkers.publish(info.symbol, pips, snapshot)) {
+            if (nativeSignalMarkers.publish(alias, pips, snapshot)) {
                 lastNativeSignalMarkerKey = key;
             }
         }
@@ -1407,6 +1442,7 @@ public class PaxOpeningRangeModule implements
                 state.lastEmittedKind = signal.kind.name();
                 state.lastEmittedBucketEnteredMs = signal.bucketEnteredMs;
                 emitted = true;
+                nativeSignalMarkers.publishTrend(alias, state.pips, signal);
             }
             // Redraw every live triangle. update() called clear() at top,
             // so each refresh re-adds the deque contents.
@@ -1774,10 +1810,85 @@ public class PaxOpeningRangeModule implements
     }
 
     static BufferedImage signalMarkerIcon(PaxTrendSignalModel.Kind kind) {
-        int fontSize = kind != null && kind.isStrong()
-                ? TRIANGLE_FONT_STRONG
-                : TRIANGLE_FONT_WEAK;
-        return trendGlyphImage(kind, fontSize).getReadOnlyImage();
+        return signalMarkerIcon(kind, Double.NaN, "SIG");
+    }
+
+    static BufferedImage signalMarkerIcon(PaxTrendSignalModel.Kind kind, double price, String source) {
+        if (kind == null || kind == PaxTrendSignalModel.Kind.NONE) {
+            return new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB);
+        }
+        String safeSource = source == null || source.isBlank() ? "SIG" : source.trim();
+        if (safeSource.length() > 4) {
+            safeSource = safeSource.substring(0, 4);
+        }
+        String priceText = Double.isFinite(price) && price > 0.0
+                ? markerPriceText(price)
+                : "";
+        String header = safeSource + (kind.isStrong() ? "!" : "");
+
+        Font headerFont = new Font(Font.SANS_SERIF, Font.BOLD, 10);
+        Font priceFont = new Font(Font.SANS_SERIF, Font.BOLD, 11);
+        BufferedImage scratch = new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D sg = scratch.createGraphics();
+        sg.setFont(headerFont);
+        FontMetrics headerMetrics = sg.getFontMetrics();
+        int headerWidth = headerMetrics.stringWidth(header);
+        sg.setFont(priceFont);
+        FontMetrics priceMetrics = sg.getFontMetrics();
+        int priceWidth = priceMetrics.stringWidth(priceText);
+        sg.dispose();
+
+        int iconBox = 16;
+        int gap = 4;
+        int padX = 6;
+        int padY = 4;
+        int textWidth = Math.max(headerWidth, priceWidth);
+        int width = Math.max(54, padX * 2 + iconBox + gap + textWidth);
+        int height = 32;
+        BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = image.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+
+        Color accent = kind.isBull()
+                ? new Color(0, 210, 255, kind.isStrong() ? 255 : 220)
+                : new Color(255, 155, 36, kind.isStrong() ? 255 : 220);
+        Color background = new Color(6, 10, 14, 218);
+        Color border = new Color(accent.getRed(), accent.getGreen(), accent.getBlue(), 230);
+        g.setColor(background);
+        g.fillRoundRect(0, 0, width - 1, height - 1, 7, 7);
+        g.setStroke(new BasicStroke(kind.isStrong() ? 2.0f : 1.4f));
+        g.setColor(border);
+        g.drawRoundRect(1, 1, width - 3, height - 3, 7, 7);
+
+        int cx = padX + iconBox / 2;
+        int top = 8;
+        int bottom = 22;
+        g.setColor(accent);
+        if (kind.isBull()) {
+            g.fillPolygon(new int[] {cx, cx - 7, cx + 7}, new int[] {top, bottom, bottom}, 3);
+        } else {
+            g.fillPolygon(new int[] {cx - 7, cx + 7, cx}, new int[] {top, top, bottom}, 3);
+        }
+
+        int textX = padX + iconBox + gap;
+        g.setFont(headerFont);
+        g.setColor(accent);
+        g.drawString(header, textX, 12);
+        if (!priceText.isEmpty()) {
+            g.setFont(priceFont);
+            g.setColor(new Color(232, 238, 243, 245));
+            g.drawString(priceText, textX, 25);
+        }
+        g.dispose();
+        return image;
+    }
+
+    private static String markerPriceText(double price) {
+        if (Math.abs(price) >= 1000.0) {
+            return String.format(java.util.Locale.US, "%.2f", price);
+        }
+        return String.format(java.util.Locale.US, "%.4f", price);
     }
 
     private static PreparedImage labelImage(String text, Color color, int fontSize) {
