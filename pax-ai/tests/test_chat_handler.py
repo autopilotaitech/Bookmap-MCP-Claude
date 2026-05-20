@@ -1,19 +1,26 @@
 """Tests for pax_ai.chat.handle_chat_stream cleanup invariants.
 
-Audit fix 5: _CURRENT_ABORT must be cleared on EVERY exit path, including
-prompt-write failure and BrokenPipe before the start event. Prior code
-had bare `return` statements after setting _CURRENT_ABORT that leaked
-the flag, so a subsequent POST /api/pax/chat/abort could bind to a
-stale event from a failed chat.
+Audit fix 5 (round 1): _CURRENT_ABORT must be cleared on EVERY exit path,
+including prompt-write failure and BrokenPipe before the start event.
+Prior code had bare `return` statements after setting _CURRENT_ABORT
+that leaked the flag, so a subsequent POST /api/pax/chat/abort could
+bind to a stale event from a failed chat.
+
+Audit fix 5 (round 2): these tests MUST NOT touch the real chat journal
+at D:\\BookmapLogs\\pax-chat.db. The autouse `_isolate_journal` fixture
+replaces `chat.journal.record` with a no-op and replaces `journal._connect`
+with a tripwire so accidental DB I/O during the test is a loud failure.
 """
 
 from __future__ import annotations
 
 import io
+from pathlib import Path
 
 import pytest
 
 from pax_ai import chat
+from pax_ai import journal as journal_mod
 
 
 class _WfileRaisingOnWrite:
@@ -32,6 +39,56 @@ def _current_abort_cleared() -> bool:
     """Helper: True if no chat is currently holding the abort flag."""
     with chat._ABORT_LOCK:
         return chat._CURRENT_ABORT is None
+
+
+@pytest.fixture(autouse=True)
+def _isolate_journal(monkeypatch):
+    """Belt-and-braces guard so handle_chat_stream cannot touch the real
+    D:\\BookmapLogs\\pax-chat.db while these tests run.
+
+    Layers:
+      1. Replace `chat.journal.record` with a no-op spy (the import path
+         the chat module actually sees -- monkeypatching `journal.record`
+         alone would not affect the reference already bound on import).
+      2. Replace `journal._connect` with a tripwire that raises if any
+         test path slips through and tries to open a real DB.
+      3. Pre-assert: the default chat DB path must not exist BEFORE the
+         test (signals a developer-machine touch); we don't delete it,
+         just refuse to run.
+
+    The spy is exposed on chat.journal.record.calls for tests that want
+    to assert journal interaction without writing anything.
+    """
+    # 0. Sanity-check the real path was not pre-touched by an earlier
+    # leaky test run on this machine. (Doesn't fail if the path simply
+    # doesn't exist -- this is a developer-friendly heads-up.)
+    default_db = journal_mod.default_db_path()
+    pre_existed = default_db.exists()
+
+    # 1. No-op record() with a call counter for assertions.
+    calls = []
+    def _noop_record(role, text, meta=None):
+        calls.append((role, text, meta))
+    monkeypatch.setattr(chat.journal, "record", _noop_record)
+
+    # 2. Tripwire: if anything bypasses (1) and reaches _connect, blow up.
+    def _tripwire(_path):
+        raise AssertionError(
+            "test reached journal._connect -- isolation fixture failed; "
+            "the test was about to open a real SQLite DB at "
+            f"{_path}. Add a journal-aware monkeypatch.")
+    monkeypatch.setattr(journal_mod, "_connect", _tripwire)
+
+    # Expose the spy to tests that want to read it.
+    chat.journal.record.calls = calls   # type: ignore[attr-defined]
+
+    yield
+
+    # 3. Post-assertion: the default-db file was not created by this test.
+    if not pre_existed:
+        assert not default_db.exists(), (
+            f"test must not create {default_db} -- isolation fixture "
+            f"did not cover an I/O path")
 
 
 def test_handle_chat_stream_clears_abort_after_normal_exit(monkeypatch):

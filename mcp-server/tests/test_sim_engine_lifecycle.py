@@ -291,7 +291,17 @@ def test_eod_auto_flatten_fires_after_rth_close(db_path):
 
     # Open a position by filling a normal limit BUY (in-RTH wall-clock so
     # EOD does NOT fire on this tick).
-    eng.place_limit("BUY", qty=1, limit=100.50, role="ENTRY", reason="setup")
+    #
+    # `tif_sec=None` disables this order's TIF expiry. The order's
+    # `placed_ms` is the REAL wall-clock at this Python instruction; the
+    # tick's `now_ms` is the SIMULATED in_rth_ms (today at 11:00 CT). If
+    # pytest happens to run before 11:00 CT, `in_rth_ms - placed_ms`
+    # spans hours, blowing past the default 90-second TIF and cancelling
+    # the entry before fill. Disabling TIF (NULL in the DB) makes this
+    # test deterministic regardless of when the suite runs. Production
+    # behaviour is unaffected -- only this test order opts out.
+    eng.place_limit("BUY", qty=1, limit=100.50, role="ENTRY",
+                     reason="setup", tif_sec=None)
     eng.tick(_snap("TEST", 100.50, nanos=1_000_000_000_000, side="sell"),
               now_ms=in_rth_ms)
     pos = eng.snapshot()["position"]

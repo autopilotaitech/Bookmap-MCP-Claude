@@ -70,6 +70,14 @@ STALE_ANCHOR_PHRASES = [
     'Outside 08:30 – 15:00',
     'Outside 08:30 - 15:00',
     'pre-08:35',
+    # Round 2 audit: any wording that frames the active OR as RTH must
+    # also be absent. RTH is only acceptable inside the §1.2 "historical
+    # context only -- NOT the active anchor" paragraph and inside Volume
+    # Profile / VWAP component-field documentation. The phrases below
+    # specifically frame the live anchor, so they must NEVER appear.
+    "When RTH opens",
+    "Regular Trading Hours",
+    "of Regular Trading Hours",
 ]
 
 
@@ -96,3 +104,55 @@ def test_render_system_prompt_states_operator_anchor_is_authoritative():
         "when anchorMode != LIVE")
     # And there must be language disclaiming the historical RTH table.
     assert "historical context only" in body or "historical reference only" in body
+
+
+def test_render_system_prompt_defines_or_as_operator_configured_static_or():
+    """Round 2 audit positive assertion: §1 must define the OR as the
+    operator-configured Static OR, not as RTH."""
+    body = prompts.render_system_prompt()
+    assert "operator-configured Static OR" in body, (
+        "skill §1 must define OR as the operator-configured Static OR, "
+        "not as RTH")
+    # When/if-the-OR-window-opens replaces "When RTH opens".
+    assert ("configured OR window opens" in body), (
+        "the institutional-flow paragraph must trigger on the configured "
+        "OR window opening, not on RTH opening")
+
+
+# ---------------------------------------------------------------------------
+# Round 2 audit fix 2: HFT skill must NOT push Pax AI into JSON-only mode.
+# ---------------------------------------------------------------------------
+
+def test_render_system_prompt_no_router_mode_selector():
+    """The old HFT skill used 'If the USER MESSAGE began with ROUTER...
+    you are in mode 1' to switch into JSON output. prompts.route() can
+    legitimately make hft_microstructure_quant_v1 the primary skill on
+    keywords like 'tape' or 'iceberg', so that selector would coerce
+    Pax AI into JSON. The selector text must NOT appear anywhere in
+    the rendered prompt."""
+    body = prompts.render_system_prompt()
+    assert "If the USER MESSAGE began with" not in body, (
+        "rendered prompt must not contain the router-primary-as-mode-selector "
+        "phrasing -- it can flip Pax AI to JSON-only on a normal query")
+    assert "you are in mode 1" not in body, (
+        "the 'mode 1' selector phrase must be gone")
+
+
+def test_render_system_prompt_no_unconditional_output_only_json():
+    """The literal instruction 'Output only JSON' must not appear in the
+    rendered prompt. Mentioning JSON output as an EXTERNAL contract is
+    fine; an unconditional command to Claude is not."""
+    body = prompts.render_system_prompt()
+    assert "Output only JSON" not in body, (
+        "unconditional 'Output only JSON' instruction must not survive in "
+        "the rendered system prompt -- it can be interpreted as Pax AI's "
+        "output mode")
+
+
+def test_render_system_prompt_pax_ai_json_exclusion_is_explicit():
+    """The HFT skill must explicitly tell the agent that JSON mode is
+    never Pax AI's output. Either 'never Pax AI' or 'never Pax AI's
+    output' is acceptable phrasing."""
+    body = prompts.render_system_prompt()
+    assert "never Pax AI" in body or "never** Pax AI" in body, (
+        "HFT skill must explicitly disclaim Pax AI as a JSON-output context")

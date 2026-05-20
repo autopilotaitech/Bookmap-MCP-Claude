@@ -13,7 +13,9 @@ This skill encodes the methodology so a dedicated agent (Claude CLI) can call th
 
 ## 1. The Opening Range — what it is, why it matters
 
-The Opening Range (OR) is the high and low of a short open-window of Regular Trading Hours. The reasoning is mechanical, not mystical. When RTH opens, the institutional algos switch on and slam in their initial allocations. Their first seconds of price discovery is where they print position. That window sets the line in the sand for the day. Once the OR is set:
+The Opening Range (OR) is the high and low of the **operator-configured Static OR window** — the open time, timezone, and duration that the trader set in the OpenRange Bookmap indicator. The active anchor is NOT a hardcoded clock time. It is whatever `snap.session.anchorHHMM` + `snap.session.anchorTimezone` + `snap.session.anchorRangeSeconds` resolve to at the moment of the read (see §1.1 for the field list).
+
+The reasoning is mechanical, not mystical. When the configured OR window opens, the institutional algos switch on and slam in their initial allocations. Their first seconds of price discovery is where they print position. That window sets the line in the sand for the day. Once the OR is set:
 
 - Above OR-High → the algos are net-long-leaning; sustained bids confirm.
 - Below OR-Low → the algos are net-short-leaning; sustained offers confirm.

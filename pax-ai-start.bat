@@ -12,6 +12,12 @@ REM Server-only mode is useful for headless smoke tests, CI, and
 REM curl-driven debugging. The Bookmap PaxAILauncher addon also starts
 REM Pax AI in --shell mode internally (see indicators/PaxAILauncher/),
 REM so this launcher is for manual / standalone runs.
+REM
+REM Health probe semantics (both modes share the same probe):
+REM   * Pax AI is "UP" when GET /api/pax/health returns 200.
+REM   * Dashboard reachability is reported SEPARATELY from the JSON
+REM     `dashboardReachable` field. Dashboard-down does NOT mark Pax AI
+REM     as failed -- only the Pax AI process itself does.
 
 setlocal
 
@@ -40,16 +46,20 @@ if /i "%MODE%"=="shell" (
   start "Pax AI :%PORT% (server-only)" "%PY%" -B -u -m pax_ai --port %PORT%
 )
 
-REM Give the server a moment, then probe.
+REM Give the server a moment, then probe Pax AI's own health endpoint.
+REM /api/pax/health returns 200 whenever the Pax AI HTTP server is up,
+REM independent of dashboard reachability. The JSON body reports
+REM dashboardReachable + claudeAvailable separately so we can surface
+REM degradations without flagging Pax AI itself as failed.
 timeout /t 2 /nobreak >nul
-"%PY%" -c "import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:%PORT%/api/snapshot',timeout=3); sys.stderr.write('[pax-ai] proxy probe OK status=%%d\n' %% r.status)" 2>nul
+"%PY%" -c "import urllib.request,json,sys; r=urllib.request.urlopen('http://127.0.0.1:%PORT%/api/pax/health',timeout=3); b=json.loads(r.read()); sys.stderr.write('[pax-ai] health probe OK status=%%d dashReachable=%%s claudeAvailable=%%s\n' %% (r.status, b.get('dashboardReachable'), b.get('claudeAvailable')))" 2>nul
 if errorlevel 1 (
-  echo [pax-ai] probe failed -- check the new window for errors
+  echo [pax-ai] health probe failed -- Pax AI process is not responding on :%PORT%, check the new window for errors
 ) else (
   if /i "%MODE%"=="shell" (
-    echo [pax-ai] proxy probe OK; floating window should be visible
+    echo [pax-ai] Pax AI UP; floating window should be visible
   ) else (
-    echo [pax-ai] proxy probe OK; open http://127.0.0.1:%PORT%/ in your browser
+    echo [pax-ai] Pax AI UP; open http://127.0.0.1:%PORT%/ in your browser
   )
 )
 
