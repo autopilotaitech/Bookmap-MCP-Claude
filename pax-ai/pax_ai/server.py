@@ -27,7 +27,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 from . import DASHBOARD_URL, DEFAULT_PORT
 from . import poller, context as ctx_mod, edge_calculus, playbook, config
@@ -335,7 +335,12 @@ class _Handler(BaseHTTPRequestHandler):
                 status, body = _api_pax_health()
                 self._send_json(status, body); return
             if path.startswith("/api/pax/level/"):
-                label = path[len("/api/pax/level/"):]
+                # URL-decode the segment. Snapshot labels include '+'
+                # (`+1` / `+2` / `+3`), which the UI rightly encodes as
+                # `%2B` per RFC 3986 -- otherwise '+' inside a path
+                # could be misread as a space by some clients. Decode
+                # before comparing to snapshot labels.
+                label = unquote(path[len("/api/pax/level/"):])
                 status, body = _api_pax_level(label)
                 self._send_json(status, body); return
             if path == "/api/pax/chat/history":

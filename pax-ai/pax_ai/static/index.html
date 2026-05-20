@@ -533,7 +533,24 @@ async function pollLevel(label) {
   if (!label) { target.textContent = 'no active level in proximity'; return; }
   try {
     const r = await fetch('/api/pax/level/' + encodeURIComponent(label), {cache:'no-store'});
-    if (!r.ok) { target.textContent = 'level ' + label + ' not found'; return; }
+    if (!r.ok) {
+      // Surface the server-side error envelope so a URL-encoding
+      // mismatch is diagnosable from the panel instead of silently
+      // showing "not found". Falls back to the legacy message if the
+      // body is not parseable JSON.
+      let detail = '';
+      try {
+        const errJson = await r.json();
+        if (errJson && errJson.available) {
+          detail = ' / available: ' + errJson.available.join(',');
+        }
+        if (errJson && errJson.error) {
+          detail = ' (server saw "' + errJson.error.replace(/^level not found: /, '') + '")' + detail;
+        }
+      } catch (e) { /* keep detail empty on parse failure */ }
+      target.textContent = 'level ' + label + ' not found' + detail;
+      return;
+    }
     const j = await r.json();
     const e = j.edge_calculus || {};
     // Numeric fields are .toFixed(...) -> safe, but string fields (label,
