@@ -119,7 +119,9 @@ def test_middle_lock_no_fire_on_steady_state():
 
 def test_trend_signal_strong_bull_eligible_fires():
     s = _live_snap_base()
-    s["trend_signal"] = {"kind": "STRONG_BULL", "eligible": True, "mid": 21330.0,
+    s["trend_signal"] = {"kind": "STRONG_BULL", "eligible": True,
+                          "changedSinceLastTick": True,
+                          "bucketEnteredMs": 1000, "mid": 21330.0,
                           "eventMsSource": "trend_analyzer"}
     t = triggers.compute_triggers(s, 100)
     fire = next((x for x in t if x["kind"] == "TREND_SIGNAL_FIRE"), None)
@@ -127,20 +129,64 @@ def test_trend_signal_strong_bull_eligible_fires():
     assert fire["severity"] == "HIGH"
 
 
+def test_trend_signal_weak_bear_is_med_severity():
+    s = _live_snap_base()
+    s["trend_signal"] = {"kind": "WEAK_BEAR", "eligible": True,
+                          "changedSinceLastTick": True,
+                          "bucketEnteredMs": 2000, "mid": 21330.0}
+    t = triggers.compute_triggers(s, 100)
+    fire = next((x for x in t if x["kind"] == "TREND_SIGNAL_FIRE"), None)
+    assert fire is not None and fire["severity"] == "MED"
+
+
 def test_trend_signal_not_eligible_does_not_fire():
     s = _live_snap_base()
-    s["trend_signal"] = {"kind": "STRONG_BULL", "eligible": False, "mid": 21330.0}
+    s["trend_signal"] = {"kind": "STRONG_BULL", "eligible": False,
+                          "changedSinceLastTick": True,
+                          "bucketEnteredMs": 1000, "mid": 21330.0}
     t = triggers.compute_triggers(s, 100)
     assert all(x["kind"] != "TREND_SIGNAL_FIRE" for x in t)
 
 
-def test_trend_signal_same_kind_does_not_fire_twice():
+def test_trend_signal_no_change_flag_does_not_fire():
     s = _live_snap_base()
-    s["trend_signal"] = {"kind": "STRONG_BULL", "eligible": True, "mid": 21330.0}
+    s["trend_signal"] = {"kind": "STRONG_BULL", "eligible": True,
+                          "changedSinceLastTick": False,
+                          "bucketEnteredMs": 1000, "mid": 21330.0}
+    t = triggers.compute_triggers(s, 100)
+    assert all(x["kind"] != "TREND_SIGNAL_FIRE" for x in t)
+
+
+def test_trend_signal_same_bucket_does_not_fire_twice():
+    """Two polls with the same bucketEnteredMs must dedup, even if
+    changedSinceLastTick is True on both ticks (defensive)."""
+    s = _live_snap_base()
+    s["trend_signal"] = {"kind": "STRONG_BULL", "eligible": True,
+                          "changedSinceLastTick": True,
+                          "bucketEnteredMs": 1000, "mid": 21330.0}
     t1 = triggers.compute_triggers(s, 100)
     t2 = triggers.compute_triggers(s, 100)
     assert any(x["kind"] == "TREND_SIGNAL_FIRE" for x in t1)
     assert all(x["kind"] != "TREND_SIGNAL_FIRE" for x in t2)
+
+
+def test_trend_signal_new_bucket_refires_within_60s():
+    """Dashboard re-entry (NONE -> BULL past cooldown) emits a new bucket
+    with changedSinceLastTick=True. The detector MUST fire again because
+    the (kind, bucket) dedup key is fresh -- this is the exact regression
+    the user reported in the screenshot."""
+    s = _live_snap_base()
+    s["trend_signal"] = {"kind": "STRONG_BULL", "eligible": True,
+                          "changedSinceLastTick": True,
+                          "bucketEnteredMs": 1000, "mid": 21330.0}
+    t1 = triggers.compute_triggers(s, 100)
+    s["trend_signal"] = {"kind": "STRONG_BULL", "eligible": True,
+                          "changedSinceLastTick": True,
+                          "bucketEnteredMs": 16000, "mid": 21331.0}
+    t2 = triggers.compute_triggers(s, 200)
+    assert any(x["kind"] == "TREND_SIGNAL_FIRE" for x in t1)
+    assert any(x["kind"] == "TREND_SIGNAL_FIRE" for x in t2), (
+        "new bucket must re-fire; this is the screenshot bug")
 
 
 # ---------------------------------------------------------------------------

@@ -159,30 +159,59 @@ def _trig_middle_lock(snap: Dict[str, Any], now_ms: int) -> List[Dict[str, Any]]
     return out
 
 
+_RENDERABLE_TREND_KINDS = ("STRONG_BULL", "WEAK_BULL", "STRONG_BEAR", "WEAK_BEAR")
+
+
 def _trig_trend_signal_fire(snap: Dict[str, Any], now_ms: int) -> List[Dict[str, Any]]:
+    """Fire on dashboard-authoritative "new bucket advanced" events.
+
+    The dashboard's compute_trend_signal exposes:
+      * changedSinceLastTick: True only on the poll where a new renderable
+        bucket advanced (legit transition OR same-kind re-entry past the
+        15s cooldown). This is the spec-canonical "new fire" flag.
+      * bucketEnteredMs: epoch ms when the current renderable bucket began.
+        Used as secondary dedup key so we never re-fire on the same bucket.
+    Prior detector mistakenly required a kind-transition, which silently
+    dropped legit re-entries (BULL -> NONE -> BULL after cooldown). That
+    is the case the user observed: TRD marker fired on the chart, but no
+    Pax AI chip rendered because the dashboard's re-entry kept the same
+    renderable kind.
+    """
     out: List[Dict[str, Any]] = []
     ts = snap.get("trend_signal") or {}
-    cur = ts.get("kind") or "NONE"
+    cur_kind = ts.get("kind") or "NONE"
     eligible = bool(ts.get("eligible"))
-    prev = _STATE.get("prev_trend_kind")
-    _STATE["prev_trend_kind"] = cur
+    changed  = bool(ts.get("changedSinceLastTick"))
+    bucket   = int(ts.get("bucketEnteredMs") or 0)
+    prev_bucket = int(_STATE.get("prev_trend_bucket_ms") or 0)
+    _STATE["prev_trend_kind"] = cur_kind
+    _STATE["prev_trend_bucket_ms"] = bucket
     if not eligible:
         return out
-    if cur not in ("STRONG_BULL", "STRONG_BEAR"):
+    if cur_kind not in _RENDERABLE_TREND_KINDS:
         return out
-    if cur == prev:
+    if not changed:
         return out
-    if not _dedup_ok("TREND_SIGNAL_FIRE", cur, now_ms, DEDUP_BUCKET_MS_DEFAULT):
+    if bucket > 0 and bucket == prev_bucket:
         return out
-    direction = "long" if cur == "STRONG_BULL" else "short"
+    # Dedup is intentionally short (5s) because the dashboard already
+    # debounces re-entries via its 15s cooldown. We dedup by (kind, bucket)
+    # so a bucket advance always slips through even if a previous bucket
+    # of the same kind fired moments ago.
+    dedup_label = f"{cur_kind}@{bucket}"
+    if not _dedup_ok("TREND_SIGNAL_FIRE", dedup_label, now_ms, 5_000):
+        return out
+    direction = "long" if "BULL" in cur_kind else "short"
+    severity = "HIGH" if cur_kind.startswith("STRONG_") else "MED"
     out.append({
         "kind":     "TREND_SIGNAL_FIRE",
-        "severity": "HIGH",
-        "label":    cur,
-        "headline": f"{cur} just fired -- {direction} bias",
-        "details":  f"trend_signal eligible at mid {ts.get('mid')}, "
+        "severity": severity,
+        "label":    cur_kind,
+        "headline": f"{cur_kind} fired -- {direction} bias",
+        "details":  f"trend_signal mid={ts.get('mid')} "
+                      f"bucketEnteredMs={bucket} "
                       f"eventMsSource={ts.get('eventMsSource')}",
-        "bucketMs": DEDUP_BUCKET_MS_DEFAULT, "asOfMs": now_ms,
+        "bucketMs": 5_000, "asOfMs": now_ms,
     })
     return out
 
@@ -390,6 +419,7 @@ def reset_state_for_tests() -> None:
     with _STATE_LOCK:
         _STATE["prev_middle_lock"] = None
         _STATE["prev_trend_kind"] = None
+        _STATE["prev_trend_bucket_ms"] = 0
         _STATE["prev_conviction_sign"] = None
         _STATE["prev_regime"] = None
         _STATE["prev_session_code"] = None
