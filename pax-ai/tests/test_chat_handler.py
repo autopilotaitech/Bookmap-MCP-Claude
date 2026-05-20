@@ -402,3 +402,216 @@ def test_aiturn_uses_snapshot_captured_at_prompt_build_not_post_done(monkeypatch
     # And the digest_sha256 must hash full_msg, which was built from snap_a.
     # Indirectly verified: snap_b's mid (99999.0) must NOT appear in rec.digest_text.
     assert "99999" not in rec.digest_text
+
+
+def test_chat_sse_bytes_identical_when_feature_bus_disabled(monkeypatch):
+    """Regression: when feature_bus.enabled=False, the SSE byte stream from
+    handle_chat_stream is bit-identical to the Phase 1+2 baseline. No shadow
+    render. No [bus-digest] stderr line. No behavior change."""
+    from pax_ai import chat, feature_bus
+    from pax_ai import claude_stream as cs
+
+    class _CaptureWfile:
+        def __init__(self): self.buf = bytearray()
+        def write(self, b):
+            self.buf.extend(b if isinstance(b, (bytes, bytearray)) else b.encode())
+        def flush(self): pass
+
+    def _fake_stream_chat(user_message, model, system_prompt_path,
+                          on_token, on_done, abort, timeout_sec):
+        on_token("hello")
+        on_done({"exit_code": 0, "elapsed_ms": 5, "tokens_emitted": 1,
+                 "aborted": False, "error": None,
+                 "total_cost_usd": 0.001, "input_tokens": 100,
+                 "output_tokens": 1, "cache_creation_input_tokens": 0,
+                 "cache_read_input_tokens": 0, "duration_api_ms": 5})
+        return 0
+    monkeypatch.setattr(cs, "stream_chat", _fake_stream_chat)
+    monkeypatch.setattr(chat.prompts, "write_frozen_prompt", lambda: Path("/tmp/sp.txt"))
+    monkeypatch.setattr(chat.prompts, "route", lambda t: {"primary": "pax-or",
+                                                            "secondary": [],
+                                                            "router_hint": ""})
+
+    from pax_ai import config as cfg_mod
+    monkeypatch.setattr(cfg_mod, "_reload_if_stale", lambda: None)
+    monkeypatch.setattr(cfg_mod, "_CACHE", {**cfg_mod._CACHE,
+        "feature_bus": {"enabled": False, "db_path": "", "snapshot_blob_dir": "",
+            "digest_blob_dir": "", "queue_max": 2000, "writer_idle_ms": 100,
+            "capture_ms": 1000, "retention_days": 30},
+        "chat": {"use_feature_bus_digest": False}})
+    w1 = _CaptureWfile()
+    chat.handle_chat_stream(w1, "test", deep=False)
+    bytes_with_chat_flag_false = bytes(w1.buf)
+
+    # Even with chat.use_feature_bus_digest=true, when feature_bus.enabled=False
+    # the shadow render must NOT run and the SSE bytes MUST stay identical.
+    monkeypatch.setattr(cfg_mod, "_CACHE", {**cfg_mod._CACHE,
+        "feature_bus": {"enabled": False, "db_path": "", "snapshot_blob_dir": "",
+            "digest_blob_dir": "", "queue_max": 2000, "writer_idle_ms": 100,
+            "capture_ms": 1000, "retention_days": 30},
+        "chat": {"use_feature_bus_digest": True}})
+    w2 = _CaptureWfile()
+    chat.handle_chat_stream(w2, "test", deep=False)
+    bytes_with_chat_flag_true = bytes(w2.buf)
+
+    assert bytes_with_chat_flag_false == bytes_with_chat_flag_true, \
+      "SSE bytes must be identical regardless of chat.use_feature_bus_digest when feature_bus is disabled"
+
+
+def test_no_shadow_digest_log_when_feature_bus_disabled(monkeypatch, capsys, tmp_path):
+    """[bus-digest] stderr line must NOT appear when feature_bus.enabled=False."""
+    from pax_ai import chat
+    from pax_ai import claude_stream as cs
+
+    monkeypatch.setattr(cs, "stream_chat", lambda **kw: (
+        kw["on_token"]("ok"),
+        kw["on_done"]({"exit_code": 0}), 0)[2])
+    monkeypatch.setattr(chat.prompts, "write_frozen_prompt", lambda: Path("/tmp/sp.txt"))
+    monkeypatch.setattr(chat.prompts, "route", lambda t: {"primary": "pax-or",
+                                                            "secondary": [],
+                                                            "router_hint": ""})
+
+    from pax_ai import config as cfg_mod
+    monkeypatch.setattr(cfg_mod, "_reload_if_stale", lambda: None)
+    monkeypatch.setattr(cfg_mod, "_CACHE", {**cfg_mod._CACHE,
+        "feature_bus": {"enabled": False, "db_path": str(tmp_path / "no.db"),
+            "snapshot_blob_dir": str(tmp_path / "s"),
+            "digest_blob_dir":   str(tmp_path / "d"),
+            "queue_max": 2000, "writer_idle_ms": 100, "capture_ms": 1000,
+            "retention_days": 30},
+        "chat": {"use_feature_bus_digest": False}})
+
+    class _W:
+        def write(self, b): pass
+        def flush(self): pass
+    chat.handle_chat_stream(_W(), "ping", deep=False)
+    err = capsys.readouterr().err
+    assert "[bus-digest]" not in err, \
+        "no shadow render must happen when feature_bus.enabled=False"
+
+
+def test_shadow_digest_logs_when_feature_bus_enabled(monkeypatch, capsys, tmp_path):
+    """When feature_bus.enabled=True, [bus-digest] stderr line MUST appear
+    on each chat turn (regardless of chat.use_feature_bus_digest)."""
+    from pax_ai import chat, feature_bus
+    from pax_ai import claude_stream as cs
+
+    monkeypatch.setattr(cs, "stream_chat", lambda **kw: (
+        kw["on_token"]("ok"),
+        kw["on_done"]({"exit_code": 0}), 0)[2])
+    monkeypatch.setattr(chat.prompts, "write_frozen_prompt", lambda: Path("/tmp/sp.txt"))
+    monkeypatch.setattr(chat.prompts, "route", lambda t: {"primary": "pax-or",
+                                                            "secondary": [],
+                                                            "router_hint": "ROUTER: pax-or"})
+
+    from pax_ai import config as cfg_mod
+    monkeypatch.setattr(cfg_mod, "_reload_if_stale", lambda: None)
+    monkeypatch.setattr(cfg_mod, "_CACHE", {**cfg_mod._CACHE,
+        "feature_bus": {"enabled": True, "db_path": str(tmp_path / "bus.db"),
+            "snapshot_blob_dir": str(tmp_path / "s"),
+            "digest_blob_dir":   str(tmp_path / "d"),
+            "queue_max": 2000, "writer_idle_ms": 100, "capture_ms": 1000,
+            "retention_days": 30},
+        "chat": {"use_feature_bus_digest": False}})
+
+    class _W:
+        def write(self, b): pass
+        def flush(self): pass
+    chat.handle_chat_stream(_W(), "ping", deep=False)
+    err = capsys.readouterr().err
+    assert "[bus-digest]" in err
+    assert "live_sha=" in err
+    assert "bus_sha="  in err
+    assert "diff_bytes=" in err
+
+
+def test_flag_false_keeps_legacy_full_msg(monkeypatch, tmp_path):
+    """Even when feature_bus.enabled=True, if chat.use_feature_bus_digest=False
+    Claude must receive the legacy full_msg, NOT the bus digest."""
+    from pax_ai import chat, feature_bus
+    from pax_ai import claude_stream as cs
+
+    captured = {}
+    def _fake_stream_chat(user_message, model, system_prompt_path,
+                          on_token, on_done, abort, timeout_sec):
+        captured["user_message"] = user_message
+        on_done({"exit_code": 0})
+        return 0
+    monkeypatch.setattr(cs, "stream_chat", _fake_stream_chat)
+    monkeypatch.setattr(chat.prompts, "write_frozen_prompt", lambda: Path("/tmp/sp.txt"))
+    monkeypatch.setattr(chat.prompts, "route", lambda t: {"primary": "pax-or",
+                                                            "secondary": [],
+                                                            "router_hint": "ROUTER: pax-or"})
+
+    from pax_ai import config as cfg_mod
+    monkeypatch.setattr(cfg_mod, "_reload_if_stale", lambda: None)
+    monkeypatch.setattr(cfg_mod, "_CACHE", {**cfg_mod._CACHE,
+        "feature_bus": {"enabled": True, "db_path": str(tmp_path / "bus.db"),
+            "snapshot_blob_dir": str(tmp_path / "s"),
+            "digest_blob_dir":   str(tmp_path / "d"),
+            "queue_max": 2000, "writer_idle_ms": 100, "capture_ms": 1000,
+            "retention_days": 30},
+        "chat": {"use_feature_bus_digest": False}})
+
+    class _W:
+        def write(self, b): pass
+        def flush(self): pass
+    chat.handle_chat_stream(_W(), "ping", deep=False)
+    # The bus-digest block layout would include "[STATE]" / "[USER]" markers.
+    # The legacy digest does NOT use those exact markers.
+    msg = captured["user_message"]
+    assert "[STATE]" not in msg, \
+        "Claude received bus digest even though chat.use_feature_bus_digest=False"
+
+
+def test_flag_true_uses_bus_full_msg_only_when_feature_bus_enabled(monkeypatch, tmp_path):
+    """Both gates required: feature_bus.enabled=True AND chat.use_feature_bus_digest=True ->
+    Claude receives bus digest (contains [STATE]/[USER] markers).
+    feature_bus.enabled=False AND chat.use_feature_bus_digest=True ->
+    Claude still receives the legacy digest."""
+    from pax_ai import chat, feature_bus
+    from pax_ai import claude_stream as cs
+
+    captured = {}
+    def _fake_stream_chat(user_message, model, system_prompt_path,
+                          on_token, on_done, abort, timeout_sec):
+        captured["user_message"] = user_message
+        on_done({"exit_code": 0})
+        return 0
+    monkeypatch.setattr(cs, "stream_chat", _fake_stream_chat)
+    monkeypatch.setattr(chat.prompts, "write_frozen_prompt", lambda: Path("/tmp/sp.txt"))
+    monkeypatch.setattr(chat.prompts, "route", lambda t: {"primary": "pax-or",
+                                                            "secondary": [],
+                                                            "router_hint": "ROUTER: pax-or"})
+
+    from pax_ai import config as cfg_mod
+    monkeypatch.setattr(cfg_mod, "_reload_if_stale", lambda: None)
+
+    # Case 1: bus enabled + flag true -> Claude gets BUS digest.
+    monkeypatch.setattr(cfg_mod, "_CACHE", {**cfg_mod._CACHE,
+        "feature_bus": {"enabled": True, "db_path": str(tmp_path / "bus.db"),
+            "snapshot_blob_dir": str(tmp_path / "s"),
+            "digest_blob_dir":   str(tmp_path / "d"),
+            "queue_max": 2000, "writer_idle_ms": 100, "capture_ms": 1000,
+            "retention_days": 30},
+        "chat": {"use_feature_bus_digest": True}})
+
+    class _W:
+        def write(self, b): pass
+        def flush(self): pass
+    chat.handle_chat_stream(_W(), "ping", deep=False)
+    assert "[STATE]" in captured["user_message"], \
+        "bus_enabled=True + flag=True must route bus digest to Claude"
+
+    captured.clear()
+    # Case 2: bus DISABLED + flag still true -> Claude gets LEGACY digest.
+    monkeypatch.setattr(cfg_mod, "_CACHE", {**cfg_mod._CACHE,
+        "feature_bus": {"enabled": False, "db_path": str(tmp_path / "nope.db"),
+            "snapshot_blob_dir": str(tmp_path / "s"),
+            "digest_blob_dir":   str(tmp_path / "d"),
+            "queue_max": 2000, "writer_idle_ms": 100, "capture_ms": 1000,
+            "retention_days": 30},
+        "chat": {"use_feature_bus_digest": True}})
+    chat.handle_chat_stream(_W(), "ping", deep=False)
+    assert "[STATE]" not in captured["user_message"], \
+        "feature_bus.enabled=False must NEVER route bus digest to Claude even with flag=True"

@@ -294,3 +294,88 @@ def test_summary_today_explicit_date_param(tmp_path, monkeypatch):
     # And a different UTC day finds zero.
     s2 = feature_bus.summary_today("2026-01-16")
     assert s2["counts"]["level_events"] == 0
+
+
+# -- recent_ai_turns contract ------------------------------------------------
+
+def _seed_ai_turn(db_path, alias="NQM6", n=1):
+    import hashlib
+    with feature_bus._open_db(db_path) as conn:
+        feature_bus._ensure_schema(conn)
+        for i in range(n):
+            conn.execute("""
+                INSERT INTO ai_turns
+                  (schema_version, ts_ms, chat_run_id, deep, model,
+                   user_text_raw, user_text_normalized, pax_text,
+                   snapshot_alias, snapshot_sha256, digest_sha256,
+                   total_cost_usd, input_tokens, output_tokens, exit_code, aborted)
+                VALUES (1, ?, 'r1', 0, 'claude-haiku-4-5',
+                        ?, ?, 'LONG PROSE OMITTED',
+                        ?, ?, ?, 0.01, 10, 50, 0, 0)
+            """, (1_000_000_000_000 + i,
+                  f"ping {i}", f"ping {i}",
+                  alias,
+                  hashlib.sha256(f"s{i}".encode()).hexdigest(),
+                  hashlib.sha256(f"d{i}".encode()).hexdigest()))
+
+
+def test_recent_ai_turns_disabled_returns_empty(tmp_path, monkeypatch):
+    _disable_bus(tmp_path, monkeypatch)
+    assert feature_bus.recent_ai_turns() == []
+
+
+def test_recent_ai_turns_db_missing_returns_empty(tmp_path, monkeypatch):
+    _enable_bus_at(tmp_path, monkeypatch)
+    assert feature_bus.recent_ai_turns() == []
+
+
+def test_recent_ai_turns_returns_newest_first(tmp_path, monkeypatch):
+    db = _enable_bus_at(tmp_path, monkeypatch)
+    _seed_ai_turn(db, n=5)
+    rows = feature_bus.recent_ai_turns(limit=5)
+    assert len(rows) == 5
+    assert [r["ts_ms"] for r in rows] == sorted([r["ts_ms"] for r in rows], reverse=True)
+
+
+def test_recent_ai_turns_alias_filter(tmp_path, monkeypatch):
+    db = _enable_bus_at(tmp_path, monkeypatch)
+    _seed_ai_turn(db, alias="NQM6", n=3)
+    _seed_ai_turn(db, alias="ESM6", n=2)
+    nqm = feature_bus.recent_ai_turns(limit=10, alias="NQM6")
+    assert all(r["snapshot_alias"] == "NQM6" for r in nqm)
+    assert len(nqm) == 3
+
+
+def test_recent_ai_turns_clamps_limit(tmp_path, monkeypatch):
+    db = _enable_bus_at(tmp_path, monkeypatch)
+    _seed_ai_turn(db, n=20)
+    assert len(feature_bus.recent_ai_turns(limit=0)) == 1
+    assert len(feature_bus.recent_ai_turns(limit=9999)) == 20  # only 20 seeded
+
+
+def test_recent_ai_turns_omits_blob_text_columns(tmp_path, monkeypatch):
+    db = _enable_bus_at(tmp_path, monkeypatch)
+    _seed_ai_turn(db, n=1)
+    [row] = feature_bus.recent_ai_turns(limit=1)
+    assert "pax_text"      not in row
+    assert "digest_text"   not in row
+    assert "snapshot_json" not in row
+
+
+def test_recent_ai_turns_before_ts_ms_excludes_newer(tmp_path, monkeypatch):
+    """before_ts_ms filter: only rows with ts_ms < before_ts_ms returned."""
+    db = _enable_bus_at(tmp_path, monkeypatch)
+    _seed_ai_turn(db, n=5)
+    # n=5 seeds rows at ts_ms = base + 0..4 (base = 1_000_000_000_000).
+    base = 1_000_000_000_000
+    # Boundary at base+3: rows with ts_ms < base+3 are 0,1,2.
+    rows = feature_bus.recent_ai_turns(limit=10, before_ts_ms=base + 3)
+    assert len(rows) == 3
+    assert all(r["ts_ms"] < base + 3 for r in rows)
+
+
+def test_recent_ai_turns_before_ts_ms_none_returns_all(tmp_path, monkeypatch):
+    db = _enable_bus_at(tmp_path, monkeypatch)
+    _seed_ai_turn(db, n=4)
+    rows = feature_bus.recent_ai_turns(limit=10, before_ts_ms=None)
+    assert len(rows) == 4

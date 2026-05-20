@@ -79,6 +79,14 @@ DEFAULTS: Dict[str, Any] = {
         "capture_ms":        1000,
         "retention_days":    30,
     },
+    "chat": {
+        "use_feature_bus_digest": False,    # Phase 3A: swap legacy digest -> bus digest at Claude input
+    },
+    "outcomes": {
+        "enabled":            False,   # Phase 4A daemon. Default OFF.
+        "wake_interval_ms":   900_000, # 15 minutes
+        "match_tolerance_ms": 5_000,   # +/- 5 seconds when finding snapshot_features rows
+    },
 }
 
 

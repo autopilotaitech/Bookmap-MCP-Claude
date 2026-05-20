@@ -165,6 +165,7 @@ def build_user_message(user_text: str) -> Tuple[str, Dict[str, Any]]:
         "snapshot_stale":   stale,
         "snapshot_age_ms":  age_ms,
         "user_normalized":  user_norm,
+        "router_hint":      routed["router_hint"],   # NEW (Batch B)
         # Feature-bus byte-exact replay: the post-done capture path must
         # hash the SAME snapshot the digest was built from, not a fresh
         # poll. Underscore-prefixed: never exposed in SSE payloads.
@@ -222,6 +223,37 @@ def handle_chat_stream(wfile, user_text: str, deep: bool = False) -> None:
 
     try:
         full_msg, meta = build_user_message(user_text)
+
+        # Phase 3A shadow bus digest: gated on feature_bus.enabled so the
+        # disabled path stays bit-identical to Phase 1+2 (no shadow render,
+        # no [bus-digest] stderr log, no behavior change). Live input swap
+        # requires BOTH gates: feature_bus.enabled=true AND
+        # chat.use_feature_bus_digest=true.
+        bus_full_msg = None
+        if config.get("feature_bus.enabled", False):
+            try:
+                from . import bus_digest as _bus_dig
+                snap_for_bus = meta.get("_snapshot_for_capture") or {}
+                bus_full_msg = _bus_dig.render_user_message(
+                    snap=snap_for_bus,
+                    user_text=user_text,
+                    router_hint=meta.get("router_hint") or "",
+                    alias=(snap_for_bus or {}).get("alias"),
+                    ts_ms=meta.get("_snapshot_ts_ms_capture"),
+                )
+                live_sha = hashlib.sha256(full_msg.encode("utf-8")).hexdigest()
+                bus_sha  = hashlib.sha256(bus_full_msg.encode("utf-8")).hexdigest()
+                diff_bytes = abs(len(bus_full_msg) - len(full_msg))
+                sys.stderr.write(
+                    f"[bus-digest] live_sha={live_sha[:12]} "
+                    f"bus_sha={bus_sha[:12]} diff_bytes={diff_bytes}\n")
+            except Exception as exc:
+                sys.stderr.write(f"[bus-digest] shadow render failed: {exc}\n")
+
+        if (config.get("feature_bus.enabled", False)
+                and config.get("chat.use_feature_bus_digest", False)
+                and bus_full_msg is not None):
+            full_msg = bus_full_msg
 
         # Journal the user turn immediately. The normalized text (voice ->
         # canonical jargon) is what we persist, not the raw transcript -- it

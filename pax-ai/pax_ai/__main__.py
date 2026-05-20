@@ -45,6 +45,11 @@ def main() -> int:
     from . import feature_bus
     feature_bus.start()
 
+    # Phase 4A outcomes daemon: passive labeling, guarded by config flag
+    # (default false). The call is idempotent; when disabled, start() is a no-op.
+    from . import outcomes
+    outcomes.start()
+
     # Chat journal init (SQLite at D:\BookmapLogs\pax-chat.db by default).
     # No-ops if PAX_LOG_DIR is unwritable -- chat still works, history is
     # just not preserved for that session.

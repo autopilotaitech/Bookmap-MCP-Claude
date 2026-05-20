@@ -70,3 +70,15 @@ def test_feature_bus_defaults_present_and_disabled():
     assert config.get("feature_bus.writer_idle_ms") == 100
     assert config.get("feature_bus.capture_ms") == 1000
     assert config.get("feature_bus.retention_days") == 30
+
+
+def test_chat_use_feature_bus_digest_default_false():
+    """Phase 3A: shadow + swap default is OFF."""
+    from pax_ai import config
+    assert config.get("chat.use_feature_bus_digest") is False
+
+
+def test_outcomes_enabled_default_false():
+    """Phase 4A: outcomes daemon is OFF by default."""
+    from pax_ai import config
+    assert config.get("outcomes.enabled") is False

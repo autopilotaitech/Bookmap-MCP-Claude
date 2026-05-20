@@ -1065,3 +1065,50 @@ def summary_today(date_str: Optional[str] = None) -> Dict[str, Any]:
     finally:
         conn.close()
     return out
+
+
+_AI_TURNS_PHASE3_PROJECTION = (
+    "id", "ts_ms", "model", "exit_code", "total_cost_usd",
+    "user_text_raw", "snapshot_alias",
+    "snapshot_sha256", "digest_sha256",
+)
+
+
+def recent_ai_turns(limit: int = 3,
+                     alias: Optional[str] = None,
+                     before_ts_ms: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Read-only SELECT of most-recent rows from ai_turns. Used by Phase 3A's
+    bus_digest SESSION_MEMORY block. Same safety contract as recent_events():
+    quiet [] on disabled/missing/locked, never raises, projection allowlist
+    omits pax_text/digest_text/snapshot_json.
+
+    before_ts_ms (Phase 4A replay correctness): when provided, only rows with
+    ts_ms < before_ts_ms are returned. This lets pax_bus_replay reconstruct
+    the SESSION_MEMORY block that capture-time chat.py saw (where the current
+    ai_turn row did not yet exist in the DB)."""
+    if not config.get("feature_bus.enabled", False):
+        return []
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        n = 3
+    n = max(1, min(50, n))
+    cols = _AI_TURNS_PHASE3_PROJECTION
+    where_parts: List[str] = []
+    sql_params: List[Any] = []
+    if alias is not None:
+        where_parts.append("snapshot_alias=?")
+        sql_params.append(alias)
+    if before_ts_ms is not None:
+        where_parts.append("ts_ms<?")
+        sql_params.append(int(before_ts_ms))
+    sql = (f"SELECT {','.join(cols)} FROM ai_turns "
+           + (("WHERE " + " AND ".join(where_parts) + " ") if where_parts else "")
+           + "ORDER BY ts_ms DESC LIMIT ?")
+    sql_params.append(n)
+    db_path = Path(config.get("feature_bus.db_path"))
+    try:
+        with _open_db_readonly(db_path) as conn:
+            return [dict(r) for r in conn.execute(sql, tuple(sql_params)).fetchall()]
+    except (FileNotFoundError, sqlite3.OperationalError):
+        return []
