@@ -132,7 +132,8 @@ def _format_ts(ts_ms: Optional[int]) -> str:
         return "??:??:??"
     import datetime as _dt
     try:
-        return _dt.datetime.utcfromtimestamp(int(ts_ms) / 1000.0).strftime("%H:%M:%S")
+        return _dt.datetime.fromtimestamp(int(ts_ms) / 1000.0,
+                                          _dt.timezone.utc).strftime("%H:%M:%S")
     except (OSError, ValueError, OverflowError):
         return "??:??:??"
 

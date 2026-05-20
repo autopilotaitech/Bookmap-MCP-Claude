@@ -469,7 +469,8 @@ def _canonical_snapshot_json(snap: Dict[str, Any]) -> str:
 
 def _date_partition(ts_ms: int) -> str:
     """UTC date partition for blob paths. UTC so the partition matches across timezones."""
-    return _dt.datetime.utcfromtimestamp(ts_ms / 1000.0).strftime("%Y-%m-%d")
+    return _dt.datetime.fromtimestamp(ts_ms / 1000.0,
+                                      _dt.timezone.utc).strftime("%Y-%m-%d")
 
 
 def _atomic_write_text(target: Path, content: str) -> None:
