@@ -89,13 +89,49 @@ public class PaxOpeningRangeModule implements
     private static final int SIGNAL_BADGE_LEFT_PADDING = 12;
     private static final int SIGNAL_BADGE_TOP_PADDING = 14;
     private static final String SETTINGS_KEY = "OpenRange Settings";
-    private static final long REPAINT_THROTTLE_NANOS = 1_000_000_000L;
+    private static final long REPAINT_THROTTLE_NANOS = 5_000_000_000L;
     private static final long DEPTH_SIGNAL_THROTTLE_NANOS = 50_000_000L;
     private static final int FEATURE_CACHE_HISTORY_SIZE = 1_024;
     /** How long the painter trusts a CSV-derived fallback before re-scanning.
      * Bounds disk hits per paint frame; short enough that a freshly-written
      * CSV becomes visible within the window. */
     private static final long FALLBACK_TTL_MS = 30_000L;
+
+    /**
+     * Fine-grained repaint dispatch.
+     *
+     * <p>The painter holds THREE shape buckets — persistent OR lines/labels
+     * (chart-anchored, expensive), trend triangles (chart-anchored, can
+     * advance independently when a new bucket fires), and volatile overlay
+     * (Heatwave box, signal badge — pixel-anchored). Each bucket can be
+     * rebuilt independently to eliminate flicker that would otherwise come
+     * from rebuilding everything on every dashboard poll.
+     *
+     * <p>Production rule (Jane-Street-style: do exactly the work needed):
+     * <ul>
+     *   <li>persistent OR lines redraw <b>only</b> when the OR structure
+     *       changes (new completed day, new dynamic level, fallback
+     *       hydrated, high/low/mid drift), on {@code onMoveEnd}, or on
+     *       explicit rebuild/backfill paths. <b>Never</b> on a market tick
+     *       or dashboard poll by itself.</li>
+     *   <li>trend triangles redraw on {@code trendSignalDirty}.</li>
+     *   <li>volatile overlay redraws on {@code heatwaveDirty}.</li>
+     * </ul>
+     */
+    static final class RepaintNeeds {
+        final boolean persistent;
+        final boolean triangles;
+        final boolean overlay;
+        static final RepaintNeeds NONE = new RepaintNeeds(false, false, false);
+        RepaintNeeds(boolean persistent, boolean triangles, boolean overlay) {
+            this.persistent = persistent;
+            this.triangles  = triangles;
+            this.overlay    = overlay;
+        }
+        boolean isNone() { return !persistent && !triangles && !overlay; }
+        static RepaintNeeds full() { return new RepaintNeeds(true, true, true); }
+    }
+
     static final int MAX_LIVE_TRIANGLES = 8;
     /** Stale-cliff for incoming trend_signal: keep existing triangles drawn,
      * but do not emit new ones if the fetcher's last successful HTTP receive
@@ -225,8 +261,8 @@ public class PaxOpeningRangeModule implements
         }
 
         PaxPainter painter = painters.get(alias);
-        if (painter != null && state.shouldRepaint(eventTime)) {
-            painter.update();
+        if (painter != null) {
+            painter.applyNeeds(state.nextRepaintNeeds(eventTime));
         }
     }
 
@@ -250,8 +286,8 @@ public class PaxOpeningRangeModule implements
         }
 
         PaxPainter painter = painters.get(alias);
-        if (painter != null && state.shouldRepaint(eventTime)) {
-            painter.update();
+        if (painter != null) {
+            painter.applyNeeds(state.nextRepaintNeeds(eventTime));
         }
     }
 
@@ -390,12 +426,60 @@ public class PaxOpeningRangeModule implements
         PaxOpeningRangeUiSettings stored = (PaxOpeningRangeUiSettings) settingsAccess.getSettings(null, SETTINGS_KEY, PaxOpeningRangeUiSettings.class);
         if (stored != null) {
             uiSettings = stored;
+            migrateLegacyDefaultsIfNeeded(settingsAccess);
         }
+        // Publish operator-controlled OR settings to or-session-config.json
+        // BEFORE any drift warning so downstream consumers (dashboard +
+        // bridge) immediately see the effective anchor.
+        PaxOpeningRangeSessionConfigWriter.publish(uiSettings);
         heatwave.applySettings(uiSettings);
         // Trend triangles share the dashboard URL with the heatwave box —
         // single source for the polled /api/snapshot endpoint.
         trendSignals.applySettings(uiSettings.showTrendTriangles,
                 uiSettings.safeHeatwaveUrl(), uiSettings.clampedHeatwavePollMs());
+    }
+
+    /** V3 migration. Bookmap deserializes user settings overwriting fields
+     *  set in the class. If we see the exact V1/V2 default tuple
+     *  (start 09:30, end 17:00) AND no operator-supplied customization was
+     *  detected on other fields, quietly migrate to canonical 08:30. We
+     *  refuse to clobber an operator who explicitly chose 09:30 for some
+     *  reason — that's why migratedToCanonical0830 acts as a breadcrumb. */
+    private void migrateLegacyDefaultsIfNeeded(SettingsAccess access) {
+        if (uiSettings.migratedToCanonical0830) {
+            return;
+        }
+        boolean looksLikeV1V2Default = uiSettings.startHour == 9
+                && uiSettings.startMinute == 30
+                && uiSettings.startSecond == 0
+                && uiSettings.endHour == 17
+                && uiSettings.endMinute == 0
+                && uiSettings.rangeSeconds == 30;
+        if (looksLikeV1V2Default) {
+            try {
+                Log.info("OpenRange: migrating pre-canonical OR anchor (09:30 ET) → 08:30 CT.");
+            } catch (Throwable ignored) { /* Log unavailable in tests */ }
+            uiSettings.startHour   = 8;
+            uiSettings.startMinute = 30;
+            uiSettings.startSecond = 0;
+            uiSettings.endHour     = 8;
+            uiSettings.endMinute   = 30;
+            uiSettings.migratedToCanonical0830 = true;
+            try {
+                access.setSettings(null, SETTINGS_KEY, uiSettings, PaxOpeningRangeUiSettings.class);
+            } catch (Throwable t) {
+                try {
+                    Log.warn("OpenRange: failed to persist V3 migration: " + t);
+                } catch (Throwable ignored) { }
+            }
+        } else {
+            // Operator-customized — set the breadcrumb so we don't re-check
+            // every restart. They keep their values.
+            uiSettings.migratedToCanonical0830 = true;
+            try {
+                access.setSettings(null, SETTINGS_KEY, uiSettings, PaxOpeningRangeUiSettings.class);
+            } catch (Throwable ignored) { }
+        }
     }
 
     @Override
@@ -611,6 +695,9 @@ public class PaxOpeningRangeModule implements
         if (access != null) {
             access.setSettings(alias, SETTINGS_KEY, settings, PaxOpeningRangeUiSettings.class);
         }
+        // Re-publish OR config so dashboard + bridge see operator changes
+        // within the next poll cycle.
+        PaxOpeningRangeSessionConfigWriter.publish(settings);
         heatwave.applySettings(settings);
         trendSignals.applySettings(settings.showTrendTriangles,
                 settings.safeHeatwaveUrl(), settings.clampedHeatwavePollMs());
@@ -690,6 +777,13 @@ public class PaxOpeningRangeModule implements
         LocalDate orderFlowDate;
         long lastRepaintTime;
         long lastDepthSignalTime;
+        /** Signature of the persistent OR shape inputs (completed days,
+         * high/low/mid, dynamic level counts + tips, fallback day, OR
+         * settings hash). Persistent shapes are rebuilt only when this
+         * signature changes — market ticks that do not alter OR structure
+         * leave the chart shapes untouched. Empty string means "no
+         * persistent shapes have been drawn yet". */
+        String lastOrSignature = "";
         // CSV-backed chart-only fallback. Populated by PaxPainter.update() when
         // the live calculator has no completed day; cleared as soon as live
         // data shows up. Never read by trading/signal code.
@@ -817,15 +911,88 @@ public class PaxOpeningRangeModule implements
         }
 
         boolean shouldRepaint(long eventTime) {
-            if (consumeHeatwaveDirty() || consumeTrendSignalDirty()) {
+            // Legacy boolean shim. Production code uses nextRepaintNeeds.
+            return !nextRepaintNeeds(eventTime).isNone();
+        }
+
+        /**
+         * Decide which shape buckets need rebuilding for this tick. Both
+         * dirty bits are eagerly consumed (single-pipe — neither is
+         * short-circuited).
+         *
+         * <p>Persistent OR shapes are rebuilt only when the OR structure
+         * signature changes. Market ticks that don't change OR structure
+         * never force a persistent rebuild. The legacy 5s throttle is now
+         * informational only — it bounds how often the signature is
+         * computed when a market tick fires, but no longer "expires" the
+         * persistent shapes.
+         */
+        RepaintNeeds nextRepaintNeeds(long eventTime) {
+            boolean heatwaveDirty = consumeHeatwaveDirty();
+            boolean trendDirty    = consumeTrendSignalDirty();
+            boolean persistent    = false;
+
+            // Only compute the OR signature once per throttle window — it
+            // walks the calculator's day map. Cheap, but no need to do it
+            // on every NQ tick.
+            if ((eventTime - lastRepaintTime) >= REPAINT_THROTTLE_NANOS) {
                 lastRepaintTime = eventTime;
-                return true;
+                String sig = computeOrSignature();
+                if (!sig.equals(lastOrSignature)) {
+                    lastOrSignature = sig;
+                    persistent = true;
+                }
             }
-            if (eventTime - lastRepaintTime < REPAINT_THROTTLE_NANOS) {
-                return false;
+            return new RepaintNeeds(persistent, trendDirty, heatwaveDirty);
+        }
+
+        /**
+         * Stable signature of every input that affects persistent OR shape
+         * rendering. Lock-guarded read of the calculator + fallback state.
+         * Any change here means the chart-anchored shapes need a rebuild.
+         */
+        String computeOrSignature() {
+            StringBuilder sb = new StringBuilder(256);
+            PaxOpeningRangeUiSettings ui = loadSettings();
+            // Settings inputs that change line endpoints / level counts /
+            // visual state.
+            sb.append("S=").append(ui.startHour).append(':').append(ui.startMinute)
+              .append(':').append(ui.startSecond)
+              .append('/').append(ui.rangeSeconds)
+              .append('/').append(ui.endHour).append(':').append(ui.endMinute)
+              .append('/').append(ui.daysToDisplay)
+              .append('/').append(ui.showMid)
+              .append('/').append(ui.showHeatwaveBox)
+              .append('/').append(ui.showTrendTriangles)
+              .append(';');
+            synchronized (lock) {
+                for (PaxOpeningRangeDayState day : calculator.getDays()) {
+                    if (!day.isComplete()) continue;
+                    sb.append("D=").append(day.getDate())
+                      .append('/').append(day.getHigh())
+                      .append('/').append(day.getLow())
+                      .append('/').append(day.getMid())
+                      .append('/').append(day.getUpperLevels().size())
+                      .append('/').append(day.getLowerLevels().size());
+                    if (!day.getUpperLevels().isEmpty()) {
+                        sb.append('/').append(day.getUpperLevels()
+                                .get(day.getUpperLevels().size() - 1).price());
+                    }
+                    if (!day.getLowerLevels().isEmpty()) {
+                        sb.append('/').append(day.getLowerLevels()
+                                .get(day.getLowerLevels().size() - 1).price());
+                    }
+                    sb.append(';');
+                }
             }
-            lastRepaintTime = eventTime;
-            return true;
+            PaxOpeningRangeDayState fb = fallbackDay;
+            if (fb != null) {
+                sb.append("FB=").append(fb.getDate())
+                  .append('/').append(fb.getHigh())
+                  .append('/').append(fb.getLow())
+                  .append(';');
+            }
+            return sb.toString();
         }
 
         boolean shouldUpdateSignalForDepth(long eventTime) {
@@ -876,7 +1043,25 @@ public class PaxOpeningRangeModule implements
     private final class PaxPainter implements ScreenSpacePainterAdapter {
         private final String alias;
         private final ScreenSpaceCanvas canvas;
-        private final List<CanvasIcon> shapes = Collections.synchronizedList(new ArrayList<>());
+        /**
+         * Persistent chart-anchored OR shapes: high/low/mid lines, dynamic
+         * extension lines, OR labels, "no OR" status text. Rebuilt only when
+         * the OR structure signature changes, on onMoveEnd, or via explicit
+         * rebuild/backfill paths.
+         */
+        private final List<CanvasIcon> persistentShapes = Collections.synchronizedList(new ArrayList<>());
+        /**
+         * Chart-anchored trend triangle shapes. Independent of persistent OR
+         * shapes so a fresh eligible trend signal can render immediately
+         * without re-drawing every OR line + label.
+         */
+        private final List<CanvasIcon> triangleShapes   = Collections.synchronizedList(new ArrayList<>());
+        /**
+         * Volatile pixel-anchored overlay shapes: Heatwave Quant Box,
+         * signal badge. Rebuilt on every dashboard-poll dirty bit. Isolated
+         * from persistentShapes so polling never flickers the OR lines.
+         */
+        private final List<CanvasIcon> volatileShapes   = Collections.synchronizedList(new ArrayList<>());
 
         PaxPainter(String alias, ScreenSpaceCanvas canvas) {
             this.alias = alias;
@@ -885,16 +1070,38 @@ public class PaxOpeningRangeModule implements
 
         @Override
         public void onMoveEnd() {
+            // Chart pan/zoom — coordinate system effectively changed; rebuild
+            // every bucket to be safe.
             update();
         }
 
+        /** Dispatch by needs vector. Each bucket is independent. */
+        synchronized void applyNeeds(RepaintNeeds needs) {
+            if (needs == null || needs.isNone()) return;
+            if (needs.persistent) updatePersistent();
+            if (needs.triangles)  updateTriangles();
+            if (needs.overlay)    updateOverlay();
+        }
+
+        /** Full repaint of every bucket. Used by onMoveEnd, init, and
+         *  explicit rebuild paths. Force-syncs the InstrumentState's
+         *  lastOrSignature so the next tick-driven check doesn't fire a
+         *  redundant persistent rebuild. */
         synchronized void update() {
             InstrumentState state = instruments.get(alias);
-            if (state == null) {
-                return;
-            }
+            if (state == null) return;
+            updatePersistent();
+            updateTriangles();
+            updateOverlay();
+            state.lastOrSignature = state.computeOrSignature();
+        }
 
-            clear();
+        /** Persistent OR shapes only — torn down and re-added from current
+         *  calculator state. CSV fallback hydrate still happens here. */
+        synchronized void updatePersistent() {
+            InstrumentState state = instruments.get(alias);
+            if (state == null) return;
+            clearPersistent();
             boolean drewDay = false;
             Set<LocalDate> drawnDates = new HashSet<>();
             List<PaxOpeningRangeDayState> daysSnapshot;
@@ -902,9 +1109,7 @@ public class PaxOpeningRangeModule implements
                 daysSnapshot = new ArrayList<>(state.calculator.getDays());
             }
             for (PaxOpeningRangeDayState day : daysSnapshot) {
-                if (!day.isComplete()) {
-                    continue;
-                }
+                if (!day.isComplete()) continue;
                 drawDay(state, day);
                 drewDay = true;
                 drawnDates.add(day.getDate());
@@ -912,8 +1117,6 @@ public class PaxOpeningRangeModule implements
             PaxOpeningRangeDayState fallback = resolveFallback(state);
             if (fallback != null) {
                 if (drawnDates.contains(fallback.getDate())) {
-                    // Live precedence for the same session: never let CSV
-                    // fallback override a completed live day for that date.
                     state.fallbackDay = null;
                     state.fallbackCsvPath = "";
                 } else {
@@ -925,14 +1128,30 @@ public class PaxOpeningRangeModule implements
                 PaxOpeningRangeSettings settings = getCalculatorSettings();
                 addStatus("OpenRange waiting: no completed OR. Set start time before a live " + settings.rangeSeconds() + "s window.");
             }
+        }
+
+        /** Trend triangle shapes only. Fired on trendSignalDirty so a fresh
+         *  eligible signal renders immediately without rebuilding OR lines. */
+        synchronized void updateTriangles() {
+            InstrumentState state = instruments.get(alias);
+            if (state == null) return;
+            clearTriangles();
+            if (loadSettings().showTrendTriangles) {
+                addTrendTriangles(state);
+            }
+        }
+
+        /** Volatile overlay shapes only — Heatwave Quant Box and signal
+         *  badge. Fired on heatwaveDirty at the 1Hz dashboard cadence. */
+        synchronized void updateOverlay() {
+            InstrumentState state = instruments.get(alias);
+            if (state == null) return;
+            clearVolatile();
             PaxOpeningRangeUiSettings ui = loadSettings();
             if (ui.showHeatwaveBox) {
                 addHeatwaveBox(ui);
             } else {
                 addSignalStatus(state.featureCache.latest());
-            }
-            if (ui.showTrendTriangles) {
-                addTrendTriangles(state);
             }
         }
 
@@ -1038,7 +1257,7 @@ public class PaxOpeningRangeModule implements
                 yPxTop = -h;
                 yPxBottom = 0;
             }
-            addShape(image,
+            addTriangleShape(image,
                     new CompositeHorizontalCoordinate(CompositeCoordinateBase.DATA_ZERO, -w / 2, xNanos),
                     new CompositeVerticalCoordinate(CompositeCoordinateBase.DATA_ZERO, yPxTop, anchorPrice),
                     new CompositeHorizontalCoordinate(CompositeCoordinateBase.DATA_ZERO, w / 2, xNanos),
@@ -1060,7 +1279,7 @@ public class PaxOpeningRangeModule implements
             int y = ui.clampedHeatwaveBoxY();
             int w = image.getReadOnlyImage().getWidth();
             int h = image.getReadOnlyImage().getHeight();
-            addShape(image,
+            addVolatileShape(image,
                     new CompositeHorizontalCoordinate(CompositeCoordinateBase.PIXEL_ZERO, x, 0),
                     new CompositeVerticalCoordinate(CompositeCoordinateBase.PIXEL_ZERO, y, 0),
                     new CompositeHorizontalCoordinate(CompositeCoordinateBase.PIXEL_ZERO, x + w, 0),
@@ -1071,10 +1290,13 @@ public class PaxOpeningRangeModule implements
             PaxOpeningRangeUiSettings ui = loadSettings();
             PaxOpeningRangeSettings settings = ui.toCalculatorSettings();
             LocalDateTime lineStart = settings.rangeEndDateTime(day.getDate());
-            LocalDateTime maxEnd = settings.lineEndDateTime(day.getDate());
-            LocalDateTime lineEnd = day.getLastUpdateTime() == null || day.getLastUpdateTime().isAfter(maxEnd)
-                    ? maxEnd
-                    : day.getLastUpdateTime();
+            // Lines anchor at canonical session boundaries — rangeEnd today
+            // → next session anchor (lineEndDateTime). No per-tick clamp to
+            // lastUpdateTime; that legacy clamp forced a persistent rebuild
+            // on every tick to advance the right edge. With a fixed maxEnd
+            // anchor the chart shapes are stable until the OR structure
+            // itself changes.
+            LocalDateTime lineEnd = settings.lineEndDateTime(day.getDate());
             if (lineEnd.isBefore(lineStart)) {
                 lineEnd = lineStart;
             }
@@ -1167,7 +1389,7 @@ public class PaxOpeningRangeModule implements
             }
             Color color = signalColor(snapshot.colorState());
             PreparedImage image = badgeImage(signalText(snapshot), color, 13);
-            addShape(image,
+            addVolatileShape(image,
                     new CompositeHorizontalCoordinate(CompositeCoordinateBase.PIXEL_ZERO, SIGNAL_BADGE_LEFT_PADDING, 0),
                     new CompositeVerticalCoordinate(CompositeCoordinateBase.PIXEL_ZERO, SIGNAL_BADGE_TOP_PADDING, 0),
                     new CompositeHorizontalCoordinate(CompositeCoordinateBase.PIXEL_ZERO, SIGNAL_BADGE_LEFT_PADDING + image.getReadOnlyImage().getWidth(), 0),
@@ -1210,20 +1432,44 @@ public class PaxOpeningRangeModule implements
         private void addShape(PreparedImage image, CompositeHorizontalCoordinate x1, CompositeVerticalCoordinate y1,
                 CompositeHorizontalCoordinate x2, CompositeVerticalCoordinate y2) {
             CanvasIcon icon = new CanvasIcon(image, x1, y1, x2, y2);
-            shapes.add(icon);
+            persistentShapes.add(icon);
             canvas.addShape(icon);
         }
 
-        private void clear() {
-            for (CanvasIcon shape : shapes) {
-                canvas.removeShape(shape);
-            }
-            shapes.clear();
+        private void addTriangleShape(PreparedImage image, CompositeHorizontalCoordinate x1, CompositeVerticalCoordinate y1,
+                CompositeHorizontalCoordinate x2, CompositeVerticalCoordinate y2) {
+            CanvasIcon icon = new CanvasIcon(image, x1, y1, x2, y2);
+            triangleShapes.add(icon);
+            canvas.addShape(icon);
+        }
+
+        private void addVolatileShape(PreparedImage image, CompositeHorizontalCoordinate x1, CompositeVerticalCoordinate y1,
+                CompositeHorizontalCoordinate x2, CompositeVerticalCoordinate y2) {
+            CanvasIcon icon = new CanvasIcon(image, x1, y1, x2, y2);
+            volatileShapes.add(icon);
+            canvas.addShape(icon);
+        }
+
+        private void clearPersistent() {
+            for (CanvasIcon shape : persistentShapes) canvas.removeShape(shape);
+            persistentShapes.clear();
+        }
+
+        private void clearTriangles() {
+            for (CanvasIcon shape : triangleShapes) canvas.removeShape(shape);
+            triangleShapes.clear();
+        }
+
+        private void clearVolatile() {
+            for (CanvasIcon shape : volatileShapes) canvas.removeShape(shape);
+            volatileShapes.clear();
         }
 
         @Override
         public void dispose() {
-            clear();
+            clearVolatile();
+            clearTriangles();
+            clearPersistent();
             canvas.dispose();
         }
     }

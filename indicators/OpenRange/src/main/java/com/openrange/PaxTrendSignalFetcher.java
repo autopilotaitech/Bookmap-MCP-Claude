@@ -25,6 +25,7 @@ final class PaxTrendSignalFetcher {
     static final int FAIL_BACKOFF_THRESHOLD = 3;
     static final long MAX_BACKOFF_MS = 5_000L;
     static final long LOG_THROTTLE_MS = 60_000L;
+    static final long UNCHANGED_REPAINT_MIN_MS = 5_000L;
     static final String DEFAULT_URL = "http://127.0.0.1:18888/api/snapshot";
 
     private final Object lifecycleLock = new Object();
@@ -42,6 +43,8 @@ final class PaxTrendSignalFetcher {
      * Mirrors PaxHeatwaveFetcher so diagnostics see the same surface on both. */
     private volatile String lastFailureReason = "";
     private volatile long lastFailureAtMs = 0L;
+    private volatile String lastRepaintKey = "";
+    private volatile long lastRepaintAtMs = 0L;
 
     PaxTrendSignalFetcher(Runnable repaintCallback) {
         this.repaintCallback = repaintCallback;
@@ -154,7 +157,7 @@ final class PaxTrendSignalFetcher {
             PaxTrendSignalModel parsed = PaxTrendSignalSnapshotParser.parse(resp.body(), nowMs);
             latest = parsed;
             consecutiveFailures.set(0);
-            fireRepaint();
+            fireRepaintIfNeeded(parsed, nowMs);
             return true;
         } catch (PaxTrendSignalSnapshotParser.ParseException pe) {
             handleFailure(nowMs, "parse: " + pe.getMessage());
@@ -192,6 +195,47 @@ final class PaxTrendSignalFetcher {
         } catch (Throwable t) {
             // Never let painter exceptions kill the fetch loop.
         }
+    }
+
+    private void fireRepaintIfNeeded(PaxTrendSignalModel parsed, long nowMs) {
+        String key = semanticKey(parsed);
+        boolean changed = !key.equals(lastRepaintKey);
+        if (changed || nowMs - lastRepaintAtMs >= UNCHANGED_REPAINT_MIN_MS) {
+            lastRepaintKey = key;
+            lastRepaintAtMs = nowMs;
+            fireRepaint();
+        }
+    }
+
+    private static String semanticKey(PaxTrendSignalModel model) {
+        if (model == null) {
+            return "null";
+        }
+        // When the dashboard says the signal is ineligible (kind=NONE,
+        // warmup, invalid mid, blockedReason), no triangle is drawn — so a
+        // changing mid or eventMs each poll must NOT invalidate the dedup
+        // key. Otherwise the fetcher would force a repaint every poll for
+        // zero visible output. Keep only the renderable-tuple fields.
+        if (!model.eligible
+                || model.kind == null
+                || model.kind == PaxTrendSignalModel.Kind.NONE) {
+            return "INELIGIBLE|"
+                    + model.kind + "|"
+                    + model.alias + "|"
+                    + model.eligible + "|"
+                    + model.blockedReason;
+        }
+        // Eligible path — bucketEnteredMs already advances only on
+        // renderable-kind transitions, so it stabilizes the key without
+        // bringing back per-tick mid/eventMs drift. Drop mid; keep
+        // bucketEnteredMs so legitimate kind transitions still trigger a
+        // repaint.
+        return model.kind + "|"
+                + model.alias + "|"
+                + model.bucketEnteredMs + "|"
+                + model.eligible + "|"
+                + model.blockedReason + "|"
+                + model.eventMsSource;
     }
 
     long computeSleepMs(boolean ok) {

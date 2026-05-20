@@ -17,8 +17,10 @@ Reads `~/.bookmap-mcp/bridge.properties` for the URL + token by default. Overrid
 ## Session conviction (v2 — anchored multi-source)
 
 `compute_session_conviction()` in `bookmap_mcp/dashboard.py` runs a per-alias
-session-anchored (08:30 CT daily) weighted conviction model over 15 explicit
-sources rather than the legacy EMA-over-7-labels accumulator. Each source
+session-anchored weighted conviction model — anchored at the operator's
+OpenRange UI session (published via `or_session.effective_session_anchor()`,
+fallback 08:30 CT only when no OR config has ever been written) — over 15
+explicit sources rather than the legacy EMA-over-7-labels accumulator. Each source
 returns `{score, reliability, raw, reason}`; the engine maintains a per-source
 ring of `(ts_ms, value)` bounded by the medium window and aggregates a score
 from the short SMA (30 s), the medium SMA (120 s), and the session SMA. Each

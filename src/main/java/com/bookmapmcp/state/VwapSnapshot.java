@@ -3,9 +3,11 @@ package com.bookmapmcp.state;
 /**
  * Session-anchored VWAP plus ±1σ/±2σ/±3σ extension bands.
  *
- * <p>Session anchor is 09:30 America/New_York (= 08:30 America/Chicago).
- * Accumulators reset whenever a trade arrives in a new session window so
- * playback or overnight restarts get a clean slate.
+ * <p>Session anchor is the operator-configured OR start time (pushed from
+ * the dashboard via POST /config; stored in
+ * {@link InstrumentState#configSessionOpen()}). Accumulators reset whenever
+ * a trade arrives in a new session window so playback or overnight restarts
+ * get a clean slate.
  *
  * <p>If no trades have arrived this session, {@link #samples()} is 0 and
  * the band fields are {@code NaN}. Handlers should serialize NaN as null.

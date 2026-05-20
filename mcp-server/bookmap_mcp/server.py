@@ -110,8 +110,9 @@ def build_server() -> FastMCP:
     def bookmap_vwap(alias: str) -> Dict[str, Any]:
         """Session-anchored VWAP plus +/- 1, 2, 3 sigma extension bands.
 
-        Session anchor is 09:30 America/New_York (= 08:30 America/Chicago, CME
-        RTH cash-equity open). Accumulators reset each day across that boundary.
+        Session anchor is the operator's OpenRange UI setting (published via
+        or_session.effective_session_anchor() and pushed to the bridge on
+        every snapshot poll). Accumulators reset across that boundary.
 
         Returns: vwap, stddev, upper1/lower1, upper2/lower2, upper3/lower3,
         samples (trades counted this session), sessionStartUtc, sessionStartCt,

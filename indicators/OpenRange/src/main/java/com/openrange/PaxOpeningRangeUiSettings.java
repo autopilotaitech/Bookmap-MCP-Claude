@@ -5,14 +5,22 @@ import java.time.LocalTime;
 
 import velox.api.layer1.settings.StrategySettingsVersion;
 
-@StrategySettingsVersion(currentVersion = 2, compatibleVersions = {1})
+@StrategySettingsVersion(currentVersion = 3, compatibleVersions = {1, 2})
 public class PaxOpeningRangeUiSettings {
-    public int startHour = 9;
+    // Canonical institutional OR anchor: 08:30 America/Chicago. The default
+    // line end matches the anchor — PaxOpeningRangeSettings.lineEndDateTime
+    // interprets lineEnd <= rangeEnd as "extend to next session's open",
+    // giving a 24h line span (drawDay anchors at maxEnd).
+    public int startHour   = 8;
     public int startMinute = 30;
     public int startSecond = 0;
     public int rangeSeconds = 30;
-    public int endHour = 17;
-    public int endMinute = 0;
+    public int endHour   = 8;
+    public int endMinute = 30;
+    /** Migration breadcrumb. Old V1/V2 stored settings have this implicit
+     *  false; the module's acceptSettingsInterface uses that signal plus
+     *  the exact old-default tuple to upgrade quietly to canonical 08:30. */
+    public boolean migratedToCanonical0830 = false;
     public int daysToDisplay = 8;
     public boolean showMid = false;
     public String labelPrefix = "OpenRange";

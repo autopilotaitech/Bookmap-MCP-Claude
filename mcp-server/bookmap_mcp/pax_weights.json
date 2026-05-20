@@ -48,7 +48,7 @@
   },
 
   "conviction_windows_sec": {
-    "_comment": "Anchored rolling windows for per-source SMA. 'short' = fast-reaction window. 'medium' = primary stability window. 'session' is anchored at 08:30 CT.",
+    "_comment": "Anchored rolling windows for per-source SMA. 'short' = fast-reaction window. 'medium' = primary stability window. 'session' is anchored at the OR UI session (or_session.effective_session_anchor()).",
     "short":                  30,
     "medium":                 120,
     "freshness_halflife_sec": 8,

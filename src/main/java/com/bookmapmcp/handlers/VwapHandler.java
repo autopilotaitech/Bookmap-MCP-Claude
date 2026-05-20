@@ -17,9 +17,15 @@ import com.bookmapmcp.state.VwapSnapshot;
 /**
  * GET /vwap?alias=...
  *
- * <p>Returns BOTH the RTH (08:30–15:00 CT) and ETH (24h from 17:00 CT)
- * session-anchored VWAPs plus their ±1σ/±2σ/±3σ bands. Top-level fields are
- * RTH (most useful for ORB); same fields are also nested under "rth" and "eth".
+ * <p>Returns the OR-session VWAP (anchored at the operator-configured
+ * OpenRange start time; accumulates every trade until the next OR-open
+ * crossing) plus a 17:00-CT-anchored informational overlay.
+ *
+ * <p>The "rth" sub-object is now the OR-session bucket (legacy field name
+ * kept for ABI compat). Top-level fields mirror "rth" — this is what the
+ * dashboard consumes for vwap_obj. The "eth" sub-object is purely
+ * informational; it always rolls at 17:00 CT regardless of OR setting and
+ * is NOT consumed by the dashboard or trading decisions.
  */
 public final class VwapHandler implements HttpHandler {
 

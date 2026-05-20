@@ -110,14 +110,11 @@ SETTINGS_DEFAULTS: Dict[str, Any] = {
     "vp_lvn_reliability":          0.5,
     "vp_neutral_reliability":      0.5,
 
-    # ─── V3: Java-bridge VWAP/VP runtime config ─────────────────────────
+    # ─── V3: Java-bridge runtime config ─────────────────────────────────
     # Pushed to the bridge's POST /config endpoint by _sync_bridge_config()
-    # in dashboard.py. These reconfigure VWAP RTH/ETH anchor times and the
-    # volume-profile value-area share inside InstrumentState.java. Anchor
-    # changes cause the next VWAP/VP snapshot to roll into a fresh session.
-    "bridge_rth_open_hhmm_ct":    "08:30",
-    "bridge_rth_close_hhmm_ct":   "15:00",
-    "bridge_eth_open_hhmm_ct":    "17:00",
+    # in dashboard.py. The bridge's session anchor (rth_open) is published
+    # from the OpenRange UI via or_session.effective_session_anchor() —
+    # not a dashboard setting. Only vp_value_area_pct is mutable here.
     "bridge_vp_value_area_pct":   0.70,
 }
 
@@ -189,10 +186,7 @@ SETTINGS_SCHEMA: Dict[str, FieldSpec] = {
     "vp_lvn_reliability":         FieldSpec("float", minimum=0.0, maximum=1.0),
     "vp_neutral_reliability":     FieldSpec("float", minimum=0.0, maximum=1.0),
 
-    # V3: Java-bridge runtime config
-    "bridge_rth_open_hhmm_ct":  FieldSpec("hhmm"),
-    "bridge_rth_close_hhmm_ct": FieldSpec("hhmm"),
-    "bridge_eth_open_hhmm_ct":  FieldSpec("hhmm"),
+    # V3: Java-bridge runtime config (session anchor comes from OR UI)
     "bridge_vp_value_area_pct": FieldSpec("float", minimum=0.01, maximum=1.0),
 }
 
@@ -370,15 +364,8 @@ def _cross_field_errors(merged: Dict[str, Any]) -> List[str]:
             "vwap_mean_revert scores must satisfy 1_2 <= 2_3 <= 3_plus "
             f"(got {m12}, {m23}, {m3p})"
         )
-    # V3: bridge RTH open must be strictly earlier than RTH close.
-    rth_o, _ = _parse_hhmm(merged["bridge_rth_open_hhmm_ct"])
-    rth_c, _ = _parse_hhmm(merged["bridge_rth_close_hhmm_ct"])
-    if rth_o is not None and rth_c is not None:
-        if (rth_o[0] * 60 + rth_o[1]) >= (rth_c[0] * 60 + rth_c[1]):
-            errors.append(
-                "bridge_rth_open_hhmm_ct must be < bridge_rth_close_hhmm_ct "
-                f"(got {merged['bridge_rth_open_hhmm_ct']} >= {merged['bridge_rth_close_hhmm_ct']})"
-            )
+    # V3: bridge session anchor is sourced from the OR UI (or_session),
+    # not from these settings. Nothing to cross-validate here.
     return errors
 
 

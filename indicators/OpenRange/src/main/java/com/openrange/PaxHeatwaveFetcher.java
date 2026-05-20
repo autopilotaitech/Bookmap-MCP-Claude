@@ -17,6 +17,7 @@ final class PaxHeatwaveFetcher {
     static final int FAIL_BACKOFF_THRESHOLD = 3;
     static final long MAX_BACKOFF_MS = 5_000L;
     static final long LOG_THROTTLE_MS = 60_000L;
+    static final long UNCHANGED_REPAINT_MIN_MS = 5_000L;
     static final String DEFAULT_URL = "http://127.0.0.1:18888/api/snapshot";
 
     private final Object lifecycleLock = new Object();
@@ -35,6 +36,8 @@ final class PaxHeatwaveFetcher {
      * HTTP endpoint itself is unreachable. */
     private volatile String lastFailureReason = "";
     private volatile long lastFailureAtMs = 0L;
+    private volatile String lastRepaintKey = "";
+    private volatile long lastRepaintAtMs = 0L;
 
     PaxHeatwaveFetcher(Runnable repaintCallback) {
         this.repaintCallback = repaintCallback;
@@ -207,7 +210,7 @@ final class PaxHeatwaveFetcher {
             PaxHeatwaveModel parsed = PaxHeatwaveSnapshotParser.parse(resp.body(), nowMs);
             latest = parsed;
             consecutiveFailures.set(0);
-            fireRepaint();
+            fireRepaintIfNeeded(parsed, nowMs);
             return true;
         } catch (PaxHeatwaveSnapshotParser.ParseException pe) {
             handleFailure(nowMs, "parse: " + pe.getMessage());
@@ -246,6 +249,66 @@ final class PaxHeatwaveFetcher {
             cb.run();
         } catch (Throwable t) {
             // Never let painter exceptions kill the fetch loop
+        }
+    }
+
+    private void fireRepaintIfNeeded(PaxHeatwaveModel parsed, long nowMs) {
+        String key = semanticKey(parsed);
+        boolean changed = !key.equals(lastRepaintKey);
+        if (changed || nowMs - lastRepaintAtMs >= UNCHANGED_REPAINT_MIN_MS) {
+            lastRepaintKey = key;
+            lastRepaintAtMs = nowMs;
+            fireRepaint();
+        }
+    }
+
+    private static String semanticKey(PaxHeatwaveModel model) {
+        if (model == null) {
+            return "null";
+        }
+        StringBuilder sb = new StringBuilder(256);
+        sb.append(model.state).append('|')
+          .append(model.verdict).append('|')
+          .append(model.verdictTone).append('|')
+          .append(quantize(model.scoreText)).append('|')
+          .append(model.offlineUrl).append('|')
+          .append(model.offlineReason);
+        if (model.rows != null) {
+            for (PaxHeatwaveModel.Row row : model.rows) {
+                if (row == null) {
+                    sb.append("|<null>");
+                } else {
+                    sb.append('|').append(row.label)
+                      .append(':').append(quantize(row.scoreText))
+                      .append(':').append(row.tone)
+                      .append(':').append(row.hint);
+                }
+            }
+        }
+        return sb.toString();
+    }
+
+    /** Quantize a "%+0.2f" or "+NN" formatted score to 0.1 granularity so
+     * tiny ±0.01 jitter does not invalidate the repaint dedup. Returns the
+     * input unchanged for non-numeric strings like "--". */
+    static String quantize(String scoreText) {
+        if (scoreText == null || scoreText.isEmpty() || "--".equals(scoreText)) {
+            return scoreText == null ? "" : scoreText;
+        }
+        try {
+            // Drop a single leading '+' that Double.parseDouble rejects.
+            String s = scoreText.charAt(0) == '+' ? scoreText.substring(1) : scoreText;
+            // Verdict score uses "+NN"/"-NN" (percent ×100); row scores use
+            // "+0.NN" / "-0.NN". Quantize anything in [-1,1] to 0.1; anything
+            // outside (verdict percent) is already discrete enough.
+            double v = Double.parseDouble(s);
+            if (Math.abs(v) <= 1.0) {
+                long q = Math.round(v * 10.0);
+                return String.format(java.util.Locale.ROOT, "%+.1f", q / 10.0);
+            }
+            return scoreText;
+        } catch (NumberFormatException nfe) {
+            return scoreText;
         }
     }
 

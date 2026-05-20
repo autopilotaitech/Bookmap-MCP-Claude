@@ -17,9 +17,14 @@ import com.bookmapmcp.state.VolumeProfileSnapshot;
 /**
  * GET /volume_profile?alias=...
  *
- * <p>Returns both RTH (08:30–15:00 CT, cleared each RTH open) and ETH
- * (17:00 CT prev → 17:00 CT, full trading day including overnight) volume
- * profiles. Top-level fields are RTH for backward compat.
+ * <p>Returns the OR-session volume profile (anchored at the operator-
+ * configured OpenRange start time; accumulates continuously between two
+ * OR-open moments) plus a 17:00-CT-anchored informational overlay.
+ *
+ * <p>Top-level fields = OR-session bucket. The "rth" sub-object is the
+ * same OR-session bucket (legacy field name kept for ABI compat); "eth"
+ * is the informational 17:00 overlay and is NOT consumed by the dashboard
+ * or trading decisions.
  */
 public final class VolumeProfileHandler implements HttpHandler {
 

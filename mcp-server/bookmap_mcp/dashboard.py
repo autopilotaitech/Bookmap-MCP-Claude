@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from . import settings as _settings
+from . import or_session as _or_session
 from .bridge_client import BridgeClient, BridgeError
 from .config import BridgeConfig, MissingTokenError, _config_path as _bridge_config_path
 
@@ -86,16 +87,56 @@ _SNAPSHOT_CACHE: Optional[Tuple[float, Dict[str, Any]]] = None
 _MAGNET_REFRESH_SECS = 60.0
 
 
-def session_state(now_et: dt.datetime) -> Tuple[str, str]:
-    minutes = now_et.hour * 60 + now_et.minute
-    if minutes < 9*60+30:   return ("PRE_MARKET",   "PRE-MARKET")
-    if minutes < 9*60+45:   return ("OR_FORMING",   "OR FORMING (no entry)")
-    if minutes < 11*60+30:  return ("ACTIVE",       "RTH ACTIVE")
-    if minutes < 12*60:     return ("LATE_MORNING", "Late morning")
-    if minutes < 13*60+30:  return ("CHOP",         "CHOP ZONE (no new entries)")
-    if minutes < 15*60+30:  return ("AFTERNOON",    "RTH afternoon")
-    if minutes < 16*60:     return ("CLOSE_RISK",   "CLOSE RISK (no new entries)")
-    return ("POST_MARKET", "POST-MARKET")
+# The OpenRange Bookmap indicator owns the session anchor (start time,
+# range seconds, line end, timezone). It publishes its effective settings
+# to or-session-config.json; we read them via the or_session module so
+# every consumer of session_state uses the operator's configured anchor.
+# Hard-coded values used to live here; they are now gone — fallback values
+# are documented in or_session._FALLBACK and only apply if OpenRange has
+# never published a config (e.g., fresh install before first attach).
+
+
+def _most_recent_session_anchor(now_local: dt.datetime, anchor_time: dt.time) -> dt.datetime:
+    """Return the most-recent {anchor_time} moment ≤ now_local on the OR
+    timezone. If now is before today's anchor, anchor is yesterday's."""
+    today_open = now_local.replace(hour=anchor_time.hour,
+                                    minute=anchor_time.minute,
+                                    second=anchor_time.second, microsecond=0)
+    if now_local < today_open:
+        return today_open - dt.timedelta(days=1)
+    return today_open
+
+
+def session_state(now: dt.datetime) -> Tuple[str, str]:
+    """Return (code, label) for the operator-configured OR session.
+
+    The OR anchor (start time, range seconds, timezone) comes from
+    or_session.effective_session_anchor() — i.e., the OpenRange indicator
+    settings. Codes:
+
+      OR_FORMING — within rangeSeconds after the most recent OR anchor.
+      ACTIVE     — every other moment between two anchors.
+
+    There is no PRE_SESSION/POST_MARKET/CHOP/CLOSE_RISK code: futures
+    trading runs 24h between two OR anchors, and adverse states are
+    expressed by the OTHER gates (news, OR bias, VWAP/OR, stretch, momentum).
+    """
+    anchor = _or_session.effective_session_anchor()
+    try:
+        tz = ZoneInfo(anchor["timezone"])
+    except Exception:
+        tz = DISPLAY_TZ
+    now_local = now.astimezone(tz) if now.tzinfo is not None else now.replace(tzinfo=tz)
+    anchor_time = dt.time(anchor["hour"], anchor["minute"], anchor["second"])
+    most_recent = _most_recent_session_anchor(now_local, anchor_time)
+    delta = (now_local - most_recent).total_seconds()
+    tz_label = anchor["timezone"].split("/")[-1].replace("_", " ")
+    label_anchor = most_recent.strftime(f"%Y-%m-%d {anchor_time.strftime('%H:%M')} {tz_label}")
+    source = anchor.get("source", "unknown")
+    suffix = "" if anchor.get("available") else f" [{source}]"
+    if delta < anchor["rangeSeconds"]:
+        return ("OR_FORMING", f"OR FORMING ({label_anchor}){suffix}")
+    return ("ACTIVE", f"ACTIVE ({label_anchor} anchor){suffix}")
 
 
 def news_blackout(now_et: dt.datetime) -> Tuple[bool, str]:
@@ -906,7 +947,8 @@ def _score_level(side: str, price: float, mid: float,
 def compute_or_levels(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Build the OR + extension level grid with per-level reaction bias.
 
-    Returns None if the OR isn't set yet (CSV missing, before 08:30:30 CT, etc).
+    Returns None if the OR isn't set yet (CSV missing, before the OR window
+    has closed for the configured operator anchor, etc).
     """
     or_row = snap.get("or_row")
     if not or_row: return None
@@ -988,7 +1030,7 @@ def compute_or_levels(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     middle_lock = not in_proximity and (or_low <= mid <= or_high)
 
     return {
-        "anchor":      "RTH 08:30 CT (30s)",
+        "anchor":      "OR Session (from operator OR settings, 30s)",
         "orHigh":      round(or_high, 2),
         "orLow":       round(or_low, 2),
         "orWidthPts":  round(or_high - or_low, 2),
@@ -1171,19 +1213,68 @@ def _clip(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return x
 
 
-def compute_vwap_bias(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _unavailable_bias(kind: str, reason: str) -> Dict[str, Any]:
+    """Explicit unavailable bias payload — never `None`, so the Heatwave
+    parser can render a clear "NO VWAP"/"NO VP" hint instead of a blank
+    cell. Keeps `score=0` with `label="UNAVAILABLE"` so downstream
+    weighted math (which keys off label/score) treats the source as
+    neutral. Reliability gating in `_source_*` is independent.
+    """
+    return {
+        "score": 0.0,
+        "label": "UNAVAILABLE",
+        "available": False,
+        "components": {"reason": reason, "kind": kind},
+        "reasons":   [f"{kind} unavailable: {reason}"],
+    }
+
+
+def compute_vwap_bias(snap: Dict[str, Any]) -> Dict[str, Any]:
     """Composite VWAP-based bias score in [-1,+1].
 
-    Reads vwap_obj (RTH-anchored with σ-bands) + ETH overlay + volume_profile.
-    Returns None when there's no usable VWAP data yet (no RTH trades).
+    Reads vwap_obj (OR-session-anchored with σ-bands; bridge's RTH_OPEN
+    is set by the dashboard from the OR UI anchor) + volume_profile. Always
+    returns a payload (never None). Three states:
+      - available=True  — full composite computable; label BULLISH/BEARISH/NEUTRAL.
+      - label=NO_SIGMA  — VWAP exists but σ is still warming; score 0, vwap+mid
+                          carried so consumers can render "VWAP ok σ warming".
+      - label=UNAVAILABLE — no usable VWAP payload at all.
     """
     vobj = snap.get("vwap_obj") or {}
-    if not vobj or "_error" in vobj: return None
+    if not vobj:
+        return _unavailable_bias("vwap_bias", "no vwap payload")
+    if "_error" in vobj:
+        return _unavailable_bias("vwap_bias", f"bridge: {vobj.get('_error')}")
     vwap   = vobj.get("vwap")
     stddev = vobj.get("stddev")
     last   = vobj.get("lastTradePrice")
-    if vwap is None or stddev is None or stddev <= 0 or last is None:
-        return None
+    if vwap is None:
+        return _unavailable_bias("vwap_bias", "no vwap value")
+    # Partial-availability: VWAP exists but σ is missing/zero. Return a
+    # NO_SIGMA payload that carries the vwap + mid so Heatwave/operator UIs
+    # can show "VWAP ok σ warming" instead of a blank cell. Score stays 0;
+    # reliability gating in _source_vwap_dislocation is independent.
+    if stddev is None or stddev <= 0:
+        partial_mid = last
+        book = snap.get("book") or {}
+        if book.get("mid") is not None:
+            try: partial_mid = float(book.get("mid"))
+            except (TypeError, ValueError): pass
+        return {
+            "score": 0.0,
+            "label": "NO_SIGMA",
+            "available": False,
+            "components": {
+                "reason": "σ warming (insufficient trades)",
+                "kind": "vwap_bias",
+                "vwap": float(vwap),
+            },
+            "reasons": ["VWAP ok, σ warming"],
+            "vwap": float(vwap),
+            "mid":  partial_mid if partial_mid is not None else None,
+        }
+    if last is None:
+        return _unavailable_bias("vwap_bias", "no last trade")
 
     book = snap.get("book") or {}
     mid = book.get("mid")
@@ -1222,16 +1313,19 @@ def compute_vwap_bias(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     components["regime"] = reg_label
     reasons.append(reg_label)
 
-    # 3) RTH vs ETH VWAP divergence — uses ETH overlay if present
-    eth = vobj.get("eth") if isinstance(vobj.get("eth"), dict) else None
-    s_div = 0.0
-    if eth and eth.get("vwap"):
+    # 3) (REMOVED in v20) ETH-overlay divergence. The bridge's `vwap_obj.eth`
+    # is the 17:00-CT-anchored informational overlay — it is NOT anchored to
+    # the operator's OR session. Including it as a weighted score made the
+    # production VWAP bias depend on a hard-coded session anchor. The
+    # overlay value, if present, is now copied into `components` purely
+    # for display, with `divDecisionWeight=0` documenting that it has no
+    # influence on `score`.
+    eth_overlay = vobj.get("eth") if isinstance(vobj.get("eth"), dict) else None
+    if eth_overlay and eth_overlay.get("vwap"):
         try:
-            div = float(vwap) - float(eth["vwap"])
-            # Normalize by stddev — gives σ-units of RTH-vs-ETH dislocation
-            s_div = _clip(div / float(stddev) / 1.5)
-            components["rth_eth_div_sigma"] = round(div / float(stddev), 2)
-            reasons.append(f"RTH-ETH {div:+.2f} ({components['rth_eth_div_sigma']:+.2f}σ)")
+            div = float(vwap) - float(eth_overlay["vwap"])
+            components["overlay_eth_div_sigma"] = round(div / float(stddev), 2)
+            components["divDecisionWeight"]     = 0.0
         except (TypeError, ValueError, ZeroDivisionError):
             pass
 
@@ -1262,13 +1356,13 @@ def compute_vwap_bias(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     components.update({
         "sigma":        round(s_sigma, 2),
         "regime_score": round(s_regime, 2),
-        "rth_eth":      round(s_div, 2),
         "vwd":          round(s_vwd, 2),
     })
 
-    w = {"sigma": 0.20, "regime": 0.35, "div": 0.20, "vwd": 0.25}
-    score = (w["sigma"]*s_sigma + w["regime"]*s_regime
-           + w["div"]*s_div     + w["vwd"]*s_vwd)
+    # v20 weights (no ETH divergence): sum to 1.0. Re-allocated proportionally
+    # from the dropped 0.20 div weight to sigma / regime / vwd.
+    w = {"sigma": 0.25, "regime": 0.40, "vwd": 0.35}
+    score = (w["sigma"]*s_sigma + w["regime"]*s_regime + w["vwd"]*s_vwd)
     score = _clip(score)
 
     if   score >  0.25: label = "BULLISH"
@@ -1278,6 +1372,7 @@ def compute_vwap_bias(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return {
         "score": round(score, 3),
         "label": label,
+        "available": True,
         "components": components,
         "reasons": reasons,
         "vwap": float(vwap),
@@ -1313,13 +1408,36 @@ def _detect_hvn_lvn(levels: List[Dict[str, Any]],
     return hvn, lvn
 
 
-def compute_vp_bias(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Composite Volume Profile bias in [-1,+1]."""
+def compute_vp_bias(snap: Dict[str, Any]) -> Dict[str, Any]:
+    """Composite Volume Profile bias in [-1,+1]. Always returns a payload
+    (never None). Three states:
+      - available=True  — full composite computable.
+      - label=NO_VALUE_AREA — POC exists, VAH/VAL still warming.
+      - label=UNAVAILABLE — no usable VP payload.
+    """
     vp = snap.get("volume_profile")
-    if not vp or vp.get("_error"): return None
+    if not vp:
+        return _unavailable_bias("vp_bias", "no volume_profile payload")
+    if vp.get("_error"):
+        return _unavailable_bias("vp_bias", f"bridge: {vp.get('_error')}")
     poc = vp.get("vpoc") or vp.get("poc")
     vah = vp.get("vah"); val = vp.get("val")
-    if poc is None or vah is None or val is None: return None
+    if poc is None:
+        return _unavailable_bias("vp_bias", "no POC")
+    # Partial-availability: POC computed but value area still warming.
+    if vah is None or val is None:
+        return {
+            "score": 0.0,
+            "label": "NO_VALUE_AREA",
+            "available": False,
+            "components": {
+                "reason": "value area warming",
+                "kind": "vp_bias",
+                "poc": float(poc),
+            },
+            "reasons": ["VP POC ok, value area warming"],
+            "poc": float(poc),
+        }
 
     book = snap.get("book") or {}
     mid = book.get("mid")
@@ -1327,7 +1445,8 @@ def compute_vp_bias(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         v = snap.get("vwap_obj") or {}
         mid = v.get("lastTradePrice")
     try: mid = float(mid)
-    except (TypeError, ValueError): return None
+    except (TypeError, ValueError):
+        return _unavailable_bias("vp_bias", "no mid")
 
     vobj = snap.get("vwap_obj") or {}
     sigma_proxy = vobj.get("stddev") or max((float(vah) - float(val)) / 2.0, 1.0)
@@ -1405,6 +1524,7 @@ def compute_vp_bias(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return {
         "score": round(score, 3),
         "label": label,
+        "available": True,
         "components": components,
         "reasons": reasons,
         "poc": float(poc), "vah": vah_f, "val": val_f,
@@ -1442,18 +1562,20 @@ def vwap_or_gate(book: Dict, vwap: Optional[float], or_row: Optional[Dict]) -> D
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase A: Session Conviction Accumulator
 #
-# Starts at 0 at 08:30 CT every day. On each poll, integrates the latest
-# values of regime / bias / VWAP slope / level reaction / VP day-type into a
-# slow-moving conviction number in [-1, +1]. Each component has its own time
-# decay (fast for microstructure, slow for day-type), so the score is robust
-# to noise but responsive to actual institutional flow.
+# Starts at 0 at every OR session anchor (operator-configured via the
+# OpenRange Bookmap indicator UI, published through or_session.py). On each
+# poll, integrates the latest values of regime / bias / VWAP slope / level
+# reaction / VP day-type into a slow-moving conviction number in [-1, +1].
+# Each component has its own time decay (fast for microstructure, slow for
+# day-type), so the score is robust to noise but responsive to actual
+# institutional flow.
 #
 # Outputs a single number you can watch all day: when it's been rising for 30
 # min, you're following a real accumulation. When it whipsaws, the day is
 # chop — stand down. This is the "follow $" trend signal.
 #
-# State is per-alias (one accumulator per attached instrument). Resets at
-# 08:30 CT every day automatically.
+# State is per-alias (one accumulator per attached instrument). Resets when
+# the OR UI anchor changes (operator switches start time, or daily rollover).
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Component weights — tuned in Phase D from the outcome tracker. Hot-reloaded
@@ -1861,13 +1983,42 @@ def _prune_ring(ring: List[Tuple[int, float]], now_ms: int, window_sec: float
     return [(ts, v) for ts, v in ring if ts >= cutoff]
 
 
-def _conv_session_anchor(now_et: dt.datetime) -> Tuple[int, dt.datetime]:
-    """Return the most recent 08:30 CT anchor before now_et."""
-    now_ct = now_et.astimezone(DISPLAY_TZ)
-    anchor = now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
-    if now_ct < anchor:
-        anchor = anchor - dt.timedelta(days=1)
-    return int(anchor.timestamp() * 1000), anchor
+def _conv_session_anchor(now: dt.datetime,
+                         anchor: Optional[Dict[str, Any]] = None
+                         ) -> Tuple[int, dt.datetime, Dict[str, Any]]:
+    """Return (anchor_ms, anchor_dt, meta) for the most recent OR session
+    anchor before ``now``.
+
+    The OR anchor (hour/minute/second/timezone) is the one the operator
+    configured in the OpenRange Bookmap indicator and published via
+    or_session.effective_session_anchor(). When ``anchor`` is provided the
+    caller is reusing a resolved anchor (one read per snapshot); otherwise
+    we resolve it here. The returned ``meta`` carries anchorMode /
+    anchorSource / anchorReason / anchorHHMM / anchorTz / anchorPath /
+    anchorAgeMs so downstream callers can surface them without re-deriving.
+    """
+    if anchor is None:
+        anchor = _or_session.effective_session_anchor()
+    try:
+        tz = ZoneInfo(anchor["timezone"])
+    except Exception:
+        tz = DISPLAY_TZ
+    now_local = now.astimezone(tz) if now.tzinfo is not None else now.replace(tzinfo=tz)
+    anchor_time = dt.time(int(anchor["hour"]),
+                          int(anchor["minute"]),
+                          int(anchor.get("second", 0)))
+    anchor_dt = _most_recent_session_anchor(now_local, anchor_time)
+    anchor_ms = int(anchor_dt.timestamp() * 1000)
+    meta = {
+        "anchorMode":   anchor.get("anchorMode", "FALLBACK"),
+        "anchorSource": anchor.get("source", "unknown"),
+        "anchorReason": anchor.get("reason"),
+        "anchorHHMM":   f"{int(anchor['hour']):02d}:{int(anchor['minute']):02d}",
+        "anchorTz":     str(anchor.get("timezone", "America/Chicago")),
+        "anchorPath":   anchor.get("path"),
+        "anchorAgeMs":  anchor.get("ageMs"),
+    }
+    return anchor_ms, anchor_dt, meta
 
 
 def _regime_to_signal(regime: str, confidence: float) -> float:
@@ -2481,22 +2632,51 @@ def _source_trend_analyzer(snap: Dict[str, Any]) -> Dict[str, Any]:
       - `eventMs` is NEVER compared to dashboard wall-clock — it can be
         hours behind under playback.
     """
-    ta = snap.get("trend_analyzer")
-    if not isinstance(ta, dict) or "_error" in ta:
-        return {"score": 0.0, "reliability": 0.0,
-                "raw": {"_present": False}, "reason": "no trend_analyzer"}
-    if not ta.get("warmedUp"):
-        return {"score": 0.0, "reliability": 0.0,
-                "raw": {"warmedUp": False}, "reason": "warmup"}
-    updated_at_ms = ta.get("updatedAtMs")
-    if updated_at_ms is None:
-        return {"score": 0.0, "reliability": 0.0,
-                "raw": {"updatedAtMs": None}, "reason": "no updatedAtMs"}
-    age_sec = (int(time.time() * 1000) - int(updated_at_ms)) / 1000.0
-    if age_sec > 30.0:
-        return {"score": 0.0, "reliability": 0.0,
-                "raw": {"ageSec": round(age_sec, 1)}, "reason": "stale"}
+    # Stable raw schema — every state returns the same key set, so consumers
+    # (Heatwave parser, debug UI, tests) never have to special-case missing
+    # fields. status ∈ {MISSING, ERROR, WARMING, STALE, LIVE}.
+    def _raw(status: str, *, score: float = 0.0, present: bool = False,
+             warmed: bool = False,
+             fast_dir: Optional[str] = None, slow_dir: Optional[str] = None,
+             f_sign: float = 0.0, s_sign: float = 0.0,
+             f_conf: float = 0.0, s_conf: float = 0.0,
+             f_chop: bool = False, s_chop: bool = False,
+             rel_hint: str = "", age_sec: Optional[float] = None,
+             event_ms: Optional[int] = None,
+             updated_at_ms: Optional[int] = None,
+             error: Optional[str] = None) -> Dict[str, Any]:
+        return {
+            "status":          status,
+            "_present":        present,
+            "warmedUp":        warmed,
+            "score":           round(score, 4),
+            "fastDirection":   fast_dir,
+            "slowDirection":   slow_dir,
+            "fastSign":        f_sign,
+            "slowSign":        s_sign,
+            "fastConf":        f_conf,
+            "slowConf":        s_conf,
+            "fastChop":        f_chop,
+            "slowChop":        s_chop,
+            "reliabilityHint": rel_hint,
+            "ageSec":          round(age_sec, 1) if age_sec is not None else None,
+            "eventMs":         event_ms,
+            "updatedAtMs":     updated_at_ms,
+            "error":           error,
+        }
 
+    ta = snap.get("trend_analyzer")
+    if not isinstance(ta, dict):
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": _raw("MISSING", rel_hint="no payload"),
+                "reason": "no trend_analyzer"}
+    if "_error" in ta:
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": _raw("ERROR", present=True, error=str(ta.get("_error")),
+                            rel_hint="error"),
+                "reason": f"error: {ta.get('_error')}"}
+
+    warmed = bool(ta.get("warmedUp"))
     fast = ta.get("fast") or {}
     slow = ta.get("slow") or {}
     f_sign, _  = _as_float(fast.get("directionSign"))
@@ -2505,28 +2685,70 @@ def _source_trend_analyzer(snap: Dict[str, Any]) -> Dict[str, Any]:
     s_conf, _  = _as_float(slow.get("confidence"))
     f_chop = bool(fast.get("chop"))
     s_chop = bool(slow.get("chop"))
+    f_dir  = fast.get("direction")
+    s_dir  = slow.get("direction")
+    rel_hint_bridge = ta.get("reliabilityHint")
+    event_ms        = ta.get("eventMs")
+    updated_at_ms   = ta.get("updatedAtMs")
+
+    if not warmed:
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": _raw("WARMING", present=True, warmed=False,
+                            fast_dir=f_dir, slow_dir=s_dir,
+                            f_sign=f_sign, s_sign=s_sign,
+                            f_conf=f_conf, s_conf=s_conf,
+                            f_chop=f_chop, s_chop=s_chop,
+                            rel_hint=rel_hint_bridge or "warmup",
+                            event_ms=event_ms, updated_at_ms=updated_at_ms),
+                "reason": "warmup"}
+    if updated_at_ms is None:
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": _raw("STALE", present=True, warmed=warmed,
+                            fast_dir=f_dir, slow_dir=s_dir,
+                            f_sign=f_sign, s_sign=s_sign,
+                            f_conf=f_conf, s_conf=s_conf,
+                            f_chop=f_chop, s_chop=s_chop,
+                            rel_hint="no updatedAtMs",
+                            event_ms=event_ms),
+                "reason": "no updatedAtMs"}
+    age_sec = (int(time.time() * 1000) - int(updated_at_ms)) / 1000.0
+    if age_sec > 30.0:
+        return {"score": 0.0, "reliability": 0.0,
+                "raw": _raw("STALE", present=True, warmed=warmed,
+                            fast_dir=f_dir, slow_dir=s_dir,
+                            f_sign=f_sign, s_sign=s_sign,
+                            f_conf=f_conf, s_conf=s_conf,
+                            f_chop=f_chop, s_chop=s_chop,
+                            rel_hint=f"stale {age_sec:.0f}s",
+                            age_sec=age_sec, event_ms=event_ms,
+                            updated_at_ms=updated_at_ms),
+                "reason": "stale"}
 
     score = _clip(0.4 * (f_sign * f_conf / 100.0)
                 + 0.6 * (s_sign * s_conf / 100.0))
 
     if f_chop and s_chop:
-        reliability = 0.25
+        reliability = 0.25; rel_hint = "both engines chop"
     elif f_chop or s_chop:
-        reliability = 0.5
+        reliability = 0.5;  rel_hint = "one engine chop"
     elif f_sign != 0 and s_sign != 0 and (f_sign * s_sign) < 0:
-        reliability = 0.6           # engines disagree
+        reliability = 0.6;  rel_hint = "engines disagree"
     else:
-        reliability = 1.0
+        reliability = 1.0;  rel_hint = "engines aligned"
 
     return {
         "score": score,
         "reliability": reliability,
-        "raw": {"fastSign": f_sign, "fastConf": f_conf,
-                "slowSign": s_sign, "slowConf": s_conf,
-                "fastChop": f_chop, "slowChop": s_chop,
-                "ageSec":   round(age_sec, 1)},
-        "reason": (f"fast {fast.get('direction')} c={int(f_conf)} "
-                   f"slow {slow.get('direction')} c={int(s_conf)}"
+        "raw": _raw("LIVE", present=True, warmed=warmed, score=score,
+                    fast_dir=f_dir, slow_dir=s_dir,
+                    f_sign=f_sign, s_sign=s_sign,
+                    f_conf=f_conf, s_conf=s_conf,
+                    f_chop=f_chop, s_chop=s_chop,
+                    rel_hint=rel_hint_bridge or rel_hint,
+                    age_sec=age_sec, event_ms=event_ms,
+                    updated_at_ms=updated_at_ms),
+        "reason": (f"fast {f_dir} c={int(f_conf)} "
+                   f"slow {s_dir} c={int(s_conf)}"
                    + (" CHOP" if (f_chop or s_chop) else "")),
     }
 
@@ -2650,15 +2872,17 @@ def compute_session_conviction(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]
     """Session-anchored multi-source weighted conviction.
 
     Per-source rolling SMAs over short (30s) and medium (120s) windows plus a
-    session-anchored SMA from 08:30 CT, combined into a single source_score in
-    [-1,+1]. Each source declares a reliability that gates its base weight;
-    correlated sources are capped per cluster. The composite is the normalized
-    weighted sum, clipped to [-1,+1].
+    session-anchored SMA from the operator's OpenRange UI anchor, combined
+    into a single source_score in [-1,+1]. Each source declares a reliability
+    that gates its base weight; correlated sources are capped per cluster.
+    The composite is the normalized weighted sum, clipped to [-1,+1].
 
     Returns a dict with the legacy keys still consumed by dashboard.js
     (score / trajectory / trend / durationSec / anchorMs / anchorIso /
     components / instantaneous / weights) plus the v2 detail blocks
-    (sourceScores / sourceReliability / effectiveWeights / rawSources / method).
+    (sourceScores / sourceReliability / effectiveWeights / rawSources / method)
+    and the OR-anchor metadata (anchorMode / anchorSource / anchorReason /
+    anchorHHMM / anchorTz / anchorPath / anchorAgeMs).
     Returns None only when there is no snapshot health or no alias.
     """
     if snap.get("health") != "ok": return None
@@ -2667,7 +2891,8 @@ def compute_session_conviction(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
     now_et = dt.datetime.now(ET)
     now_ms = int(now_et.timestamp() * 1000)
-    anchor_ms, anchor_dt = _conv_session_anchor(now_et)
+    or_anchor = _or_session.effective_session_anchor()
+    anchor_ms, anchor_dt, anchor_meta = _conv_session_anchor(now_et, or_anchor)
 
     cfg = _load_pax_weights()
     base_weights = cfg.get("conviction_source_weights") or CONVICTION_SOURCE_WEIGHTS
@@ -2822,12 +3047,30 @@ def compute_session_conviction(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]
         "durationSec":       int(duration_sec),
         "anchorMs":          anchor_ms,
         "anchorIso":         st["anchorIso"],
+        # OR-anchor provenance — operator can audit which session anchor
+        # drove this conviction tick. anchorMode is LIVE when the OR
+        # indicator has published a fresh config, else LAST_KNOWN_STALE or
+        # FALLBACK. pax_decision blocks entry when anchorMode != LIVE.
+        "anchorMode":        anchor_meta["anchorMode"],
+        "anchorSource":      anchor_meta["anchorSource"],
+        "anchorReason":      anchor_meta["anchorReason"],
+        "anchorHHMM":        anchor_meta["anchorHHMM"],
+        "anchorTz":          anchor_meta["anchorTz"],
+        "anchorPath":        anchor_meta["anchorPath"],
+        "anchorAgeMs":       anchor_meta["anchorAgeMs"],
         "components":        legacy_components,
         "instantaneous":     legacy_instant,
         "weights":           legacy_weights,
         # v2 detail
         "sourceScores":      {n: round(v, 3) for n, v in source_scores.items()},
         "sourceReliability": {n: round(v, 3) for n, v in source_reliability.items()},
+        # Pre-reliability base weights (the raw operator-configured weight
+        # before reliability multiplication, cluster cap, or share cap).
+        # Used by Heatwave/UI to detect CAPPED/ZEROED states reliably —
+        # CAPPED = effective < base * reliability; ZEROED = effective == 0
+        # while base * reliability > 0.
+        "sourceBaseWeights": {n: round(base_weights.get(n, 0.0), 4)
+                               for n in _CONVICTION_SOURCES},
         "effectiveWeights":  {n: round(v, 4) for n, v in effective.items()},
         "rawSources":        raw_sources,
         "reasons":           reasons,
@@ -2901,8 +3144,20 @@ def pax_decision(snap: Dict[str, Any]) -> Dict[str, Any]:
                 "components": components}
 
     gates = snap.get("gates") or {}
-    session = (gates.get("session") or {}).get("code", "?")
+    ses_obj = gates.get("session") or {}
+    session = ses_obj.get("code", "?")
+    anchor_mode = ses_obj.get("anchorMode") or "FALLBACK"
     components["session"] = session
+    components["anchorMode"] = anchor_mode
+    # v18 stale-policy: pax_decision must not enter trades unless the OR
+    # config is LIVE. Stale/fallback anchors continue to drive VWAP/VP
+    # (so the operator can read state) but pax holds entries.
+    if anchor_mode != "LIVE":
+        return {"decision": "WAIT", "size": 0,
+                "reason": f"OR anchor not LIVE (mode={anchor_mode})",
+                "reasons": [f"anchorMode={anchor_mode}",
+                             f"anchorReason={ses_obj.get('anchorReason') or 'unknown'}"],
+                "components": components}
     if session in ("PRE_MARKET", "OR_FORMING", "POST_MARKET"):
         return {"decision": "WAIT", "size": 0, "reason": f"session {session}",
                 "reasons": [f"session: {session}"], "components": components}
@@ -2983,12 +3238,20 @@ def pax_decision(snap: Dict[str, Any]) -> Dict[str, Any]:
     components["vpBias"]   = vp
     direction = "LONG" if "LONG" in ldec else "SHORT"
     want = "BULLISH" if direction == "LONG" else "BEARISH"
-    if vw and vp and vw != "NEUTRAL" and vp != "NEUTRAL" and vw != want and vp != want:
+    # Partial-availability labels are NEUTRAL/non-voting in trade decisions —
+    # they must not count as "against direction" simply because the σ-band
+    # or value-area is still warming. These are the labels compute_vwap_bias
+    # and compute_vp_bias emit when inputs are present but a sub-component
+    # is missing.
+    _DIRECTIONAL = {"BULLISH", "BEARISH"}
+    vw_dir = vw if vw in _DIRECTIONAL else None
+    vp_dir = vp if vp in _DIRECTIONAL else None
+    if vw_dir and vp_dir and vw_dir != want and vp_dir != want:
         return {"decision": "WAIT", "size": 0,
                 "reason": "both VWAP-bias and VP-bias against direction",
                 "reasons": reasons + [f"want {want}, got VWAP={vw} VP={vp}"],
                 "components": components}
-    agree = int(vw == want) + int(vp == want)
+    agree = int(vw_dir == want) + int(vp_dir == want)
     if agree:
         bag = _settings.get("pax_bias_agreement_boost")
         eff *= 1.0 + bag * agree
@@ -3111,7 +3374,23 @@ def trade_decision(snap: Dict[str, Any]) -> Dict[str, Any]:
     gates: Dict[str, Any] = {}
     ses = snap.get("gates", {}).get("session", {})
     gates["session"] = ses.get("code", "?")
-    if ses.get("code") in ("PRE_MARKET", "OR_FORMING", "CHOP", "CLOSE_RISK", "POST_MARKET"):
+    gates["anchorMode"] = ses.get("anchorMode", "FALLBACK")
+    # Stale/fallback policy (v18): when the OR config is not LIVE, do NOT
+    # take new entries. The bridge keeps VWAP/VP computing with the
+    # last-known anchor (operator can still watch the chart) but trade
+    # decisions WAIT until the operator re-saves OR settings or a fresh
+    # config is published.
+    anchor_mode = ses.get("anchorMode") or "FALLBACK"
+    if anchor_mode != "LIVE":
+        return {"decision": "WAIT", "confidence": "LOW", "size": 0,
+                "entry": None, "stop": None, "target1": None, "target2": None,
+                "reasons": [f"OR anchor not LIVE (mode={anchor_mode}); "
+                            f"reason={ses.get('anchorReason') or 'unknown'}"],
+                "gates": gates}
+    # OR_FORMING (the 30-second OR measurement window immediately after the
+    # OR open) is hard-blocking. Every other ACTIVE moment is gated by
+    # news / OR bias / VWAP-OR / stretch / momentum.
+    if ses.get("code") == "OR_FORMING":
         return {"decision": "WAIT", "confidence": "LOW", "size": 0,
                 "entry": None, "stop": None, "target1": None, "target2": None,
                 "reasons": [f"session: {ses.get('label','?')}"], "gates": gates}
@@ -3280,32 +3559,36 @@ def _sync_magnet_levels(cfg: BridgeConfig, alias: Optional[str],
         _LAST_MAGNETS[alias] = (new_tuple, time.monotonic())
 
 
-# Bridge runtime-config sync. Same pattern as _sync_magnet_levels: cache the
-# last successfully-pushed tuple + monotonic timestamp, refresh whenever the
-# desired values change OR the TTL expires. The bridge does NOT persist
-# /config across Bookmap restarts, so the dashboard must keep re-pushing.
-_LAST_BRIDGE_CONFIG: Optional[Tuple[Tuple[str, str, str, float], float]] = None
+# Bridge runtime-config sync. The bridge's session anchor (rth_open in the
+# legacy parameter name) IS the operator-driven OR start time — pushed
+# from or_session.effective_session_anchor() so VWAP / VP / CVD reset use
+# the same anchor as the OpenRange indicator. vp_value_area_pct is the
+# only other mutable knob.
+_LAST_BRIDGE_CONFIG: Optional[Tuple[Tuple[str, float], float]] = None
 _LAST_BRIDGE_CONFIG_LOCK = threading.Lock()
 
 
 def _sync_bridge_config(cfg: BridgeConfig) -> None:
-    """Push VWAP/VP runtime config (RTH/ETH anchor times, VP value-area %)
-    from pax_settings.json to the Java bridge's POST /config endpoint.
-
-    Cache + TTL pattern: only POSTs when the tuple changes OR the cached
-    write is older than _MAGNET_REFRESH_SECS. Bookmap restart wipes Java's
-    in-memory state, so a TTL re-push is necessary even when nothing changed
-    on the Python side. Catches every exception so a transient failure cannot
-    break fetch_snapshot."""
+    """Push session anchor (from OR config) + VP value-area % to the
+    bridge. Cache + TTL pattern. Errors swallowed so transient failures
+    cannot break fetch_snapshot."""
     global _LAST_BRIDGE_CONFIG
     try:
-        rth_open  = _settings.get("bridge_rth_open_hhmm_ct")
-        rth_close = _settings.get("bridge_rth_close_hhmm_ct")
-        eth_open  = _settings.get("bridge_eth_open_hhmm_ct")
-        vp_pct    = float(_settings.get("bridge_vp_value_area_pct"))
+        vp_pct = float(_settings.get("bridge_vp_value_area_pct"))
     except Exception:
         return
-    desired = (str(rth_open), str(rth_close), str(eth_open), vp_pct)
+    anchor = _or_session.effective_session_anchor()
+    # Always send HH:MM:SS — the bridge's LocalTime.parse accepts both
+    # HH:MM and HH:MM:SS, but truncating here would silently drop the
+    # operator's startSecond and let bridge VWAP/VP/CVD anchor 1-59 seconds
+    # before the dashboard's conviction/session anchors. v20 invariant pins
+    # this: bridge must mirror the full OR start time.
+    rth_open_hms = (
+        f"{int(anchor['hour']):02d}:{int(anchor['minute']):02d}:"
+        f"{int(anchor.get('second', 0)):02d}"
+    )
+
+    desired = (rth_open_hms, vp_pct)
     now_mono = time.monotonic()
     ttl = _settings.get("magnet_refresh_secs")
 
@@ -3319,10 +3602,8 @@ def _sync_bridge_config(cfg: BridgeConfig) -> None:
     try:
         with BridgeClient(cfg, timeout_s=2.0) as client:
             client.post_json("/config", {
-                "rth_open":          desired[0],
-                "rth_close":         desired[1],
-                "eth_open":          desired[2],
-                "vp_value_area_pct": str(desired[3]),
+                "rth_open":          rth_open_hms,
+                "vp_value_area_pct": str(vp_pct),
             })
     except BridgeError as exc:
         sys.stderr.write(f"[dashboard] /config POST failed: {exc}\n")
@@ -3387,11 +3668,26 @@ def fetch_snapshot() -> Dict[str, Any]:
     now_et = dt.datetime.now(ET)
     state, label = session_state(now_et)
     blocked, news_label = news_blackout(now_et)
+    or_session_eff = _or_session.load_effective()
+    or_anchor = _or_session.effective_session_anchor()
     gates_shared = {
         "session": {
             "code": state, "label": label,
             "now_local": dt.datetime.now(DISPLAY_TZ).strftime("%H:%M:%S ") + DISPLAY_TZ_LABEL,
             "now_et":    now_et.strftime("%H:%M:%S ET"),
+            # OR-anchor lineage. v18 adds anchorMode ∈ {LIVE, LAST_KNOWN_STALE,
+            # FALLBACK} for explicit stale-policy gating in trade_decision /
+            # pax_decision.
+            "anchorMode":         or_anchor["anchorMode"],
+            "anchorSource":       or_anchor["source"],
+            "anchorAvailable":    or_anchor["available"],
+            "anchorReason":       or_anchor["reason"],
+            "anchorTimezone":     or_anchor["timezone"],
+            "anchorHHMM":         f"{or_anchor['hour']:02d}:{or_anchor['minute']:02d}",
+            "anchorRangeSeconds": or_anchor["rangeSeconds"],
+            "anchorAgeMs":        or_anchor["ageMs"],
+            "anchorUpdatedAtMs":  or_anchor["updatedAtMs"],
+            "anchorConfigPath":   or_anchor["path"],
         },
         "news":    {"blocked": blocked, "label": news_label},
     }
@@ -3491,6 +3787,14 @@ def _compose_alias_snapshot(c, cfg, alias: str,
     snap: Dict[str, Any] = {
         "health": "ok",
         "ts": now_et.isoformat(timespec="seconds"),
+        # Top-level mirror of gates.session so consumers (Heatwave parser,
+        # journals, debug UIs) don't have to drill into gates. The session
+        # anchor is operator-driven via the OpenRange indicator settings
+        # (or_session.effective_session_anchor()).
+        "session": gates_shared.get("session", {}),
+        # Full OR-session-config payload exposed at top level so operator
+        # UIs and tests can verify the lineage of the active session anchor.
+        "or_session_config": _or_session.load_effective(),
         "ping": ping, "alias": alias, "instruments": instruments,
         "book": book, "trades": trade_list,
         "position": position, "working": working, "balance": balance, "fills": fills,
@@ -3749,11 +4053,11 @@ tr.row-heat { background: var(--row-bg, transparent) !important; }
   </div>
 </div>
 
-<!-- Row 2a: Session conviction (Phase A — anchored 08:30 CT, SMA-integrated) -->
+<!-- Row 2a: Session conviction (anchored at the operator's OR UI session) -->
 <div class="row">
   <div class="card" id="conv-card" style="flex:2;border-left:3px solid #9ece6a;padding:6px 10px;">
     <h2 style="display:flex;justify-content:space-between;align-items:center;margin:0;">
-      <span>Session conviction <span class="muted" style="font-size:10px;font-weight:400;text-transform:none;letter-spacing:0;">anchored 08:30 CT · follow the trend</span></span>
+      <span>Session conviction <span class="muted" style="font-size:10px;font-weight:400;text-transform:none;letter-spacing:0;" id="conv-anchor-label">anchored at OR session · follow the trend</span></span>
       <span id="conv-trend"></span>
     </h2>
     <div id="conv-box" style="margin-top:4px;"></div>
@@ -3798,7 +4102,7 @@ tr.row-heat { background: var(--row-bg, transparent) !important; }
 <div class="row">
   <div class="card" style="flex:2">
     <h2 style="display:flex;justify-content:space-between;align-items:center;">
-      Session VWAP &amp; bands (anchor 08:30 CT)
+      Session VWAP &amp; bands <span class="muted" style="font-size:11px;font-weight:400;text-transform:none;letter-spacing:0;" id="vwap-anchor-label">(OR-session anchor)</span>
       <span id="vwap-bias-badge" style="display:flex;gap:6px;align-items:center;"></span>
     </h2>
     <div id="vwap-box"></div>
@@ -4105,7 +4409,7 @@ async function refresh() {
     const msg = (vobj && vobj._error) ? vobj._error : 'no /vwap endpoint — redeploy bridge jar';
     vbox.innerHTML = '<span class="err">'+msg+'</span>';
   } else if (!vobj.samples || vobj.vwap === null || vobj.vwap === undefined) {
-    vbox.innerHTML = '<span class="muted">no trades this session yet — waiting on 08:30 CT open</span>';
+    vbox.innerHTML = '<span class="muted">no trades this session yet — waiting on OR session open</span>';
   } else {
     const last = vobj.lastTradePrice;
     const dev = last !== null && last !== undefined && vobj.stddev > 0
@@ -4135,10 +4439,10 @@ async function refresh() {
     const ethDev = (last !== null && last !== undefined && eth.stddev > 0)
       ? (last - eth.vwap) / eth.stddev : null;
     const lastBig = `<div style="font-size:22px;font-weight:700;color:#cfd6e4;margin-bottom:4px;">${fmtP(last)}</div>`;
-    const rthLine = `<div class="kv"><span><span style="color:#7aa2f7;font-weight:600;">RTH</span> ${fmtP(vobj.vwap)} ±${fmtP(vobj.stddev)}</span>${devBadge(dev)}</div>`;
+    const rthLine = `<div class="kv"><span><span style="color:#7aa2f7;font-weight:600;">OR VWAP</span> ${fmtP(vobj.vwap)} ±${fmtP(vobj.stddev)}</span>${devBadge(dev)}</div>`;
     const ethLine = `<div class="kv"><span><span style="color:#e0af68;font-weight:600;">ETH</span> ${fmtP(eth.vwap)} ±${fmtP(eth.stddev)}</span>${devBadge(ethDev)}</div>`;
     const meta = `<div class="muted" style="font-size:10px;margin-top:4px;line-height:1.5;">` +
-      `RTH: ${fmtN(vobj.samples)} prints · since ${(vobj.sessionStartCt||'').replace('T',' ').substring(11,16)}<br/>` +
+      `OR Session: ${fmtN(vobj.samples)} prints · since ${(vobj.sessionStartCt||'').replace('T',' ').substring(11,16)}<br/>` +
       `ETH: ${fmtN(eth.samples)} prints · since ${(eth.sessionStartCt||'').replace('T',' ').substring(0,16).replace('T',' ')}` +
       `</div>`;
     const right = lastBig + rthLine + ethLine + meta;
@@ -4232,18 +4536,18 @@ async function refresh() {
 
     const sparkSvg = renderSpark(vobj, s.trades, s.volume_profile);
 
-    // Volume profile summary stats below the chart — RTH + ETH side by side
+    // Volume profile summary stats — OR-session bucket (top-level) + ETH overlay (informational)
     let vpSummary = '';
     const vp = s.volume_profile;
     if (vp && !vp._error) {
       const rthLine = (vp.totalVolume > 0)
-        ? `<span style="color:#7aa2f7;">RTH</span>: ${fmtN(vp.totalVolume)} ctr · VPOC ${fmtP(vp.vpoc)} · VA ${fmtP(vp.val)}–${fmtP(vp.vah)} (${Math.round((vp.valueAreaPct||0.7)*100)}%)`
-        : '<span style="color:#7aa2f7;">RTH</span>: <span class="muted">no RTH trades yet (open 08:30 CT)</span>';
+        ? `<span style="color:#7aa2f7;">OR VP</span>: ${fmtN(vp.totalVolume)} ctr · VPOC ${fmtP(vp.vpoc)} · VA ${fmtP(vp.val)}–${fmtP(vp.vah)} (${Math.round((vp.valueAreaPct||0.7)*100)}%)`
+        : '<span style="color:#7aa2f7;">OR VP</span>: <span class="muted">no OR-session trades yet</span>';
       const ev = vp.eth || {};
       const ethLine = (ev.totalVolume > 0)
         ? `<span style="color:#e0af68;">ETH</span>: ${fmtN(ev.totalVolume)} ctr · VPOC ${fmtP(ev.vpoc)} · VA ${fmtP(ev.val)}–${fmtP(ev.vah)} (${Math.round((ev.valueAreaPct||0.7)*100)}%)`
         : '<span style="color:#e0af68;">ETH</span>: <span class="muted">no overnight trades</span>';
-      // Add VP bias badge next to the RTH line
+      // Add VP bias badge next to the OR VP line
       const vpb = s.vp_bias;
       let vpBadge = '';
       if (vpb && vpb.label) {
@@ -5449,26 +5753,14 @@ button:hover { filter:brightness(1.2); }
 </details>
 
 <details id="sec-bridge_config" open>
-  <summary>Java bridge — VWAP / Volume Profile session anchor</summary>
+  <summary>Java bridge — Volume Profile</summary>
   <div style="padding:4px 4px 8px; color:#737994; font-size:11px;">
-    <b style="color:#cfd6e4;">RTH open</b> is the shared anchor for both the
-    VWAP RTH calculation AND the Volume Profile session — Java reads them off
-    the same <code>rthAnchorMs()</code>. Default is <b>08:30 CT</b> (CME RTH
-    open); change it here and both shift on the next poll. ETH open anchors
-    the overnight VWAP; <b>value-area %</b> is the VP value-area share (0.70
-    = traditional 70%). The dashboard pushes these to <code>POST /config</code>
-    on every poll (~1s) via <code>_sync_bridge_config()</code>. Requires
-    <b>bookmap-mcp-bridge-v11.jar</b> or newer.
+    The session anchor is the operator's OpenRange UI setting (see the
+    "OR window" section below). The dashboard pushes that anchor to the
+    bridge on every snapshot poll via <code>POST /config</code> so VWAP,
+    Volume Profile, and the dashboard session gate all share one source of
+    truth. The only runtime-mutable bridge setting is the VP value-area share.
   </div>
-  <div class="row"><label>bridge_rth_open_hhmm_ct</label>
-    <input id="f_bridge_rth_open_hhmm_ct" class="input-num" type="time" data-kind="hhmm">
-    <span class="doc">RTH anchor for VWAP RTH + Volume Profile (default 08:30 CT)</span></div>
-  <div class="row"><label>bridge_rth_close_hhmm_ct</label>
-    <input id="f_bridge_rth_close_hhmm_ct" class="input-num" type="time" data-kind="hhmm">
-    <span class="doc">RTH close — gates the in-RTH window check (default 15:00 CT)</span></div>
-  <div class="row"><label>bridge_eth_open_hhmm_ct</label>
-    <input id="f_bridge_eth_open_hhmm_ct" class="input-num" type="time" data-kind="hhmm">
-    <span class="doc">VWAP ETH session anchor (default 17:00 CT)</span></div>
   <div class="row"><label>bridge_vp_value_area_pct</label>
     <input id="f_bridge_vp_value_area_pct" class="input-num" type="number" step="0.01" min="0.01" max="1" data-kind="float">
     <span class="doc">Volume Profile value-area share (default 0.70 = traditional 70%)</span></div>
@@ -5534,8 +5826,8 @@ const SCALAR_FIELDS = [
   // V2: Volume profile
   'vp_context_proximity_ticks','vp_bin_proximity_ticks','vp_hvn_score',
   'vp_far_reliability','vp_lvn_reliability','vp_neutral_reliability',
-  // V3: Java bridge runtime config
-  'bridge_rth_open_hhmm_ct','bridge_rth_close_hhmm_ct','bridge_eth_open_hhmm_ct',
+  // V3: Java bridge runtime config (session anchor is pushed from OR UI;
+  //     vp_value_area_pct is the only runtime-mutable bridge setting here)
   'bridge_vp_value_area_pct'
 ];
 

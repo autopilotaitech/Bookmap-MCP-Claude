@@ -80,8 +80,140 @@ final class PaxHeatwaveSnapshotParser {
         rows[9] = groupedRow("BOOK", new String[]{"orderbook", "lt_liquidity"},
                 sources, weights, reliab, bookHint(sources));
         rows[10] = singleRow("MICRO", "micro_events", sources, reliab, microHint(root));
+        // TA: TrendAnalyzer collection status + weighted contribution. Shown
+        // as its own row so operators can see whether trend_analyzer is
+        // LIVE / WARMING / STALE / MISSING / ZEROED / CAPPED at a glance.
+        // The composite contribution (effective weight × source score) is
+        // already counted inside the main verdict; this row is the
+        // visibility/audit surface, not double counting.
+        rows[11] = taRow(conviction);
 
         return new PaxHeatwaveModel(verdict, verdictTone, scoreText, rows, fetchedAtMs, true);
+    }
+
+    /**
+     * Build the TrendAnalyzer (TA) row. Pulls the stable raw-payload schema
+     * emitted by _source_trend_analyzer in the dashboard, plus the source's
+     * effective weight + cap state, and renders a compact one-line status.
+     *
+     * Status precedence: MISSING > ERROR > STALE > WARMING > ZEROED >
+     * CAPPED > LIVE. Tone reflects live contribution (bull/bear) or warning
+     * (amber for stale/error) or neutral (for warmup/zeroed/unavailable).
+     */
+    private static Row taRow(Map<?, ?> conviction) {
+        if (conviction == null) {
+            return new Row("TA", "--", Tone.NEUTRAL, "MISSING conviction");
+        }
+        Map<?, ?> raw = null;
+        Object rawSources = conviction.get("rawSources");
+        if (rawSources instanceof Map) {
+            Object trendRaw = ((Map<?, ?>) rawSources).get("trend_analyzer");
+            if (trendRaw instanceof Map) raw = (Map<?, ?>) trendRaw;
+        }
+        Map<?, ?> sourceScores      = asMap(conviction.get("sourceScores"));
+        Map<?, ?> sourceReliability = asMap(conviction.get("sourceReliability"));
+        Map<?, ?> effectiveWeights  = asMap(conviction.get("effectiveWeights"));
+        // Prefer the explicit per-source base weight (v3 conviction
+        // payload). Legacy "weights" is the 7-key compat dict — using it
+        // for trend_analyzer would always return null. Use sourceBaseWeights
+        // when present; fall back to weights only for legacy snapshots.
+        Map<?, ?> baseWeights       = asMap(conviction.get("sourceBaseWeights"));
+        if (baseWeights == null) baseWeights = asMap(conviction.get("weights"));
+
+        Double srcScore = sourceScores == null ? null : asDouble(sourceScores.get("trend_analyzer"));
+        Double srcRel   = sourceReliability == null ? null : asDouble(sourceReliability.get("trend_analyzer"));
+        Double effW     = effectiveWeights == null ? null : asDouble(effectiveWeights.get("trend_analyzer"));
+        Double baseW    = baseWeights == null ? null : asDouble(baseWeights.get("trend_analyzer"));
+
+        // Status word
+        String status;
+        if (raw == null) {
+            status = "MISSING";
+        } else {
+            String s = asString(raw.get("status"));
+            status = s == null ? "MISSING" : s.toUpperCase(Locale.ROOT);
+        }
+
+        // Cap state derived from effective weight: when reliability and base
+        // weight are both > 0 but the effective weight is 0, the source-share
+        // cap zeroed this source (no corroborating signals).
+        boolean zeroed = "LIVE".equals(status) && srcRel != null && srcRel > 0.0
+                && baseW != null && baseW > 0.0
+                && effW != null && Math.abs(effW) < 1e-9;
+        // CAPPED: effective weight is positive but materially below the
+        // "expected" base × reliability product (within 5%). The expected
+        // value is exact only before cluster caps; we use a generous 10%
+        // threshold so the cap state surfaces only when sharply capped.
+        boolean capped = false;
+        if ("LIVE".equals(status) && !zeroed && srcRel != null && srcRel > 0.0
+                && baseW != null && effW != null) {
+            double expected = baseW * srcRel;
+            if (expected > 1e-6 && Math.abs(effW) < expected * 0.5) {
+                capped = true;
+            }
+        }
+
+        String scoreText;
+        Tone tone;
+        StringBuilder hint = new StringBuilder();
+
+        if ("MISSING".equals(status)) {
+            scoreText = "--"; tone = Tone.AMBER;
+            hint.append("MISSING");
+            if (raw != null && raw.get("error") != null) hint.append(" err=").append(raw.get("error"));
+        } else if ("ERROR".equals(status)) {
+            scoreText = "--"; tone = Tone.AMBER;
+            hint.append("ERROR");
+            String err = raw == null ? null : asString(raw.get("error"));
+            if (err != null) hint.append(' ').append(err);
+        } else if ("STALE".equals(status)) {
+            scoreText = "--"; tone = Tone.AMBER;
+            hint.append("STALE");
+            Double age = raw == null ? null : asDouble(raw.get("ageSec"));
+            if (age != null) hint.append(" age=").append(String.format(Locale.ROOT, "%.0fs", age));
+        } else if ("WARMING".equals(status)) {
+            scoreText = "--"; tone = Tone.NEUTRAL;
+            hint.append("WARMING fast=").append(asString(raw.get("fastDirection")) == null ? "--" : asString(raw.get("fastDirection")))
+                .append(" slow=").append(asString(raw.get("slowDirection")) == null ? "--" : asString(raw.get("slowDirection")));
+        } else if (zeroed) {
+            scoreText = srcScore == null ? "--" : formatScore(srcScore);
+            tone = Tone.NEUTRAL;
+            hint.append("ZEROED no-corroborate");
+        } else if ("LIVE".equals(status)) {
+            scoreText = srcScore == null ? "--" : formatScore(srcScore);
+            if (effW != null && srcScore != null && Math.abs(effW) > 1e-9) {
+                double contrib = effW * srcScore;
+                tone = contrib > 0.02 ? Tone.BULL : (contrib < -0.02 ? Tone.BEAR : Tone.NEUTRAL);
+            } else {
+                tone = Tone.NEUTRAL;
+            }
+            // Compact LIVE hint: fast/slow with confidence + age
+            String fd = raw == null ? null : asString(raw.get("fastDirection"));
+            String sd = raw == null ? null : asString(raw.get("slowDirection"));
+            Double fc = raw == null ? null : asDouble(raw.get("fastConf"));
+            Double sc = raw == null ? null : asDouble(raw.get("slowConf"));
+            Double age = raw == null ? null : asDouble(raw.get("ageSec"));
+            hint.append(capped ? "CAPPED " : "LIVE ")
+                .append(compactDir(fd)).append(fc == null ? "--" : String.format(Locale.ROOT, "%.0f", fc))
+                .append('/')
+                .append(compactDir(sd)).append(sc == null ? "--" : String.format(Locale.ROOT, "%.0f", sc));
+            if (srcRel != null) hint.append(" rel=").append(String.format(Locale.ROOT, "%.2f", srcRel));
+            if (age != null)    hint.append(" age=").append(String.format(Locale.ROOT, "%.1fs", age));
+            if (effW != null)   hint.append(" effW=").append(String.format(Locale.ROOT, "%.3f", effW));
+        } else {
+            scoreText = "--"; tone = Tone.NEUTRAL;
+            hint.append(status);
+        }
+        return new Row("TA", scoreText, tone, hint.toString());
+    }
+
+    private static String compactDir(String dir) {
+        if (dir == null) return "--";
+        String u = dir.toUpperCase(Locale.ROOT);
+        if (u.startsWith("UP"))    return "U";
+        if (u.startsWith("DOWN"))  return "D";
+        if (u.startsWith("FLAT"))  return "F";
+        return u.substring(0, Math.min(2, u.length()));
     }
 
     private static String pickVerdict(Map<?, ?> root) {
@@ -373,7 +505,20 @@ final class PaxHeatwaveSnapshotParser {
 
     private static String vwapHint(Map<?, ?> vwapBias) {
         if (vwapBias == null) {
-            return "";
+            return "NO VWAP";
+        }
+        // Dashboard returns explicit availability labels:
+        //  UNAVAILABLE  — nothing yet
+        //  NO_SIGMA     — VWAP exists, σ warming
+        //  BULLISH/BEARISH/NEUTRAL — full composite
+        String biasLabel = asString(vwapBias.get("label"));
+        if ("UNAVAILABLE".equalsIgnoreCase(biasLabel)) {
+            Map<?, ?> comps = asMap(vwapBias.get("components"));
+            String reason = comps == null ? null : asString(comps.get("reason"));
+            return reason == null || reason.isEmpty() ? "NO VWAP" : "NO VWAP: " + reason;
+        }
+        if ("NO_SIGMA".equalsIgnoreCase(biasLabel)) {
+            return "VWAP ok, sigma warming";
         }
         Map<?, ?> components = asMap(vwapBias.get("components"));
         Double sigma = components == null ? null : asDouble(components.get("sigma_z"));
@@ -399,7 +544,16 @@ final class PaxHeatwaveSnapshotParser {
 
     private static String vpHint(Map<?, ?> vpBias) {
         if (vpBias == null) {
-            return "";
+            return "NO VP";
+        }
+        String biasLabel = asString(vpBias.get("label"));
+        if ("UNAVAILABLE".equalsIgnoreCase(biasLabel)) {
+            Map<?, ?> comps = asMap(vpBias.get("components"));
+            String reason = comps == null ? null : asString(comps.get("reason"));
+            return reason == null || reason.isEmpty() ? "NO VP" : "NO VP: " + reason;
+        }
+        if ("NO_VALUE_AREA".equalsIgnoreCase(biasLabel)) {
+            return "POC ok, value area warming";
         }
         Map<?, ?> components = asMap(vpBias.get("components"));
         String va = components == null ? null : asString(components.get("va_state"));
@@ -409,8 +563,7 @@ final class PaxHeatwaveSnapshotParser {
         if (va != null && !va.isEmpty()) {
             return va;
         }
-        String label = asString(vpBias.get("label"));
-        return label == null ? "" : label;
+        return biasLabel == null ? "" : biasLabel;
     }
 
     private static String psHint(Map<?, ?> sources) {

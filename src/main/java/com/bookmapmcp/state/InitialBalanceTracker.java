@@ -30,13 +30,22 @@ import java.time.ZonedDateTime;
  */
 public final class InitialBalanceTracker {
 
-    private static final ZoneId    CT       = ZoneId.of("America/Chicago");
-    private static final LocalTime IB_OPEN  = LocalTime.of(8, 30);
-    private static final LocalTime IB_CLOSE = LocalTime.of(9, 30);
+    /**
+     * v19: IB is now anchored at the operator-configured OR session open
+     * (InstrumentState.configSessionOpen()) and lasts
+     * InstrumentState.configIbSeconds() (default 3600s = 1h, Steidlmayer
+     * canonical). The legacy 08:30-09:30 RTH window is gone; the IB
+     * window follows whatever OR setting the operator has active.
+     */
+    private static final ZoneId CT = ZoneId.of("America/Chicago");
 
     private final Object lock = new Object();
 
     private long   sessionStartMs = 0L;
+    // v19: effective IB window, derived from the OR anchor + configurable IB
+    // seconds at session reset. Exposed in the snapshot for audit.
+    private long   ibOpenMs       = 0L;
+    private long   ibCloseMs      = 0L;
     private double ibHigh = Double.NEGATIVE_INFINITY;
     private double ibLow  = Double.POSITIVE_INFINITY;
     private boolean ibComplete = false;
@@ -55,10 +64,12 @@ public final class InitialBalanceTracker {
     /** Called on every trade. */
     public void onTrade(double price, long nowMs) {
         synchronized (lock) {
-            long sStart = sessionAnchorMs(nowMs);
+            // v19: dynamic OR-anchored IB window.
+            LocalTime sessionOpen = InstrumentState.configSessionOpen();
+            int ibSeconds = InstrumentState.configIbSeconds();
+            long sStart = sessionAnchorMs(nowMs, sessionOpen);
             if (sStart != sessionStartMs) {
-                // New RTH session: archive prior IB into the daily ring (if any),
-                // then reset.
+                // New session — archive prior IB then reset.
                 if (sessionStartMs != 0L && ibLow != Double.POSITIVE_INFINITY) {
                     double range = ibHigh - ibLow;
                     if (range > 0 && lastSessionMsRecorded != sessionStartMs) {
@@ -69,6 +80,8 @@ public final class InitialBalanceTracker {
                     }
                 }
                 sessionStartMs = sStart;
+                ibOpenMs       = sStart;
+                ibCloseMs      = sStart + (long) ibSeconds * 1000L;
                 ibHigh = Double.NEGATIVE_INFINITY;
                 ibLow  = Double.POSITIVE_INFINITY;
                 ibComplete = false;
@@ -81,22 +94,20 @@ public final class InitialBalanceTracker {
             if (price < sessionLow)  sessionLow  = price;
             tradesInSession++;
 
-            // IB capture only during 08:30-09:30 CT
-            ZonedDateTime z = Instant.ofEpochMilli(nowMs).atZone(CT);
-            LocalTime lt = z.toLocalTime();
-            if (!lt.isBefore(IB_OPEN) && lt.isBefore(IB_CLOSE)) {
+            // IB capture window — purely wall-clock-ms based off the OR anchor.
+            if (nowMs >= ibOpenMs && nowMs < ibCloseMs) {
                 if (price > ibHigh) ibHigh = price;
                 if (price < ibLow)  ibLow  = price;
-            } else if (!lt.isBefore(IB_CLOSE)) {
+            } else if (nowMs >= ibCloseMs) {
                 ibComplete = true;
             }
         }
     }
 
-    private long sessionAnchorMs(long nowMs) {
+    private long sessionAnchorMs(long nowMs, LocalTime sessionOpen) {
         ZonedDateTime z = Instant.ofEpochMilli(nowMs).atZone(CT);
         LocalDate d = z.toLocalDate();
-        ZonedDateTime open = d.atTime(IB_OPEN).atZone(CT);
+        ZonedDateTime open = d.atTime(sessionOpen).atZone(CT);
         if (z.isBefore(open)) open = open.minusDays(1);
         return open.toInstant().toEpochMilli();
     }
@@ -143,7 +154,7 @@ public final class InitialBalanceTracker {
             }
 
             return new InitialBalanceSnapshot(
-                sessionStartMs,
+                sessionStartMs, ibOpenMs, ibCloseMs,
                 haveIb ? ibHigh : Double.NaN,
                 haveIb ? ibLow  : Double.NaN,
                 ibRange, ibComplete, ibSizeTag,
@@ -159,27 +170,31 @@ public final class InitialBalanceTracker {
 
     public static final class InitialBalanceSnapshot {
         public final long   sessionStartMs;
+        public final long   ibOpenMs;        // v19: effective IB window open (= sessionStartMs)
+        public final long   ibCloseMs;       // v19: effective IB window close
         public final double ibHigh;
         public final double ibLow;
         public final double ibRange;
         public final boolean ibComplete;
-        public final String ibSizeTag;      // NARROW / NORMAL / WIDE / UNKNOWN
+        public final String ibSizeTag;
         public final double avgIb;
         public final int    avgIbDays;
         public final double sessionHigh;
         public final double sessionLow;
         public final double sessionRange;
-        public final String dayType;        // TREND / NORMAL / NORMAL_VAR / NEUTRAL / NON_TREND / UNKNOWN
-        public final double[] extensionsUp;   // 50%, 100%, 150%, 200% above ibHigh
-        public final double[] extensionsDown; // mirror below ibLow
+        public final String dayType;
+        public final double[] extensionsUp;
+        public final double[] extensionsDown;
 
-        public InitialBalanceSnapshot(long sessionStartMs, double ibHigh, double ibLow, double ibRange,
+        public InitialBalanceSnapshot(long sessionStartMs, long ibOpenMs, long ibCloseMs,
+                                      double ibHigh, double ibLow, double ibRange,
                                       boolean ibComplete, String ibSizeTag,
                                       double avgIb, int avgIbDays,
                                       double sessionHigh, double sessionLow, double sessionRange,
                                       String dayType,
                                       double[] extensionsUp, double[] extensionsDown) {
             this.sessionStartMs = sessionStartMs;
+            this.ibOpenMs = ibOpenMs; this.ibCloseMs = ibCloseMs;
             this.ibHigh = ibHigh; this.ibLow = ibLow; this.ibRange = ibRange;
             this.ibComplete = ibComplete; this.ibSizeTag = ibSizeTag;
             this.avgIb = avgIb; this.avgIbDays = avgIbDays;

@@ -3,7 +3,7 @@ package com.openrange;
 public class PaxHeatwaveSnapshotParserTest {
 
     public static void main(String[] args) {
-        richFixtureBuildsElevenRows();
+        richFixtureBuildsTwelveRows();
         richFixturePicksPaxDecisionFirst();
         richFixtureFlowGroupedWeightedAverage();
         richFixtureOrPicksNearestByAbsDistance();
@@ -19,6 +19,11 @@ public class PaxHeatwaveSnapshotParserTest {
         realisticFixtureFlowUsesFlowRegime();
         realisticFixtureCvdHintBuyOrSellNotRising();
         realisticFixtureFallsBackToDirectVwapKeysWhenComponentsAbsent();
+        taRowMissingWhenConvictionAbsent();
+        taRowReportsMissingWhenRawAbsent();
+        taRowReportsLiveWithFastSlowAndAge();
+        taRowReportsWarmingWhenStatusWarming();
+        taRowReportsStaleWhenStatusStale();
     }
 
     private static final String RICH = ""
@@ -147,11 +152,12 @@ public class PaxHeatwaveSnapshotParserTest {
 
     private static final String MALFORMED = "{not valid json,";
 
-    private static void richFixtureBuildsElevenRows() {
+    private static void richFixtureBuildsTwelveRows() {
         PaxHeatwaveModel m = PaxHeatwaveSnapshotParser.parse(RICH, 1000L);
-        assertEquals(11, m.rows.length, "row count");
-        String[] expected = {"OR ", "FLOW", "OFI", "CVD", "ABSORB", "VWAP", "VP", "PS", "TAPE", "BOOK", "MICRO"};
-        for (int i = 0; i < 11; i++) {
+        assertEquals(12, m.rows.length, "row count");
+        String[] expected = {"OR ", "FLOW", "OFI", "CVD", "ABSORB", "VWAP", "VP",
+                              "PS", "TAPE", "BOOK", "MICRO", "TA"};
+        for (int i = 0; i < 12; i++) {
             if (i == 0) {
                 if (!m.rows[i].label.startsWith("OR")) {
                     throw new AssertionError("row 0 should start with OR; got " + m.rows[i].label);
@@ -159,6 +165,108 @@ public class PaxHeatwaveSnapshotParserTest {
             } else {
                 assertEquals(expected[i], m.rows[i].label, "row " + i + " label");
             }
+        }
+    }
+
+    // ─── TA row visibility tests ──────────────────────────────────────────
+
+    private static void taRowMissingWhenConvictionAbsent() {
+        // Parser falls back to a default WAIT verdict; the TA row should
+        // still exist and show MISSING (12 rows always present).
+        String json = "{\"ts\":\"2026-05-19T11:42:17\",\"or_levels\":{\"levels\":[]}}";
+        PaxHeatwaveModel m = PaxHeatwaveSnapshotParser.parse(json, 1000L);
+        assertEquals(12, m.rows.length, "row count");
+        if (!"TA".equals(m.rows[11].label)) {
+            throw new AssertionError("row 11 must be TA; got " + m.rows[11].label);
+        }
+        if (!m.rows[11].hint.contains("MISSING")) {
+            throw new AssertionError("TA hint must say MISSING when conviction absent; got: "
+                    + m.rows[11].hint);
+        }
+    }
+
+    private static void taRowReportsMissingWhenRawAbsent() {
+        // conviction exists but rawSources.trend_analyzer absent → MISSING.
+        String json = "{\"conviction\":{\"score\":0.0,\"sourceScores\":{},\"effectiveWeights\":{},\"sourceReliability\":{},\"rawSources\":{},\"weights\":{}}}";
+        PaxHeatwaveModel m = PaxHeatwaveSnapshotParser.parse(json, 1000L);
+        if (!m.rows[11].hint.contains("MISSING")) {
+            throw new AssertionError("TA hint must say MISSING when raw absent; got: " + m.rows[11].hint);
+        }
+    }
+
+    private static void taRowReportsLiveWithFastSlowAndAge() {
+        String json = ""
+                + "{\"conviction\":{"
+                + "\"score\":0.30,"
+                + "\"sourceScores\":{\"trend_analyzer\":0.62},"
+                + "\"sourceReliability\":{\"trend_analyzer\":1.0},"
+                + "\"effectiveWeights\":{\"trend_analyzer\":0.06},"
+                + "\"weights\":{\"trend_analyzer\":0.06},"
+                + "\"rawSources\":{\"trend_analyzer\":{"
+                + "\"status\":\"LIVE\",\"_present\":true,\"warmedUp\":true,"
+                + "\"fastDirection\":\"UP\",\"slowDirection\":\"UP\","
+                + "\"fastConf\":82,\"slowConf\":76,"
+                + "\"reliabilityHint\":\"engines aligned\",\"ageSec\":0.8,"
+                + "\"score\":0.62}}"
+                + "}}";
+        PaxHeatwaveModel m = PaxHeatwaveSnapshotParser.parse(json, 1000L);
+        PaxHeatwaveModel.Row ta = m.rows[11];
+        if (!ta.hint.startsWith("LIVE ")) {
+            throw new AssertionError("TA hint should start LIVE; got: " + ta.hint);
+        }
+        if (!ta.hint.contains("U82") || !ta.hint.contains("U76")) {
+            throw new AssertionError("TA hint should contain compact U82/U76; got: " + ta.hint);
+        }
+        if (!ta.hint.contains("age=")) {
+            throw new AssertionError("TA hint should include age=; got: " + ta.hint);
+        }
+        if (ta.tone != PaxHeatwaveModel.Tone.BULL) {
+            throw new AssertionError("TA tone should be BULL for positive contribution; got " + ta.tone);
+        }
+    }
+
+    private static void taRowReportsWarmingWhenStatusWarming() {
+        String json = ""
+                + "{\"conviction\":{"
+                + "\"score\":0.0,"
+                + "\"sourceScores\":{\"trend_analyzer\":0.0},"
+                + "\"sourceReliability\":{\"trend_analyzer\":0.0},"
+                + "\"effectiveWeights\":{\"trend_analyzer\":0.0},"
+                + "\"weights\":{\"trend_analyzer\":0.06},"
+                + "\"rawSources\":{\"trend_analyzer\":{"
+                + "\"status\":\"WARMING\",\"_present\":true,\"warmedUp\":false,"
+                + "\"fastDirection\":null,\"slowDirection\":null,"
+                + "\"reliabilityHint\":\"warmup\"}}"
+                + "}}";
+        PaxHeatwaveModel m = PaxHeatwaveSnapshotParser.parse(json, 1000L);
+        PaxHeatwaveModel.Row ta = m.rows[11];
+        if (!ta.hint.contains("WARMING")) {
+            throw new AssertionError("TA hint should say WARMING; got: " + ta.hint);
+        }
+        if (ta.tone != PaxHeatwaveModel.Tone.NEUTRAL) {
+            throw new AssertionError("TA tone should be NEUTRAL for warmup; got " + ta.tone);
+        }
+    }
+
+    private static void taRowReportsStaleWhenStatusStale() {
+        String json = ""
+                + "{\"conviction\":{"
+                + "\"score\":0.0,"
+                + "\"sourceScores\":{\"trend_analyzer\":0.0},"
+                + "\"sourceReliability\":{\"trend_analyzer\":0.0},"
+                + "\"effectiveWeights\":{\"trend_analyzer\":0.0},"
+                + "\"weights\":{\"trend_analyzer\":0.06},"
+                + "\"rawSources\":{\"trend_analyzer\":{"
+                + "\"status\":\"STALE\",\"_present\":true,\"warmedUp\":true,"
+                + "\"ageSec\":45.0,\"reliabilityHint\":\"stale 45s\"}}"
+                + "}}";
+        PaxHeatwaveModel m = PaxHeatwaveSnapshotParser.parse(json, 1000L);
+        PaxHeatwaveModel.Row ta = m.rows[11];
+        if (!ta.hint.contains("STALE")) {
+            throw new AssertionError("TA hint should say STALE; got: " + ta.hint);
+        }
+        if (ta.tone != PaxHeatwaveModel.Tone.AMBER) {
+            throw new AssertionError("TA tone should be AMBER for stale; got " + ta.tone);
         }
     }
 
@@ -221,12 +329,19 @@ public class PaxHeatwaveSnapshotParserTest {
 
     private static void sparseFixtureProducesNeutralRows() {
         PaxHeatwaveModel m = PaxHeatwaveSnapshotParser.parse(SPARSE, 1000L);
-        assertEquals(11, m.rows.length, "row count");
+        assertEquals(12, m.rows.length, "row count");
+        // Sources 1..10 (FLOW..MICRO) must show -- / NEUTRAL when missing.
         for (int i = 1; i < 11; i++) {
             assertEquals("--", m.rows[i].scoreText, "row " + i + " score should be -- when source missing");
             assertEquals(PaxHeatwaveModel.Tone.NEUTRAL, m.rows[i].tone, "row " + i + " tone");
         }
         assertEquals("--", m.rows[0].scoreText, "OR row should be -- with no levels");
+        // TA row (row 11) reports MISSING with amber tone when conviction
+        // absent — operator must see that trend_analyzer is not contributing.
+        assertEquals("--", m.rows[11].scoreText, "TA score should be -- when no conviction");
+        if (!m.rows[11].hint.contains("MISSING")) {
+            throw new AssertionError("TA hint must contain MISSING; got: " + m.rows[11].hint);
+        }
     }
 
     private static void sparseFixtureFallsBackToTradeDecision() {

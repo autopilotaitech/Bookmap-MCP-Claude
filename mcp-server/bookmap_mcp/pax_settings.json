@@ -47,8 +47,5 @@
   "vp_far_reliability": 0.3,
   "vp_lvn_reliability": 0.5,
   "vp_neutral_reliability": 0.5,
-  "bridge_rth_open_hhmm_ct": "08:30",
-  "bridge_rth_close_hhmm_ct": "15:00",
-  "bridge_eth_open_hhmm_ct": "17:00",
   "bridge_vp_value_area_pct": 0.7
 }

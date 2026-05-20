@@ -14,15 +14,19 @@ import com.bookmapmcp.state.InstrumentState;
 /**
  * GET  /config           — return current VWAP/VP runtime config.
  * POST /config           — update one or more of:
- *   ?rth_open=HH:MM
- *   ?rth_close=HH:MM
- *   ?eth_open=HH:MM
- *   ?vp_value_area_pct=0.70  (must be in (0, 1])
+ *   ?rth_open=HH:MM[:SS]    — institutional session anchor (the bridge
+ *                             tracks the OpenRange OR start time via this
+ *                             field; pushed by the dashboard's
+ *                             _sync_bridge_config every poll). Accepts the
+ *                             full ISO-8601 LocalTime syntax — seconds are
+ *                             preserved so a 17:00:15 OR start anchors
+ *                             VWAP/VP/CVD at the exact second, matching
+ *                             the dashboard's conviction anchor.
+ *   ?vp_value_area_pct=0.70 — VP value-area share, must be in (0, 1].
  *
- * <p>All times are in America/Chicago, matching the rest of the bridge.
- * Any param omitted is left unchanged. Mutations are atomic via
- * InstrumentState.applyConfig(). Changing an anchor time causes the
- * next VWAP/VP snapshot to roll into a fresh session.
+ * <p>{@code rth_close} and {@code eth_open} are retained in the parameter
+ * surface for ABI compatibility but only accept their fixed default
+ * values; posting different values returns 400 bad_config.
  */
 public final class ConfigHandler implements HttpHandler {
 
@@ -52,14 +56,6 @@ public final class ConfigHandler implements HttpHandler {
             return;
         }
 
-        // Validate combined constraints (RTH open < RTH close on the same day).
-        LocalTime effectiveRthOpen  = rthOpen  != null ? rthOpen  : InstrumentState.configRthOpen();
-        LocalTime effectiveRthClose = rthClose != null ? rthClose : InstrumentState.configRthClose();
-        if (!effectiveRthOpen.isBefore(effectiveRthClose)) {
-            Http.writeJsonError(exchange, 400, "bad_window",
-                    "rth_open must be strictly earlier than rth_close.");
-            return;
-        }
         if (vpPct != null && (!Double.isFinite(vpPct) || vpPct <= 0.0 || vpPct > 1.0)) {
             Http.writeJsonError(exchange, 400, "bad_value_area_pct",
                     "vp_value_area_pct must be a number in (0, 1].");
@@ -91,7 +87,8 @@ public final class ConfigHandler implements HttpHandler {
         try {
             return LocalTime.parse(raw);
         } catch (DateTimeParseException e) {
-            throw new IllegalArgumentException("expected HH:MM, got '" + raw + "'");
+            throw new IllegalArgumentException(
+                    "expected HH:MM[:SS] (ISO LocalTime), got '" + raw + "'");
         }
     }
 

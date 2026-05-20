@@ -658,13 +658,29 @@ def _safe_f(x: Any) -> Optional[float]:
 
 
 def _today_rth_anchor_ms() -> int:
-    """Most recent 08:30 CT anchor before now."""
+    """Most recent OR session anchor before now.
+
+    Anchor source: or_session.effective_session_anchor() — the OpenRange
+    indicator UI. Falls back to canonical 08:30 CT only when no OR config
+    has ever been published. Function name keeps the legacy ``rth`` prefix
+    for compatibility with existing audit/event payloads that already log
+    this field; the value itself is OR-anchored.
+    """
     from zoneinfo import ZoneInfo
-    ct = ZoneInfo("America/Chicago")
-    now_ct = dt.datetime.now(ct)
-    anchor = now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
-    if now_ct < anchor: anchor = anchor - dt.timedelta(days=1)
-    return int(anchor.timestamp() * 1000)
+    from . import or_session as _or_session
+    anchor = _or_session.effective_session_anchor()
+    try:
+        tz = ZoneInfo(anchor["timezone"])
+    except Exception:
+        tz = ZoneInfo("America/Chicago")
+    now_local = dt.datetime.now(tz)
+    open_dt = now_local.replace(hour=int(anchor["hour"]),
+                                  minute=int(anchor["minute"]),
+                                  second=int(anchor.get("second", 0)),
+                                  microsecond=0)
+    if now_local < open_dt:
+        open_dt = open_dt - dt.timedelta(days=1)
+    return int(open_dt.timestamp() * 1000)
 
 
 def _today_eod_anchor_ms(hour_ct: int = 15, minute_ct: int = 0) -> int:

@@ -8,36 +8,38 @@ import java.time.ZonedDateTime;
 /**
  * Intraday anchored VWAPs — Brian Shannon's confluence framework, light edition.
  *
- * <p>Tracks two anchored VWAPs that update from the RTH session start (08:30 CT):
+ * <p>Tracks two anchored VWAPs anchored at the OR session start (the
+ * operator-configured OpenRange indicator start time, pushed to the
+ * bridge via /config rth_open):
  * <ul>
  *   <li><b>OpeningDriveTop AVWAP</b> — anchored at the timestamp of the highest
- *       trade during the opening 5 minutes (08:30 – 08:35 CT). This is the
- *       price at which the early longs got positioned.</li>
+ *       trade during the opening-drive window (OR open → OR open +
+ *       {@link InstrumentState#configOpeningDriveSeconds()}).</li>
  *   <li><b>OpeningDriveBottom AVWAP</b> — anchored at the lowest trade during
- *       the same 5-min window. The price at which early shorts got positioned.</li>
+ *       the same window.</li>
  * </ul>
  *
- * <p>Use as confluence levels: when current price approaches an anchored VWAP,
- * the corresponding cohort is at breakeven on the day. Bounces / rejections at
- * these levels are high-probability setups (Shannon, 2022).</p>
- *
- * <p>Anchor pinning: once the 5-min window closes (08:35 CT), the anchor times
- * are frozen for the rest of the session. Before 08:35 the anchor floats as
- * higher highs / lower lows print.</p>
+ * <p>v19 (institutional): both the session anchor AND the drive window are
+ * derived from {@link InstrumentState#configSessionOpen()}, not hard-coded
+ * 08:30 CT. Operator changing OR settings rolls the tracker to the new
+ * anchor at the next trade after the change.
  *
  * <p>Thread-safety: internal lock guards all mutation + snapshot reads. Single
  * onTrade callback from the trade dispatcher.</p>
  */
 public final class AnchoredVwapTracker {
 
-    private static final ZoneId    CT          = ZoneId.of("America/Chicago");
-    private static final LocalTime DRIVE_OPEN  = LocalTime.of(8, 30);
-    private static final LocalTime DRIVE_CLOSE = LocalTime.of(8, 35);
+    private static final ZoneId CT = ZoneId.of("America/Chicago");
 
     private final Object lock = new Object();
 
     // Per-session state (resets across sessions)
     private long   sessionAnchorMs = 0L;
+    // Effective drive window for the active session — derived from the
+    // current InstrumentState.configSessionOpen() and configOpeningDriveSeconds()
+    // at the moment of session reset. Exposed in the snapshot for audit.
+    private long   driveOpenMs     = 0L;
+    private long   driveCloseMs    = 0L;
     private double driveHighPx = Double.NEGATIVE_INFINITY;
     private double driveLowPx  = Double.POSITIVE_INFINITY;
     private long   driveHighMs = 0L;
@@ -60,10 +62,17 @@ public final class AnchoredVwapTracker {
 
     public void onTrade(double price, long size, long nowMs) {
         synchronized (lock) {
-            long sStart = sessionAnchorMs(nowMs);
+            // v19: read OR anchor + drive duration dynamically every tick so
+            // operator changes to the OpenRange indicator propagate live.
+            LocalTime driveOpen = InstrumentState.configSessionOpen();
+            int driveSeconds   = InstrumentState.configOpeningDriveSeconds();
+            long sStart = sessionAnchorMs(nowMs, driveOpen);
             if (sStart != sessionAnchorMs) {
-                // New RTH session — reset everything
+                // New session (first trade after start, OR anchor changed,
+                // or session rolled to next day) — reset everything.
                 sessionAnchorMs = sStart;
+                driveOpenMs     = sStart;
+                driveCloseMs    = sStart + (long) driveSeconds * 1000L;
                 driveHighPx = Double.NEGATIVE_INFINITY;
                 driveLowPx  = Double.POSITIVE_INFINITY;
                 driveHighMs = driveLowMs = 0L;
@@ -73,9 +82,9 @@ public final class AnchoredVwapTracker {
                 driveTradeCount = 0;
             }
 
-            ZonedDateTime z = Instant.ofEpochMilli(nowMs).atZone(CT);
-            LocalTime lt = z.toLocalTime();
-            boolean inDrive = !lt.isBefore(DRIVE_OPEN) && lt.isBefore(DRIVE_CLOSE);
+            // Drive window check is now wall-clock-millis based, derived
+            // directly from the OR-anchored sessionAnchorMs + driveSeconds.
+            boolean inDrive = nowMs >= driveOpenMs && nowMs < driveCloseMs;
 
             boolean topJustAnchored = false;
             boolean botJustAnchored = false;
@@ -107,11 +116,8 @@ public final class AnchoredVwapTracker {
                     botVolume = size;
                     botJustAnchored = true;
                 }
-            } else if (!driveFrozen && !lt.isBefore(DRIVE_CLOSE)) {
-                // Drive just closed — anchors are now frozen for the session.
-                // The AVWAP state at this point is the running VWAP from the
-                // extreme moment, which is what we want for the remainder of
-                // the session.
+            } else if (!driveFrozen && nowMs >= driveCloseMs) {
+                // Drive just closed — anchors frozen for the session.
                 driveFrozen = true;
             }
 
@@ -130,9 +136,9 @@ public final class AnchoredVwapTracker {
         }
     }
 
-    private long sessionAnchorMs(long nowMs) {
+    private long sessionAnchorMs(long nowMs, LocalTime sessionOpen) {
         ZonedDateTime z = Instant.ofEpochMilli(nowMs).atZone(CT);
-        ZonedDateTime open = z.toLocalDate().atTime(DRIVE_OPEN).atZone(CT);
+        ZonedDateTime open = z.toLocalDate().atTime(sessionOpen).atZone(CT);
         if (z.isBefore(open)) open = open.minusDays(1);
         return open.toInstant().toEpochMilli();
     }
@@ -143,6 +149,7 @@ public final class AnchoredVwapTracker {
             double botVwap = botVolume > 0 ? botPriceVolume / botVolume : Double.NaN;
             return new AnchoredVwapSnapshot(
                 sessionAnchorMs,
+                driveOpenMs, driveCloseMs,
                 driveHighPx != Double.NEGATIVE_INFINITY ? driveHighPx : Double.NaN,
                 driveLowPx  != Double.POSITIVE_INFINITY ? driveLowPx  : Double.NaN,
                 driveHighMs, driveLowMs, driveFrozen,
@@ -154,24 +161,29 @@ public final class AnchoredVwapTracker {
 
     public static final class AnchoredVwapSnapshot {
         public final long   sessionAnchorMs;
-        public final double driveHigh;        // highest trade price during the drive window
-        public final double driveLow;         // lowest trade price during the drive window
-        public final long   driveHighMs;      // wall-clock timestamp of driveHigh
-        public final long   driveLowMs;       // wall-clock timestamp of driveLow
-        public final boolean driveFrozen;     // true once the 5-min drive window closed
-        public final long   topAnchorMs;      // when the top AVWAP anchor was set
-        public final double topVwap;          // anchored VWAP from drive top
-        public final long   topVolume;        // contracts traded since anchor
+        public final long   driveOpenMs;      // v19: effective drive window open ms (= sessionAnchorMs)
+        public final long   driveCloseMs;     // v19: effective drive window close ms
+        public final double driveHigh;
+        public final double driveLow;
+        public final long   driveHighMs;
+        public final long   driveLowMs;
+        public final boolean driveFrozen;
+        public final long   topAnchorMs;
+        public final double topVwap;
+        public final long   topVolume;
         public final long   botAnchorMs;
         public final double botVwap;
         public final long   botVolume;
 
         public AnchoredVwapSnapshot(long sessionAnchorMs,
+                                    long driveOpenMs, long driveCloseMs,
                                     double driveHigh, double driveLow,
                                     long driveHighMs, long driveLowMs, boolean driveFrozen,
                                     long topAnchorMs, double topVwap, long topVolume,
                                     long botAnchorMs, double botVwap, long botVolume) {
             this.sessionAnchorMs = sessionAnchorMs;
+            this.driveOpenMs = driveOpenMs;
+            this.driveCloseMs = driveCloseMs;
             this.driveHigh = driveHigh; this.driveLow = driveLow;
             this.driveHighMs = driveHighMs; this.driveLowMs = driveLowMs;
             this.driveFrozen = driveFrozen;

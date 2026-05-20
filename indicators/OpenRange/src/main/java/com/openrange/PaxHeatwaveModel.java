@@ -39,7 +39,7 @@ final class PaxHeatwaveModel {
     }
 
     static final String[] LABELS = new String[] {
-            "OR", "FLOW", "OFI", "CVD", "ABSORB", "VWAP", "VP", "PS", "TAPE", "BOOK", "MICRO"
+            "OR", "FLOW", "OFI", "CVD", "ABSORB", "VWAP", "VP", "PS", "TAPE", "BOOK", "MICRO", "TA"
     };
     static final int ROW_COUNT = LABELS.length;
 

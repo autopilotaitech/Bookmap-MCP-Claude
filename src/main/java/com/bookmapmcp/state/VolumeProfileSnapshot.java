@@ -5,8 +5,9 @@ import java.util.List;
 /**
  * Session-anchored Volume Profile.
  *
- * <p>Tracks total contracts traded at each price tick from the 09:30 ET RTH
- * open. Surfaces:
+ * <p>Tracks total contracts traded at each price tick from the operator's
+ * OR session open (pushed via POST /config; stored in
+ * {@link InstrumentState#configSessionOpen()}). Surfaces:
  * <ul>
  *   <li>{@code vpoc} — point of control (price with the most volume).</li>
  *   <li>{@code vah}/{@code val} — value area high/low (bounds of the 70% volume zone around VPOC).</li>

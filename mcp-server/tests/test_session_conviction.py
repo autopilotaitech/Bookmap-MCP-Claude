@@ -1,6 +1,7 @@
 """Tests for the v2 anchored multi-source conviction engine.
 
-The engine maintains a per-alias session anchor at 08:30 CT. Each tick it pulls
+The engine maintains a per-alias session anchor sourced from the OR UI
+(or_session.effective_session_anchor(); fallback 08:30 CT). Each tick it pulls
 fifteen explicit source signals from the snapshot, pushes the instantaneous
 value into a per-source ring bounded by the medium window, and aggregates a
 score from the short rolling SMA, the medium rolling SMA, and the session SMA.
@@ -872,8 +873,8 @@ def test_trajectory_falling_after_signal_drops():
 
 
 def test_session_reset_clears_accumulators():
-    """When the 08:30 CT anchor advances, every source ring + score ring
-    must be wiped."""
+    """When the OR session anchor advances (daily rollover or operator UI
+    change), every source ring + score ring must be wiped."""
     _reset_state()
     snap = _full_bull_snap()
     alias = snap["alias"]
@@ -882,7 +883,7 @@ def test_session_reset_clears_accumulators():
         _slide_state_back(alias, 1000)
     assert any(len(s["ring"]) > 0 for s in d._CONVICTION_STATE[alias]["sources"].values())
 
-    # Force stale anchor → simulate the daily 08:30 crossover.
+    # Force stale anchor → simulate the daily OR-session crossover.
     d._CONVICTION_STATE[alias]["anchorMs"] = 0
     d.compute_session_conviction(snap)
     # After reset, only the just-pushed sample (the current tick) should be in

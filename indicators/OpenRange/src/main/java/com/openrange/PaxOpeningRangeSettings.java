@@ -47,6 +47,13 @@ public class PaxOpeningRangeSettings {
     }
 
     public LocalDateTime lineEndDateTime(LocalDate date) {
+        // Institutional anchor is 08:30 CT (the OR start). lineEnd is the clock
+        // time at which the OR overlay stops extending. When lineEnd is on or
+        // before rangeEnd on the calendar day, the operator means "next session
+        // start" — extend the line to the same clock time the next day. The
+        // drawing path clamps this maxEnd against the day's lastUpdateTime so
+        // today's line still ends at "now"; past days are bounded by the
+        // calculator's lastUpdateTime maintenance in onInterval.
         LocalDateTime rangeEndDateTime = rangeEndDateTime(date);
         LocalDateTime lineEndDateTime = date.atTime(lineEnd);
         if (!lineEndDateTime.isAfter(rangeEndDateTime)) {

@@ -131,6 +131,8 @@ public final class MomentumHandler implements HttpHandler {
         ed.append(']');
         return new JsonWriter().beginObject()
                 .prop("sessionStartMs", ib.sessionStartMs)
+                .prop("ibOpenMs",  ib.ibOpenMs)
+                .prop("ibCloseMs", ib.ibCloseMs)
                 .prop("ibHigh", ib.ibHigh)
                 .prop("ibLow", ib.ibLow)
                 .prop("ibRange", ib.ibRange)
@@ -151,6 +153,8 @@ public final class MomentumHandler implements HttpHandler {
         com.bookmapmcp.state.AnchoredVwapTracker.AnchoredVwapSnapshot a = state.anchoredVwapSnapshot();
         return new JsonWriter().beginObject()
                 .prop("sessionAnchorMs", a.sessionAnchorMs)
+                .prop("driveOpenMs",  a.driveOpenMs)
+                .prop("driveCloseMs", a.driveCloseMs)
                 .prop("driveHigh", a.driveHigh)
                 .prop("driveLow", a.driveLow)
                 .prop("driveHighMs", a.driveHighMs)

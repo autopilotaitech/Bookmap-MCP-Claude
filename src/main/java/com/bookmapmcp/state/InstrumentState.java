@@ -42,33 +42,64 @@ public final class InstrumentState {
     public static final int MICRO_EVENT_CAPACITY = 200;
 
     private static final ZoneId CT = ZoneId.of("America/Chicago");
-    // Runtime-mutable via POST /config from the Python dashboard. Treat as
-    // volatile static state, NOT constants. Defaults are the CME RTH window;
-    // the Python settings file is authoritative once it pushes a value.
+    // Session anchors. RTH_OPEN is the institutional anchor used for VWAP +
+    // Volume Profile session rolls — runtime-mutable so the bridge follows
+    // whatever the OpenRange indicator publishes via or-session-config.json
+    // (the dashboard pushes it to POST /config on each poll cycle). The
+    // bridge does NOT read the file directly; the dashboard is the single
+    // pusher so a stale or missing file can't introduce a divergence.
     private static volatile LocalTime RTH_OPEN  = LocalTime.of(8, 30);
-    private static volatile LocalTime RTH_CLOSE = LocalTime.of(15, 0);
-    private static volatile LocalTime ETH_OPEN  = LocalTime.of(17, 0);
+    // ETH_OPEN and RTH_CLOSE are retained for state classes (CVD reset,
+    // overnight VWAP buckets) but are NOT runtime-tunable from operator
+    // controls. They are informational and the dashboard's session_state
+    // does not use them.
+    private static final LocalTime RTH_CLOSE = LocalTime.of(15, 0);
+    private static final LocalTime ETH_OPEN  = LocalTime.of(17, 0);
     // Volume-profile value-area share (0.70 = the traditional 70% Steidlmayer
-    // construction). Runtime-mutable via POST /config.
+    // construction). Runtime-mutable.
     private static volatile double VP_VALUE_AREA_PCT = 0.70;
 
-    public static LocalTime configRthOpen()  { return RTH_OPEN; }
-    public static LocalTime configRthClose() { return RTH_CLOSE; }
-    public static LocalTime configEthOpen()  { return ETH_OPEN; }
+    // v19: opening-drive window duration. Default 300s (5 minutes, original
+    // RTH design). When the operator changes the OR anchor, the drive
+    // window anchors at the new OR open and extends for these seconds.
+    private static volatile int OPENING_DRIVE_SECONDS = 300;
+    // v19: Initial Balance duration. Default 3600s (1h, Steidlmayer
+    // canonical). Anchored at OR open.
+    private static volatile int IB_SECONDS = 3600;
+
+    public static int configOpeningDriveSeconds() { return OPENING_DRIVE_SECONDS; }
+    public static int configIbSeconds()           { return IB_SECONDS; }
+
+    public static LocalTime configRthOpen()       { return RTH_OPEN; }
+    public static LocalTime configRthClose()      { return RTH_CLOSE; }
+    public static LocalTime configEthOpen()       { return ETH_OPEN; }
+    /** Alias: the bridge's "RTH_OPEN" IS the operator-driven OR/session
+     *  anchor — name retained for storage/compat. */
+    public static LocalTime configSessionOpen()   { return RTH_OPEN; }
     public static double    configVpValueAreaPct() { return VP_VALUE_AREA_PCT; }
 
     /**
-     * Atomically apply new VWAP/VP config. Any null leaves that value
-     * unchanged. {@code vpValueAreaPct &lt;= 0 || &gt; 1} is rejected. The
-     * caller validates HH:MM strings before constructing the LocalTimes.
-     * Changing an anchor causes the next VWAP/VP snapshot to roll into a
-     * fresh session if {@code anchorMs} differs (existing maybeRoll logic).
+     * Atomically apply runtime config. {@code rthOpen} sets the
+     * institutional session anchor (VWAP / VP / CVD reset); it is the
+     * bridge mirror of the OpenRange OR start time. {@code rthClose} and
+     * {@code ethOpen} are no-ops in this build (informational only) — the
+     * legacy parameters are kept for ABI stability but reject any value
+     * that differs from the fixed defaults. {@code vpValueAreaPct} sets
+     * the VP value-area share.
      */
     public static synchronized void applyConfig(LocalTime rthOpen, LocalTime rthClose,
                                                  LocalTime ethOpen, Double vpValueAreaPct) {
-        if (rthOpen  != null) RTH_OPEN  = rthOpen;
-        if (rthClose != null) RTH_CLOSE = rthClose;
-        if (ethOpen  != null) ETH_OPEN  = ethOpen;
+        if (rthOpen != null) {
+            RTH_OPEN = rthOpen;
+        }
+        if (rthClose != null && !rthClose.equals(RTH_CLOSE)) {
+            throw new IllegalArgumentException(
+                    "rth_close is fixed at 15:00 CT in this bridge build");
+        }
+        if (ethOpen != null && !ethOpen.equals(ETH_OPEN)) {
+            throw new IllegalArgumentException(
+                    "eth_open is fixed at 17:00 CT in this bridge build");
+        }
         if (vpValueAreaPct != null) {
             double v = vpValueAreaPct.doubleValue();
             if (Double.isFinite(v) && v > 0.0 && v <= 1.0) VP_VALUE_AREA_PCT = v;
@@ -252,8 +283,8 @@ public final class InstrumentState {
     private double ps15mMean = 0, ps15mM2 = 0;  private long ps15mN = 0;
 
     // CVD (Cumulative Volume Delta) — running buy aggressor minus sell aggressor.
-    // Anchored at RTH open (08:30 CT), resets daily. Matches what Engineered's
-    // CVD gauge shows in the bottom panel.
+    // Anchored at the operator's OR session open (RTH_OPEN, runtime-mutable
+    // via applyConfig), resets daily across that boundary.
     private final Object cvdLock = new Object();
     private long cvdSessionStartMs = 0L;
     private long cvdValue = 0L;
@@ -520,35 +551,39 @@ public final class InstrumentState {
             if (recentTrades.size() == TRADES_CAPACITY) recentTrades.pollFirst();
             recentTrades.addLast(record);
         }
-        // VWAP RTH/ETH accumulators
+        // VWAP — OR-session accumulator. Anchor is the most-recent OR open
+        // (set via /config rth_open from the OpenRange indicator). Trades
+        // accumulate continuously between two OR-open moments — there is
+        // NO RTH 08:30–15:00 gate. Operator switching OR start time rolls
+        // the bucket at the next anchor crossing via VwapBucket.maybeRoll.
+        // vwapEth retains a 17:00-anchored informational overlay; it is
+        // never read by the production dashboard.
         synchronized (vwapLock) {
             vwapEth.add(price, size, ethAnchorMs(nowMsForSession()));
-            if (isInRthWindow(nowMsForSession())) vwapRth.add(price, size, rthAnchorMs(nowMsForSession()));
-            else                       vwapRth.maybeRoll(rthAnchorMs(nowMsForSession()));
+            vwapRth.add(price, size, rthAnchorMs(nowMsForSession()));
         }
         int tick = (int) Math.round(rawPrice);
-        // Volume profile RTH/ETH
+        // Volume Profile — same OR-session model. Continuous accumulation.
         synchronized (volProfileLock) {
             vpEth.add(tick, size, bidAggressor, ethAnchorMs(nowMsForSession()));
-            if (isInRthWindow(nowMsForSession())) vpRth.add(tick, size, bidAggressor, rthAnchorMs(nowMsForSession()));
-            else                       vpRth.maybeRoll(rthAnchorMs(nowMsForSession()));
+            vpRth.add(tick, size, bidAggressor, rthAnchorMs(nowMsForSession()));
         }
         // A: trade event for the depth-event history
         synchronized (mboLock) {
             if (mboDeltas.size() == MBO_DELTA_CAPACITY) mboDeltas.pollFirst();
             mboDeltas.addLast(new MboDelta(nowMs, !bidAggressor, tick, (byte)3, size));
         }
-        // CVD accumulation — RTH-anchored, resets daily at 08:30 CT.
+        // CVD accumulation — OR-session anchored. Resets at each OR-open
+        // crossing (operator-driven via /config rth_open). Accumulates
+        // every print between two OR-open moments; no RTH window gate.
         synchronized (cvdLock) {
             long anchor = rthAnchorMs(nowMsForSession());
             if (anchor != cvdSessionStartMs) {
                 cvdSessionStartMs = anchor;
                 cvdValue = 0L;
             }
-            if (isInRthWindow(nowMsForSession())) {
-                if (bidAggressor) cvdValue += size;  // buy aggressor (bid was aggressor / lifted offer)
-                else              cvdValue -= size;  // sell aggressor (ask was aggressor / hit bid)
-            }
+            if (bidAggressor) cvdValue += size;  // buy aggressor (bid was aggressor / lifted offer)
+            else              cvdValue -= size;  // sell aggressor (ask was aggressor / hit bid)
         }
         // Flow-regime tracker — feed every print so it can build per-window
         // FlowRegime.onTrade's third arg is `buyAggressor`. Bookmap's bidAggressor
@@ -958,8 +993,8 @@ public final class InstrumentState {
         long nowMs = (nowNanos > 0L) ? (nowNanos / 1_000_000L) : System.currentTimeMillis();
         synchronized (vwapLock) {
             vwapEth.add(price, size, ethAnchorMs(nowMs));
-            if (isInRthWindow(nowMs)) vwapRth.add(price, size, rthAnchorMs(nowMs));
-            else                       vwapRth.maybeRoll(rthAnchorMs(nowMs));
+            // OR-session accumulator — no RTH window gate.
+            vwapRth.add(price, size, rthAnchorMs(nowMs));
         }
     }
 

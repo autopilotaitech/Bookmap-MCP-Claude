@@ -418,7 +418,8 @@ def test_pax_decision_reads_or_width_from_settings(s):
     snap = {
         "health": "ok",
         "alias":  "TEST",
-        "gates":  {"session": {"code": "ACTIVE"}, "news": {"blocked": False}},
+        "gates":  {"session": {"code": "ACTIVE", "anchorMode": "LIVE"},
+                    "news": {"blocked": False}},
         "or_levels": {
             "orHigh": 100.0, "orLow": 90.0, "orWidthPts": 10.0,
             "middleLock": False, "inProximity": False, "levels": [],
@@ -740,21 +741,61 @@ def test_v2_validation_rejects_vwap_mean_revert_out_of_order(s):
     assert any("vwap_mean_revert" in e for e in errs)
 
 
-def test_session_state_uses_hardcoded_literals_not_settings(s):
-    """session_state() must NOT consult settings. OR window is owned by the
-    OR-Strategy addon, not by this dashboard."""
-    from bookmap_mcp import dashboard
+def test_session_state_canonical_0830_ct(s, monkeypatch, tmp_path):
+    """Canonical institutional session model — anchored at the most recent
+    08:30 America/Chicago. A futures trading day runs from one 08:30 CT
+    anchor to the next, so 00:30 CT on Tuesday belongs to Monday's session
+    (ACTIVE), not PRE_SESSION. The only blocking state is OR_FORMING
+    (08:30:00-08:30:30 CT immediately after the anchor).
+
+    Forces or_session to use fallback (no real OR config) so the test is
+    deterministic regardless of what the local Bookmap indicator has
+    published."""
+    from bookmap_mcp import dashboard, or_session
     import datetime as dt
     from zoneinfo import ZoneInfo
     ET = ZoneInfo("America/New_York")
+    CT = ZoneInfo("America/Chicago")
+    monkeypatch.setattr(or_session, "candidate_paths",
+                         lambda: [tmp_path / "no-such-or-config.json"])
     s.load_settings()
 
-    # 09:40 → OR_FORMING (between 09:30 and 09:45 ET).
-    now = dt.datetime(2026, 5, 18, 9, 40, tzinfo=ET)
-    state, _ = dashboard.session_state(now)
-    assert state == "OR_FORMING"
+    # 08:29:59 CT — one second before the anchor; previous session is still
+    # ACTIVE (we use most-recent-anchor semantics, NOT calendar-day).
+    just_before = dt.datetime(2026, 5, 19, 8, 29, 59, tzinfo=CT)
+    code, label = dashboard.session_state(just_before)
+    assert code == "ACTIVE", label
 
-    # No session_*_min_et key should exist in settings any more.
+    # 08:30:00 CT exactly — OR_FORMING starts.
+    at_open = dt.datetime(2026, 5, 19, 8, 30, 0, tzinfo=CT)
+    assert dashboard.session_state(at_open)[0] == "OR_FORMING"
+
+    # 08:30:15 CT — inside the 30s OR window.
+    inside_or = dt.datetime(2026, 5, 19, 8, 30, 15, tzinfo=CT)
+    assert dashboard.session_state(inside_or)[0] == "OR_FORMING"
+
+    # 08:30:31 CT — past OR_FORMING; ACTIVE for today's anchor.
+    just_after = dt.datetime(2026, 5, 19, 8, 30, 31, tzinfo=CT)
+    assert dashboard.session_state(just_after)[0] == "ACTIVE"
+
+    # 17:00 CT same day — still ACTIVE under today's 08:30 anchor.
+    afternoon = dt.datetime(2026, 5, 19, 17, 0, 0, tzinfo=CT)
+    assert dashboard.session_state(afternoon)[0] == "ACTIVE"
+
+    # 00:30 CT next calendar day — ACTIVE under PREVIOUS day's 08:30 anchor.
+    overnight = dt.datetime(2026, 5, 20, 0, 30, 0, tzinfo=CT)
+    assert dashboard.session_state(overnight)[0] == "ACTIVE"
+
+    # 08:29 CT next calendar day — still ACTIVE under previous day's anchor
+    # (anchor hasn't rolled yet).
+    pre_anchor_next = dt.datetime(2026, 5, 20, 8, 29, 0, tzinfo=CT)
+    assert dashboard.session_state(pre_anchor_next)[0] == "ACTIVE"
+
+    # ET callers still work — function converts internally.
+    active_et = dt.datetime(2026, 5, 19, 18, 0, tzinfo=ET)   # == 17:00 CT
+    assert dashboard.session_state(active_et)[0] == "ACTIVE"
+
+    # Legacy ET-anchored session_*_min_et keys remain absent.
     for legacy_key in [
         "session_rth_start_min_et", "session_or_end_min_et",
         "session_late_morning_min_et", "session_chop_start_min_et",
@@ -914,33 +955,27 @@ def test_settings_page_does_not_expose_session_window_fields(http_server):
         assert legacy_marker not in body, f"legacy session field still present: {legacy_marker}"
 
 
-# ─── V3: Java-bridge VWAP / VP runtime config ───────────────────────────────
+# ─── V3: Java-bridge VP runtime config (session anchors are fixed) ──────────
 
 
-def test_v3_defaults_match_java_constants(s):
-    """V3 defaults match the values that lived in InstrumentState.java
-    before they became runtime-mutable."""
+def test_v3_bridge_vp_default_matches_canonical(s):
+    """vp_value_area_pct is the only runtime-mutable bridge field; session
+    anchors are fixed at 08:30 CT in InstrumentState.java."""
     s.load_settings()
-    assert s.SETTINGS_DEFAULTS["bridge_rth_open_hhmm_ct"]  == "08:30"
-    assert s.SETTINGS_DEFAULTS["bridge_rth_close_hhmm_ct"] == "15:00"
-    assert s.SETTINGS_DEFAULTS["bridge_eth_open_hhmm_ct"]  == "17:00"
     assert s.SETTINGS_DEFAULTS["bridge_vp_value_area_pct"] == 0.70
 
 
-@pytest.mark.parametrize("bad", ["", "9:30", "25:00", "12:60", "12-30", "abc", "noon"])
-def test_v3_hhmm_validation_rejects_bad_format(s, bad):
-    proposal = dict(s.SETTINGS_DEFAULTS)
-    proposal["bridge_rth_open_hhmm_ct"] = bad
-    _, errs = s.validate(proposal)
-    assert errs, f"expected error for {bad!r}"
-
-
-def test_v3_validation_rejects_rth_open_at_or_after_close(s):
-    proposal = dict(s.SETTINGS_DEFAULTS)
-    proposal["bridge_rth_open_hhmm_ct"]  = "15:30"
-    proposal["bridge_rth_close_hhmm_ct"] = "15:00"
-    _, errs = s.validate(proposal)
-    assert any("bridge_rth_open" in e and "bridge_rth_close" in e for e in errs)
+def test_v3_bridge_session_anchors_are_not_dashboard_settings(s):
+    """Legacy bridge_rth_open / bridge_rth_close / bridge_eth_open keys MUST
+    NOT exist — they were deliberately removed so the dashboard cannot drift
+    the canonical 08:30 CT institutional anchor."""
+    for legacy in (
+        "bridge_rth_open_hhmm_ct",
+        "bridge_rth_close_hhmm_ct",
+        "bridge_eth_open_hhmm_ct",
+    ):
+        assert legacy not in s.SETTINGS_DEFAULTS, f"{legacy} must be removed"
+        assert legacy not in s.SETTINGS_SCHEMA,   f"{legacy} must be removed"
 
 
 def test_v3_validation_rejects_vp_pct_out_of_range(s):
@@ -953,45 +988,36 @@ def test_v3_validation_rejects_vp_pct_out_of_range(s):
     assert any("bridge_vp_value_area_pct" in e for e in errs)
 
 
-def test_v3_apply_via_http(http_server, s):
-    """Push V3 fields via /api/settings; values land in cache.
-
-    Defaults are CME standards: RTH 08:30 CT open, 15:00 CT close, ETH
-    17:00 CT, value area 0.70. This test uses *different* values just to
-    verify that an apply actually changes the cache."""
+def test_v3_apply_vp_pct_via_http(http_server, s):
+    """vp_value_area_pct apply lands in the cache."""
     s.load_settings()
     status, body = _http_post(http_server + "/api/settings",
-                               {"updates": {
-                                   "bridge_rth_open_hhmm_ct":  "08:00",
-                                   "bridge_rth_close_hhmm_ct": "15:30",
-                                   "bridge_eth_open_hhmm_ct":  "17:30",
-                                   "bridge_vp_value_area_pct": 0.68,
-                               }})
+                               {"updates": {"bridge_vp_value_area_pct": 0.68}})
     assert status == 200, body
-    assert s.get("bridge_rth_open_hhmm_ct")  == "08:00"
-    assert s.get("bridge_rth_close_hhmm_ct") == "15:30"
-    assert s.get("bridge_eth_open_hhmm_ct")  == "17:30"
     assert s.get("bridge_vp_value_area_pct") == 0.68
 
 
-def test_v3_settings_page_has_bridge_config_section(http_server):
-    """Page must expose the Java bridge config controls."""
+def test_v3_settings_page_only_exposes_vp_pct(http_server):
+    """Page exposes vp_value_area_pct but no session-anchor controls."""
     status, body, _ = _http_get(http_server + "/settings")
-    for marker in [
-        "sec-bridge_config",
-        "f_bridge_rth_open_hhmm_ct", "f_bridge_rth_close_hhmm_ct",
-        "f_bridge_eth_open_hhmm_ct", "f_bridge_vp_value_area_pct",
-        "bookmap-mcp-bridge-v11", "POST /config",
-    ]:
-        assert marker in body, f"missing marker {marker}"
+    assert "f_bridge_vp_value_area_pct" in body
+    # Legacy anchor inputs must be gone.
+    for legacy in (
+        "f_bridge_rth_open_hhmm_ct",
+        "f_bridge_rth_close_hhmm_ct",
+        "f_bridge_eth_open_hhmm_ct",
+    ):
+        assert legacy not in body, f"legacy input {legacy} still rendered"
 
 
-def test_v3_sync_bridge_config_posts_once_then_caches(s, monkeypatch):
-    """_sync_bridge_config should POST on first call and skip on second
-    (cache hit within TTL)."""
-    from bookmap_mcp import dashboard
+def test_v3_sync_bridge_config_posts_anchor_and_vp_then_caches(s, monkeypatch, tmp_path):
+    """First call pushes rth_open (from OR config) + vp_value_area_pct;
+    second within TTL is a no-op. Forces or_session fallback so the
+    assertion is independent of any locally-published OR config file."""
+    from bookmap_mcp import dashboard, or_session
+    monkeypatch.setattr(or_session, "candidate_paths",
+                         lambda: [tmp_path / "no-such-or-config.json"])
     s.load_settings()
-    # Reset bridge-config sync cache.
     dashboard._LAST_BRIDGE_CONFIG = None
 
     posts: List[Tuple[str, Dict[str, str]]] = []
@@ -1010,9 +1036,11 @@ def test_v3_sync_bridge_config_posts_once_then_caches(s, monkeypatch):
     dashboard._sync_bridge_config(fake_cfg)
     assert len(posts) == 1, posts
     assert posts[0][0] == "/config"
-    assert posts[0][1]["rth_open"]          == "08:30"
-    assert posts[0][1]["rth_close"]         == "15:00"
-    assert posts[0][1]["eth_open"]          == "17:00"
+    keys = set(posts[0][1].keys())
+    assert keys == {"rth_open", "vp_value_area_pct"}, posts
+    # rth_open comes from the OR config (or fallback). v20: always-HH:MM:SS
+    # so the bridge mirrors operator startSecond. Default fallback is 08:30:00.
+    assert posts[0][1]["rth_open"] == "08:30:00"
     assert float(posts[0][1]["vp_value_area_pct"]) == pytest.approx(0.70)
 
     # Second call within TTL: should not POST.
@@ -1020,8 +1048,7 @@ def test_v3_sync_bridge_config_posts_once_then_caches(s, monkeypatch):
     assert len(posts) == 1, posts
 
 
-def test_v3_sync_bridge_config_repushes_on_settings_change(s, monkeypatch):
-    """Changing a bridge setting should trigger a fresh POST even within TTL."""
+def test_v3_sync_bridge_config_repushes_on_vp_change(s, monkeypatch):
     from bookmap_mcp import dashboard
     s.load_settings()
     dashboard._LAST_BRIDGE_CONFIG = None
@@ -1048,7 +1075,6 @@ def test_v3_sync_bridge_config_repushes_on_settings_change(s, monkeypatch):
 
 
 def test_v3_sync_bridge_config_swallows_bridge_errors(s, monkeypatch):
-    """A bridge failure must not propagate to fetch_snapshot."""
     from bookmap_mcp import dashboard
     s.load_settings()
     dashboard._LAST_BRIDGE_CONFIG = None
@@ -1061,7 +1087,5 @@ def test_v3_sync_bridge_config_swallows_bridge_errors(s, monkeypatch):
             raise dashboard.BridgeError("simulated network failure")
 
     monkeypatch.setattr(dashboard, "BridgeClient", FakeClient)
-    # Must NOT raise.
     dashboard._sync_bridge_config(object())
-    # Cache must NOT have been updated on failure (next call should retry).
     assert dashboard._LAST_BRIDGE_CONFIG is None

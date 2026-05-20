@@ -18,6 +18,9 @@ public class PaxOpeningRangeCalculatorTest {
         liveRangeBoundaryMatchesBackfillBoundary();
         liveRangeNotCompletedWithoutAnyObservation();
         overnightLineEndExtendsPastMidnight();
+        sameClockLineEndExtendsToNextSessionStart();
+        canonicalEightThirtyStartLineEndExtendsToNextSession();
+        canonicalEightThirtyOpeningRangeCompletesAtExpectedTime();
         dynamicLevelsWorkWhenLineEndIsEarlierClockTime();
     }
 
@@ -110,6 +113,58 @@ public class PaxOpeningRangeCalculatorTest {
                 "evening range end");
         assertEquals(LocalDateTime.of(2026, 5, 11, 17, 0), settings.lineEndDateTime(date),
                 "line end earlier on the clock must resolve to next day");
+    }
+
+    private static void sameClockLineEndExtendsToNextSessionStart() {
+        // When the user's lineEnd matches the OR rangeStart, the operator's
+        // intent is "extend the line until the next session opens." Past code
+        // collapsed this to a zero-width span; the drawDay path clamps the
+        // maxEnd against lastUpdateTime so today's line still ends at "now"
+        // and past days remain bounded by the calculator's lastUpdateTime.
+        PaxOpeningRangeSettings settings = new PaxOpeningRangeSettings(
+                LocalTime.of(17, 0), 30, LocalTime.of(17, 0), 8, false, "OR");
+        LocalDate date = LocalDate.of(2026, 5, 19);
+
+        assertEquals(LocalDateTime.of(2026, 5, 20, 17, 0), settings.lineEndDateTime(date),
+                "lineEnd == rangeStart should extend overlay to next session's open, not collapse");
+    }
+
+    private static void canonicalEightThirtyStartLineEndExtendsToNextSession() {
+        // Canonical institutional session: 08:30 CT. With lineEnd defaulted to
+        // the same clock as rangeStart, the OR overlay must span until 08:30
+        // the next day (clamped by lastUpdateTime in drawDay).
+        PaxOpeningRangeSettings settings = new PaxOpeningRangeSettings(
+                LocalTime.of(8, 30), 30, LocalTime.of(8, 30), 8, false, "OR");
+        LocalDate date = LocalDate.of(2026, 5, 19);
+
+        assertEquals(LocalDateTime.of(2026, 5, 19, 8, 30, 30), settings.rangeEndDateTime(date),
+                "08:30 OR completes at 08:30:30");
+        assertEquals(LocalDateTime.of(2026, 5, 20, 8, 30), settings.lineEndDateTime(date),
+                "08:30 lineEnd must extend overlay to next 08:30 session start");
+    }
+
+    private static void canonicalEightThirtyOpeningRangeCompletesAtExpectedTime() {
+        // Use lineEnd later in the same day to avoid the dynamic-levels gate
+        // tripping on overnight semantics for this completion-only test.
+        PaxOpeningRangeSettings settings = new PaxOpeningRangeSettings(
+                LocalTime.of(8, 30), 30, LocalTime.of(15, 0), 8, false, "OR");
+        PaxOpeningRangeCalculator calculator = new PaxOpeningRangeCalculator(settings, "ESM6", 0.25);
+        LocalDate date = LocalDate.of(2026, 5, 19);
+
+        calculator.onTrade(LocalDateTime.of(date, LocalTime.of(8, 30, 0)),  5000.00);
+        calculator.onTrade(LocalDateTime.of(date, LocalTime.of(8, 30, 10)), 5012.00);
+        calculator.onTrade(LocalDateTime.of(date, LocalTime.of(8, 30, 30)), 5008.00);
+        // Post-range tick to drive a dynamic level emission.
+        calculator.onTrade(LocalDateTime.of(date, LocalTime.of(8, 35, 0)),  5028.00);
+
+        PaxOpeningRangeDayState day = calculator.getDay(date);
+        assertTrue(day.isComplete(), "08:30 OR should complete at 08:30:30");
+        assertEquals(5012.00, day.getHigh(), "08:30 high");
+        assertEquals(5000.00, day.getLow(),  "08:30 low");
+        // ES level factor = 15. Initial upper level = high + 15 = 5027. Post-range
+        // trade at 5028 breaks it and adds a second upper level.
+        assertTrue(day.getUpperLevels().size() >= 1,
+                "08:30 session must emit at least the initial upper level");
     }
 
     private static void dynamicLevelsWorkWhenLineEndIsEarlierClockTime() {
