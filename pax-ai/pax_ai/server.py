@@ -39,6 +39,36 @@ _DASHBOARD_TIMEOUT_S = 2.0
 
 
 # ---------------------------------------------------------------------------
+# Request-parameter parsing helpers
+# ---------------------------------------------------------------------------
+
+HISTORY_LIMIT_DEFAULT = 50
+HISTORY_LIMIT_MIN = 1
+HISTORY_LIMIT_MAX = 500
+
+
+def _clamp_history_limit(raw_value: Any) -> int:
+    """Coerce an arbitrary query-string value into a safe history limit.
+
+    Semantics: missing / empty / non-integer -> default 50.
+    Out-of-range integers are clamped to [1, 500] rather than rejected --
+    history is read-only and a clamp gives a useful response where a 400
+    would just confuse callers. Matches journal.recent's own clamp.
+    """
+    if raw_value is None or raw_value == "":
+        return HISTORY_LIMIT_DEFAULT
+    try:
+        n = int(raw_value)
+    except (TypeError, ValueError):
+        return HISTORY_LIMIT_DEFAULT
+    if n < HISTORY_LIMIT_MIN:
+        return HISTORY_LIMIT_MIN
+    if n > HISTORY_LIMIT_MAX:
+        return HISTORY_LIMIT_MAX
+    return n
+
+
+# ---------------------------------------------------------------------------
 # Legacy proxy (still works; used by /api/snapshot for debugging)
 # ---------------------------------------------------------------------------
 
@@ -306,14 +336,16 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/pax/chat/history":
                 from urllib.parse import parse_qs
                 q = parse_qs(urlparse(self.path).query)
-                limit = int(q.get("limit", [50])[0])
-                scope = q.get("scope", ["all"])[0]   # 'all' | 'run'
+                limit_raw = (q.get("limit") or [None])[0]
+                limit = _clamp_history_limit(limit_raw)
+                scope = (q.get("scope") or ["all"])[0]   # 'all' | 'run'
                 run = journal.current_run_id() if scope == "run" else None
                 rows = journal.recent(limit=limit, run_id=run)
                 self._send_json(200, {
                     "rows":        rows,
                     "run_id":      journal.current_run_id(),
                     "scope":       scope,
+                    "limit":       limit,
                 })
                 return
             self._send_json(404, {"error": "not found", "path": path})

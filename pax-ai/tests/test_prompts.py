@@ -39,5 +39,60 @@ def test_render_system_prompt_contains_preamble_and_skills():
     assert "Pax AI" in body
     # Output style header
     assert "OUTPUT STYLE" in body
-    # At least the default skill body got concatenated
+    # Both skills should be concatenated, neither missing.
     assert "## SKILL: pax-or" in body
+    assert "## SKILL: hft_microstructure_quant_v1" in body
+
+
+def test_render_system_prompt_no_missing_skill_placeholders():
+    """If a skill body file is absent, _load_skill_body emits a
+    "(missing at <path>)" placeholder. The audit requires that BOTH
+    advertised skills be tracked in the repo, so neither placeholder
+    should ever appear in the rendered prompt."""
+    body = prompts.render_system_prompt()
+    assert "(missing at " not in body, (
+        "render_system_prompt rendered a missing-skill placeholder; one of "
+        "skills/pax-or/SKILL.md or skills/hft_microstructure_quant_v1/SKILL.md "
+        "is not on disk")
+
+
+# ---------------------------------------------------------------------------
+# Audit fix 1: no stale 08:30 anchor claims; positive language about the
+# operator OR / snapshot anchor being authoritative.
+# ---------------------------------------------------------------------------
+
+STALE_ANCHOR_PHRASES = [
+    "For NQ that is 08:30",
+    "08:30:00 – 08:30:30",
+    "08:30:00 - 08:30:30",          # ASCII-hyphen variant
+    'anchor: "RTH 08:30',
+    '< 08:30:30 CT',
+    'Outside 08:30 – 15:00',
+    'Outside 08:30 - 15:00',
+    'pre-08:35',
+]
+
+
+def test_render_system_prompt_no_stale_active_anchor_claims():
+    body = prompts.render_system_prompt()
+    found = [p for p in STALE_ANCHOR_PHRASES if p in body]
+    assert not found, (
+        f"Pax AI system prompt contains stale active-anchor claims that "
+        f"contradict the operator-configured OR anchor invariant: {found}")
+
+
+def test_render_system_prompt_states_operator_anchor_is_authoritative():
+    body = prompts.render_system_prompt()
+    # The skill must explicitly tell Claude that the operator-configured
+    # OR (via the live snapshot) is the source of truth.
+    assert "anchorHHMM" in body
+    assert "anchorTimezone" in body
+    assert "anchorRangeSeconds" in body
+    assert "anchorMode" in body
+    # And it must spell out the LIVE gate.
+    assert ("anchorMode != \"LIVE\"" in body
+            or "anchorMode != 'LIVE'" in body), (
+        "skill must instruct the agent to treat output as informational only "
+        "when anchorMode != LIVE")
+    # And there must be language disclaiming the historical RTH table.
+    assert "historical context only" in body or "historical reference only" in body

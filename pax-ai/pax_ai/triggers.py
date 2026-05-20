@@ -39,23 +39,54 @@ from . import config
 
 
 # ---------------------------------------------------------------------------
-# State (in-process)
+# State (in-process, ALIAS-SCOPED)
 # ---------------------------------------------------------------------------
+#
+# Pax AI may be pointed at multiple Bookmap aliases over the lifetime of a
+# process (NQM6 -> MNQM6 -> ESM6, etc.). Each alias has its own trend
+# bucket, its own middle-lock edge, its own regime transitions, and its
+# own linger cache. Storing transition / linger state globally meant
+# switching aliases inherited or suppressed triggers that belonged to a
+# different instrument. The audit explicitly calls this out as a bug.
+#
+# Each alias has its own _AliasState. The default fallback key is
+# "__default__" (used when snap["alias"] is missing or empty).
+
+ALIAS_DEFAULT = "__default__"
+
+
+def _new_alias_state() -> Dict[str, Any]:
+    return {
+        "prev_middle_lock":     None,        # bool | None
+        "prev_trend_kind":      None,        # str  | None
+        "prev_trend_bucket_ms": 0,           # int (last seen bucketEnteredMs)
+        "prev_conviction_sign": None,        # +1 / -1 / 0 / None
+        "prev_regime":          None,        # str  | None
+        "prev_session_code":    None,        # str  | None
+        "prev_anchor_mode":     None,        # str  | None
+        # Linger cache for EDGE triggers: (kind, label) -> trigger dict
+        # with firstSeenMs + lingerUntilMs. Pruned on each
+        # compute_triggers call. Per-alias so a chip on NQ never bleeds
+        # into MNQ.
+        "active_edges":         {},
+    }
+
 
 _STATE_LOCK = threading.Lock()
-_STATE: Dict[str, Any] = {
-    # Last value seen per per-kind context. Used for delta detection.
-    "prev_middle_lock":       None,        # bool | None
-    "prev_trend_kind":        None,        # str  | None
-    "prev_trend_bucket_ms":   0,           # int (last seen bucketEnteredMs)
-    "prev_conviction_sign":   None,        # +1 / -1 / 0 / None
-    "prev_regime":            None,        # str  | None
-    "prev_session_code":      None,        # str  | None
-    "prev_anchor_mode":       None,        # str  | None
-    # Linger cache for EDGE triggers: (kind, label) -> trigger dict with
-    # firstSeenMs + lingerUntilMs. Pruned on each compute_triggers call.
-    "active_edges":           {},
-}
+_PER_ALIAS_STATE: Dict[str, Dict[str, Any]] = {}
+
+
+def _state_for(alias: Optional[str]) -> Dict[str, Any]:
+    """Return the per-alias state dict, creating it on first access.
+
+    Caller MUST already hold _STATE_LOCK.
+    """
+    key = (alias or "").strip() or ALIAS_DEFAULT
+    s = _PER_ALIAS_STATE.get(key)
+    if s is None:
+        s = _new_alias_state()
+        _PER_ALIAS_STATE[key] = s
+    return s
 
 # Default linger window for edge events. Overridable via pax_ai_config.json
 # (`linger_ms`) for taste.
@@ -87,14 +118,14 @@ def _linger_ms() -> int:
     return max(3_000, min(60_000, v))
 
 
-def _emit_edge(trig: Dict[str, Any], now_ms: int) -> None:
-    """Insert / refresh an edge trigger in the linger cache.
+def _emit_edge(state: Dict[str, Any], trig: Dict[str, Any], now_ms: int) -> None:
+    """Insert / refresh an edge trigger in the per-alias linger cache.
 
     Same (kind, label) refreshes lingerUntilMs but preserves the original
     firstSeenMs so the UI can sort / age-out consistently.
     """
     key = (trig["kind"], trig.get("label") or "-")
-    cache = _STATE["active_edges"]
+    cache = state["active_edges"]
     prior = cache.get(key)
     trig["firstSeenMs"] = (prior or {}).get("firstSeenMs", now_ms)
     trig["lingerUntilMs"] = now_ms + _linger_ms()
@@ -102,8 +133,8 @@ def _emit_edge(trig: Dict[str, Any], now_ms: int) -> None:
     cache[key] = trig
 
 
-def _prune_expired_edges(now_ms: int) -> None:
-    cache = _STATE["active_edges"]
+def _prune_expired_edges(state: Dict[str, Any], now_ms: int) -> None:
+    cache = state["active_edges"]
     expired = [k for k, t in cache.items()
                  if now_ms >= int(t.get("lingerUntilMs") or 0)]
     for k in expired:
@@ -201,22 +232,22 @@ def _trig_level_approach(snap: Dict[str, Any], now_ms: int) -> List[Dict[str, An
     return out
 
 
-def _trig_middle_lock(snap: Dict[str, Any], now_ms: int) -> None:
+def _trig_middle_lock(state: Dict[str, Any], snap: Dict[str, Any], now_ms: int) -> None:
     """EDGE: fires on middleLock TRANSITION. Linger-cached for visibility."""
     cur = bool((snap.get("or_levels") or {}).get("middleLock"))
-    prev = _STATE.get("prev_middle_lock")
-    _STATE["prev_middle_lock"] = cur
+    prev = state.get("prev_middle_lock")
+    state["prev_middle_lock"] = cur
     if prev is None or prev == cur:
         return
     if cur:
-        _emit_edge({
+        _emit_edge(state, {
             "kind": "MIDDLE_LOCK_ENTER", "severity": "MED", "label": "-",
             "headline": "mid is inside OR -> STAND DOWN",
             "details": "no entry while middleLock is true; wait for proximity to OR-H/OR-L",
             "asOfMs": now_ms,
         }, now_ms)
     else:
-        _emit_edge({
+        _emit_edge(state, {
             "kind": "MIDDLE_LOCK_EXIT", "severity": "MED", "label": "-",
             "headline": "mid left the OR interior",
             "details": "middleLock cleared; level proximity re-enabled",
@@ -227,23 +258,24 @@ def _trig_middle_lock(snap: Dict[str, Any], now_ms: int) -> None:
 _RENDERABLE_TREND_KINDS = ("STRONG_BULL", "WEAK_BULL", "STRONG_BEAR", "WEAK_BEAR")
 
 
-def _trig_trend_signal_fire(snap: Dict[str, Any], now_ms: int) -> None:
+def _trig_trend_signal_fire(state: Dict[str, Any], snap: Dict[str, Any], now_ms: int) -> None:
     """EDGE: fires on a new bucketEnteredMs that comes with changedSinceLastTick=True.
 
     The dashboard's compute_trend_signal sets changedSinceLastTick=True
     only on the SINGLE poll where the renderable bucket advanced. Our
-    detector catches that one poll and writes the trigger into the linger
-    cache; the chip stays visible for LINGER_MS regardless of subsequent
-    False ticks.
+    detector catches that one poll and writes the trigger into the
+    per-alias linger cache; the chip stays visible for LINGER_MS
+    regardless of subsequent False ticks. Per-alias state means the same
+    bucketEnteredMs on a *different* alias still fires fresh.
     """
     ts = snap.get("trend_signal") or {}
     cur_kind = ts.get("kind") or "NONE"
     eligible = bool(ts.get("eligible"))
     changed  = bool(ts.get("changedSinceLastTick"))
     bucket   = int(ts.get("bucketEnteredMs") or 0)
-    prev_bucket = int(_STATE.get("prev_trend_bucket_ms") or 0)
-    _STATE["prev_trend_kind"] = cur_kind
-    _STATE["prev_trend_bucket_ms"] = bucket
+    prev_bucket = int(state.get("prev_trend_bucket_ms") or 0)
+    state["prev_trend_kind"] = cur_kind
+    state["prev_trend_bucket_ms"] = bucket
     if not eligible:
         return
     if cur_kind not in _RENDERABLE_TREND_KINDS:
@@ -254,7 +286,7 @@ def _trig_trend_signal_fire(snap: Dict[str, Any], now_ms: int) -> None:
         return
     direction = "long" if "BULL" in cur_kind else "short"
     severity = "HIGH" if cur_kind.startswith("STRONG_") else "MED"
-    _emit_edge({
+    _emit_edge(state, {
         "kind":     "TREND_SIGNAL_FIRE",
         "severity": severity,
         "label":    cur_kind,
@@ -266,19 +298,19 @@ def _trig_trend_signal_fire(snap: Dict[str, Any], now_ms: int) -> None:
     }, now_ms)
 
 
-def _trig_conviction_flip(snap: Dict[str, Any], now_ms: int) -> None:
+def _trig_conviction_flip(state: Dict[str, Any], snap: Dict[str, Any], now_ms: int) -> None:
     """EDGE: fires on conviction sign cross past hysteresis band."""
     conv = snap.get("conviction") or {}
     score = conv.get("score")
-    prev_sign = _STATE.get("prev_conviction_sign")
+    prev_sign = state.get("prev_conviction_sign")
     new_sign = _sign_with_hysteresis(score, prev_sign)
-    _STATE["prev_conviction_sign"] = new_sign
+    state["prev_conviction_sign"] = new_sign
     if prev_sign is None or new_sign is None or prev_sign == new_sign:
         return
     if prev_sign * new_sign >= 0 and not (prev_sign == 0 and new_sign != 0):
         return
     direction = "bull" if new_sign > 0 else ("bear" if new_sign < 0 else "neutral")
-    _emit_edge({
+    _emit_edge(state, {
         "kind":     "CONVICTION_FLIP",
         "severity": "HIGH",
         "label":    str(new_sign),
@@ -290,18 +322,18 @@ def _trig_conviction_flip(snap: Dict[str, Any], now_ms: int) -> None:
     }, now_ms)
 
 
-def _trig_regime_change(snap: Dict[str, Any], now_ms: int) -> None:
+def _trig_regime_change(state: Dict[str, Any], snap: Dict[str, Any], now_ms: int) -> None:
     """EDGE: fires when flow.regime transitions INTO an absorption/exhaustion regime."""
     flow = snap.get("flow") or {}
     cur = flow.get("regime")
-    prev = _STATE.get("prev_regime")
-    _STATE["prev_regime"] = cur
+    prev = state.get("prev_regime")
+    state["prev_regime"] = cur
     if cur is None or cur == prev:
         return
     if cur not in ABSORPTION_REGIMES:
         return
     conf = flow.get("regimeConfidence")
-    _emit_edge({
+    _emit_edge(state, {
         "kind":     "REGIME_CHANGE",
         "severity": "HIGH",
         "label":    cur,
@@ -311,7 +343,7 @@ def _trig_regime_change(snap: Dict[str, Any], now_ms: int) -> None:
     }, now_ms)
 
 
-def _trig_micro_event(snap: Dict[str, Any], now_ms: int) -> None:
+def _trig_micro_event(state: Dict[str, Any], snap: Dict[str, Any], now_ms: int) -> None:
     """EDGE: fires once per new SPOOF/ICEBERG/STOP_SWEEP in the lookback window.
 
     Linger cache dedups (type, price) tuples so a single iceberg held in
@@ -337,7 +369,7 @@ def _trig_micro_event(snap: Dict[str, Any], now_ms: int) -> None:
         # _emit_edge already dedups by (kind, label) and refreshes linger
         # on identical key -- exactly the iceberg-held-for-many-polls case.
         side = ev.get("side")
-        _emit_edge({
+        _emit_edge(state, {
             "kind":     "MICRO_EVENT",
             "severity": "MED",
             "label":    label,
@@ -445,25 +477,33 @@ def compute_triggers(snap: Optional[Dict[str, Any]], snap_age_ms: int) -> List[D
 
     triggers: List[Dict[str, Any]] = []
 
+    # Alias used to scope state. If the snapshot has no alias (offline /
+    # cold-start), all stateful detectors share the "__default__" bucket
+    # -- consistent with the prior behavior for the single-instrument case.
+    alias = (snap or {}).get("alias") if isinstance(snap, dict) else None
+
     if snap is None or snap_age_ms > stale_ms or snap.get("health") != "ok":
         env = snap if snap is not None else {"health": "offline",
                                               "bridgeError": "no snapshot yet"}
         with _STATE_LOCK:
-            _prune_expired_edges(now_ms)
-            triggers += list(_STATE["active_edges"].values())
+            state = _state_for(alias)
+            _prune_expired_edges(state, now_ms)
+            triggers += list(state["active_edges"].values())
             triggers += _trig_bridge_degraded(env, now_ms)
     else:
         with _STATE_LOCK:
-            # 1. Run edge detectors -- they write into the linger cache.
-            _trig_middle_lock(snap, now_ms)
-            _trig_trend_signal_fire(snap, now_ms)
-            _trig_conviction_flip(snap, now_ms)
-            _trig_regime_change(snap, now_ms)
-            _trig_micro_event(snap, now_ms)
+            state = _state_for(alias)
+            # 1. Run edge detectors -- they write into the per-alias
+            #    linger cache.
+            _trig_middle_lock(state, snap, now_ms)
+            _trig_trend_signal_fire(state, snap, now_ms)
+            _trig_conviction_flip(state, snap, now_ms)
+            _trig_regime_change(state, snap, now_ms)
+            _trig_micro_event(state, snap, now_ms)
             # 2. Prune expired edges.
-            _prune_expired_edges(now_ms)
+            _prune_expired_edges(state, now_ms)
             # 3. Compose: lingering edges + state conditions.
-            triggers += list(_STATE["active_edges"].values())
+            triggers += list(state["active_edges"].values())
             triggers += _trig_level_approach(snap, now_ms)
             triggers += _trig_news_t_minus(snap, now_ms)
             triggers += _trig_bridge_degraded(snap, now_ms)
@@ -476,13 +516,12 @@ def compute_triggers(snap: Optional[Dict[str, Any]], snap_age_ms: int) -> List[D
 
 
 def reset_state_for_tests() -> None:
-    """Wipe in-memory state. Test-only helper."""
+    """Wipe ALL alias state. Test-only helper."""
     with _STATE_LOCK:
-        _STATE["prev_middle_lock"] = None
-        _STATE["prev_trend_kind"] = None
-        _STATE["prev_trend_bucket_ms"] = 0
-        _STATE["prev_conviction_sign"] = None
-        _STATE["prev_regime"] = None
-        _STATE["prev_session_code"] = None
-        _STATE["prev_anchor_mode"] = None
-        _STATE["active_edges"] = {}
+        _PER_ALIAS_STATE.clear()
+
+
+def known_aliases_for_tests() -> List[str]:
+    """Return the list of alias keys with cached state. Test-only helper."""
+    with _STATE_LOCK:
+        return list(_PER_ALIAS_STATE.keys())

@@ -153,103 +153,124 @@ def _sse_event(name: str, data: Dict[str, Any]) -> bytes:
     return f"event: {name}\ndata: {payload}\n\n".encode("utf-8")
 
 
+def _clear_abort_if_owned(abort: threading.Event) -> None:
+    """Clear _CURRENT_ABORT only if it still points at our event.
+
+    Idempotent and tolerant of concurrent handlers: if a newer chat has
+    already replaced _CURRENT_ABORT with its own event, we leave that
+    one alone.
+    """
+    global _CURRENT_ABORT
+    with _ABORT_LOCK:
+        if _CURRENT_ABORT is abort:
+            _CURRENT_ABORT = None
+
+
 def handle_chat_stream(wfile, user_text: str) -> None:
     """SSE handler. Called by server.py after sending the status + headers.
 
     Writes a sequence of SSE events to wfile and flushes after each.
     Closes the chat after the subprocess exits or aborts.
+
+    The _CURRENT_ABORT flag is set on entry and cleared on EVERY exit
+    path via try/finally so that a follow-up POST /api/pax/chat/abort
+    cannot bind to a stale event from a previously failed chat. Previously
+    early-return paths (prompt-write failure, BrokenPipe before the
+    start event) leaked _CURRENT_ABORT.
     """
     global _CURRENT_ABORT
     abort = threading.Event()
     with _ABORT_LOCK:
         _CURRENT_ABORT = abort
 
-    full_msg, meta = build_user_message(user_text)
-
-    # Journal the user turn immediately. The normalized text (voice ->
-    # canonical jargon) is what we persist, not the raw transcript -- it
-    # matches what Claude sees in the digest.
-    journal.record("YOU", meta["user_normalized"], meta={
-        "router_primary":  meta["router_primary"],
-        "snapshot_stale":  meta["snapshot_stale"],
-        "snapshot_age_ms": meta["snapshot_age_ms"],
-    })
-
-    # System prompt path - rendered at boot, cached on disk
     try:
-        sp_path = prompts.write_frozen_prompt()
-    except Exception as exc:
-        wfile.write(_sse_event("error", {"error": f"prompts.write failed: {exc}"}))
-        wfile.flush()
-        return
+        full_msg, meta = build_user_message(user_text)
 
-    model = config.get("models.live", "claude-haiku-4-5")
-    pax_collected: List[str] = []
+        # Journal the user turn immediately. The normalized text (voice ->
+        # canonical jargon) is what we persist, not the raw transcript -- it
+        # matches what Claude sees in the digest.
+        journal.record("YOU", meta["user_normalized"], meta={
+            "router_primary":  meta["router_primary"],
+            "snapshot_stale":  meta["snapshot_stale"],
+            "snapshot_age_ms": meta["snapshot_age_ms"],
+        })
 
-    # Tell the UI the chat is starting + which skill is leading.
-    try:
-        wfile.write(_sse_event("start", {
-            "model":            model,
-            "router_primary":   meta["router_primary"],
-            "router_secondary": meta["router_secondary"],
-            "snapshot_stale":   meta["snapshot_stale"],
-            "snapshot_age_ms":  meta["snapshot_age_ms"],
-        }))
-        wfile.flush()
-    except (BrokenPipeError, ConnectionResetError):
-        return
-
-    def on_token(text: str) -> None:
-        pax_collected.append(text)
+        # System prompt path - rendered at boot, cached on disk
         try:
-            wfile.write(_sse_event("token", {"text": text}))
+            sp_path = prompts.write_frozen_prompt()
+        except Exception as exc:
+            try:
+                wfile.write(_sse_event("error", {"error": f"prompts.write failed: {exc}"}))
+                wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
+        model = config.get("models.live", "claude-haiku-4-5")
+        pax_collected: List[str] = []
+
+        # Tell the UI the chat is starting + which skill is leading.
+        try:
+            wfile.write(_sse_event("start", {
+                "model":            model,
+                "router_primary":   meta["router_primary"],
+                "router_secondary": meta["router_secondary"],
+                "snapshot_stale":   meta["snapshot_stale"],
+                "snapshot_age_ms":  meta["snapshot_age_ms"],
+            }))
             wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            abort.set()
+            return
 
-    final_info: Dict[str, Any] = {}
-    def on_done(info: Dict[str, Any]) -> None:
-        final_info.update(info)
+        def on_token(text: str) -> None:
+            pax_collected.append(text)
+            try:
+                wfile.write(_sse_event("token", {"text": text}))
+                wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                abort.set()
 
-    t0 = time.monotonic()
-    rc = claude_stream.stream_chat(
-        user_message=full_msg,
-        model=model,
-        system_prompt_path=sp_path,
-        on_token=on_token,
-        on_done=on_done,
-        abort=abort,
-    )
-    elapsed_ms = int((time.monotonic() - t0) * 1000)
+        final_info: Dict[str, Any] = {}
+        def on_done(info: Dict[str, Any]) -> None:
+            final_info.update(info)
 
-    # Journal the assistant turn (even on partial / aborted / errored runs
-    # so the audit trail is complete).
-    pax_text = "".join(pax_collected)
-    journal.record("PAX", pax_text, meta={
-        "model":          model,
-        "exit_code":      rc,
-        "elapsed_ms":     elapsed_ms,
-        "tokens_emitted": final_info.get("tokens_emitted", 0),
-        "aborted":        final_info.get("aborted", abort.is_set()),
-        "error":          final_info.get("error"),
-        "router_primary": meta["router_primary"],
-    })
+        t0 = time.monotonic()
+        rc = claude_stream.stream_chat(
+            user_message=full_msg,
+            model=model,
+            system_prompt_path=sp_path,
+            on_token=on_token,
+            on_done=on_done,
+            abort=abort,
+        )
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
 
-    try:
-        wfile.write(_sse_event("done", {
+        # Journal the assistant turn (even on partial / aborted / errored
+        # runs so the audit trail is complete).
+        pax_text = "".join(pax_collected)
+        journal.record("PAX", pax_text, meta={
+            "model":          model,
             "exit_code":      rc,
             "elapsed_ms":     elapsed_ms,
             "tokens_emitted": final_info.get("tokens_emitted", 0),
             "aborted":        final_info.get("aborted", abort.is_set()),
             "error":          final_info.get("error"),
-            "stderr_tail":    final_info.get("stderr_tail"),
-            "model":          model,
             "router_primary": meta["router_primary"],
-        }))
-        wfile.flush()
-    except (BrokenPipeError, ConnectionResetError):
-        pass
+        })
 
-    with _ABORT_LOCK:
-        if _CURRENT_ABORT is abort:
-            _CURRENT_ABORT = None
+        try:
+            wfile.write(_sse_event("done", {
+                "exit_code":      rc,
+                "elapsed_ms":     elapsed_ms,
+                "tokens_emitted": final_info.get("tokens_emitted", 0),
+                "aborted":        final_info.get("aborted", abort.is_set()),
+                "error":          final_info.get("error"),
+                "stderr_tail":    final_info.get("stderr_tail"),
+                "model":          model,
+                "router_primary": meta["router_primary"],
+            }))
+            wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+    finally:
+        _clear_abort_if_owned(abort)

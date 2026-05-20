@@ -13,9 +13,7 @@ This skill encodes the methodology so a dedicated agent (Claude CLI) can call th
 
 ## 1. The Opening Range — what it is, why it matters
 
-The Opening Range (OR) is the high and low of the **first 30 seconds** of Regular Trading Hours. For NQ that is **08:30:00 – 08:30:30 America/Chicago (CT)**. Not 30 minutes. Not 5 minutes. Thirty seconds.
-
-The reasoning is mechanical, not mystical. When RTH opens, the institutional algos switch on and slam in their initial allocations. Their first 30 seconds of price discovery is where they print position. That window sets the line in the sand for the day. Once the OR is set:
+The Opening Range (OR) is the high and low of a short open-window of Regular Trading Hours. The reasoning is mechanical, not mystical. When RTH opens, the institutional algos switch on and slam in their initial allocations. Their first seconds of price discovery is where they print position. That window sets the line in the sand for the day. Once the OR is set:
 
 - Above OR-High → the algos are net-long-leaning; sustained bids confirm.
 - Below OR-Low → the algos are net-short-leaning; sustained offers confirm.
@@ -23,23 +21,45 @@ The reasoning is mechanical, not mystical. When RTH opens, the institutional alg
 
 The leverage of trading at the OR boundaries is this: **if you are stopped out, the algos are also stopped out.** You are co-located with the size that moves the tape. Anywhere else, you are guessing.
 
-### Product table (the canon)
+### 1.1 Anchor source of truth (READ THIS FIRST)
 
-| Product | Open (CT)       | Range window         | Extension rung |
-|---------|------------------|----------------------|----------------|
-| NQ/MNQ  | 08:30:00         | 08:30:00 – 08:30:30  | 65 pts         |
-| ES/MES  | 08:30:00         | 08:30:00 – 08:30:30  | 15 pts         |
-| RTY/M2K | 08:30:00         | 08:30:00 – 08:30:30  | symbol-specific|
-| YM/MYM  | 08:30:00         | 08:30:00 – 08:30:30  | symbol-specific|
-| GC      | 07:20:00         | 07:20:00 – 07:20:30  | symbol-specific|
-| ZB (30Y)| 07:20:00         | 07:20:00 – 07:20:30  | symbol-specific|
-| CL      | 08:00:00         | 08:00:00 – 08:00:30  | symbol-specific|
+**The active OR open time, range duration, and timezone come from the operator-configured OR settings exposed in the live snapshot. They are NOT hardcoded in this skill.** The OpenRange indicator that the trader configures in Bookmap is the single source of truth; the dashboard echoes that config into every snapshot. The Pax agent must consult these fields rather than assume a specific clock time.
 
-(Daylight Savings flips the CT/ET offset; the **exchange local** anchor never moves.)
+| Skill concept | Authoritative snapshot field |
+|---------------|------------------------------|
+| OR open time (HH:MM)        | `snap.session.anchorHHMM`               |
+| Anchor timezone             | `snap.session.anchorTimezone`           |
+| Range window length (sec)   | `snap.session.anchorRangeSeconds`       |
+| Anchor lineage (LIVE / fallback) | `snap.session.anchorMode`           |
+| Session phase code          | `snap.session.code` (PRE_MARKET / OR_FORMING / ACTIVE / LATE_MORNING / CHOP / AFTERNOON / CLOSE_RISK / POST_MARKET) |
+| Full config blob            | `snap.or_session_config`                |
+| Computed OR-H / OR-L / mid  | `snap.or_levels.orHigh` / `.orLow` / `.mid` |
+
+**Anchor-mode gate (non-negotiable):**
+
+- `snap.session.anchorMode == "LIVE"` → OR is current, trade signals are actionable per §6 gates.
+- `snap.session.anchorMode != "LIVE"` (e.g. LAST_KNOWN_STALE, FALLBACK) → treat every Pax read as **informational only**. Lead the response with "OR anchor is not LIVE — informational only". No new entries, no FOLLOW/FADE recommendations.
+- `snap.health != "ok"` → refuse to read; respond "bridge offline".
+
+### 1.2 Default exchange RTH (historical context only — NOT the active anchor)
+
+The table below documents the *default* exchange RTH open used as a fallback if the operator has not configured an OR or while waiting for the bridge to come online. **It is illustrative only. Always use the snapshot fields from §1.1 to determine what is actually active.**
+
+| Product | Default exchange RTH open (local) | Default range window | Default extension rung |
+|---------|------------------------------------|----------------------|------------------------|
+| NQ/MNQ  | exchange open                     | first 30 s            | 65 pts                 |
+| ES/MES  | exchange open                     | first 30 s            | 15 pts                 |
+| RTY/M2K | exchange open                     | first 30 s            | symbol-specific        |
+| YM/MYM  | exchange open                     | first 30 s            | symbol-specific        |
+| GC      | exchange open                     | first 30 s            | symbol-specific        |
+| ZB (30Y)| exchange open                     | first 30 s            | symbol-specific        |
+| CL      | exchange open                     | first 30 s            | symbol-specific        |
+
+The Pax canon uses a 30-second window historically. The *actual* range duration for the current session is `snap.session.anchorRangeSeconds` — never assume 30 unless that field confirms it.
 
 ### Capture rule
 
-`OR-High = max(trade price)` and `OR-Low = min(trade price)` across the 30-second window. **Use traded prints, not the order book.** A resting bid that never gets hit does not set the OR.
+`OR-High = max(trade price)` and `OR-Low = min(trade price)` across the operator-configured window (`anchorHHMM` + `anchorRangeSeconds`). The dashboard does this computation; the agent reads `snap.or_levels.orHigh` / `.orLow`. **Use traded prints, not the order book.** A resting bid that never gets hit does not set the OR.
 
 ---
 
@@ -173,9 +193,10 @@ A perfect setup in the wrong regime is a losing setup. Check these before every 
 
 | Gate                | RED condition                                                                 | Source                                  |
 |---------------------|-------------------------------------------------------------------------------|-----------------------------------------|
-| Session             | Outside 08:30 – 15:00 CT (RTH), or pre-08:35 (let the OR settle)              | local clock                              |
-| News blackout       | ±5 min around tier-1 macro (NFP, CPI, FOMC, GDP)                              | macro calendar / `/api/snapshot.gates.news` |
-| OR width            | OR < 3 NQ pts (too tight, fakeouts) or > 25 NQ pts (already moved)            | computed from RTH first 30s prints       |
+| Anchor              | `snap.session.anchorMode != "LIVE"` (LAST_KNOWN_STALE / FALLBACK)              | `snap.session.anchorMode`               |
+| Session phase       | `snap.session.code` in {PRE_MARKET, OR_FORMING, CLOSE_RISK, POST_MARKET}; LATE_MORNING / CHOP / AFTERNOON are conditional STAND_DOWNs for low-edge windows | `snap.session.code`                     |
+| News blackout       | `snap.gates.news.blocked == true` (±5 min around tier-1 macro: NFP, CPI, FOMC, GDP) | `snap.gates.news`                       |
+| OR width            | `snap.or_levels.orWidthPts` below 3 NQ pts (too tight, fakeouts) or above 25 NQ pts (already moved) | `snap.or_levels.orWidthPts`            |
 | VWAP / OR gate      | `gate == ALLOW_SHORT` while you're trying to long, or vice versa              | `/vwap` + dashboard gate logic           |
 | Capital flow match  | SPU/BOND, gold, currencies disagreeing strongly with your side                | manual / multi-instrument cross-check    |
 | Mid-Week Shuffle    | Wed AM with contra-trend "rip your face off" move underway                    | regime detection / day-of-week + ATR     |
@@ -260,7 +281,7 @@ This is the runtime mapping. Each Pax concept ties to a Bookmap MCP bridge endpo
 
 | Pax concept                          | Bridge endpoint              | Field(s) read                                                    |
 |--------------------------------------|------------------------------|------------------------------------------------------------------|
-| OR-High, OR-Low                      | `/recent_trades` + clock     | max/min trade price in 08:30:00 – 08:30:30 CT window             |
+| OR-High, OR-Low                      | `/api/snapshot.or_levels`    | `orHigh` / `orLow` computed by the dashboard over the operator-configured anchor window (`session.anchorHHMM` + `session.anchorRangeSeconds`, default 30 s) |
 | Sustained bids/offers at BBO         | `/pull_stack`                | `windows[0].bias`, `windows[0].zScore`, `aggregateBias`          |
 | Rotation against you                 | `/pull_stack`                | `rotation` (NONE / ROTATION_UP / ROTATION_DN)                    |
 | LT liquidity magnet                  | `/lt_liquidity`              | bias (ASK HEAVY = bullish magnet, BID HEAVY = bearish magnet)    |
@@ -284,7 +305,7 @@ The bridge now emits a quant-style regime classifier built from:
 - **Volume-per-tick (VPT)** — traded volume divided by realized tick range (the absorption metric)
 - **Bias trajectory** — 3-bucket SMA slope of windowed imbalance over the last 3 minutes
 
-All features are Welford-EWMA z-scored against rolling baselines (5-min half-life). Thresholds adapt to the current vol regime — same code works at the 08:30 open and at midday.
+All features are Welford-EWMA z-scored against rolling baselines (5-min half-life). Thresholds adapt to the current vol regime — same code works at the morning open and at midday.
 
 **Regime taxonomy** (`flow.regime`):
 
@@ -406,7 +427,7 @@ middle, only at levels" discipline.
 
 ```
 or_levels = {
-  anchor: "RTH 08:30 CT (30s)",
+  anchor: "<operator-configured anchor, e.g. session.anchorHHMM + anchorRangeSeconds; never hardcoded by this skill>",
   orHigh: 21340.25, orLow: 21318.75,
   orWidthPts: 21.5, rungPts: 65, mid: 21326.00,
   proxTicks: 50, proxPts: 12.5,
@@ -468,21 +489,26 @@ or_levels = {
 
 ## 12. Decision tree — one screen
 
+All time-gates resolve through the live snapshot. The skill never asserts a clock time on its own.
+
 ```
-TIME?
-├─ < 08:30:30 CT  → WAIT (OR still forming)
-├─ 08:30:30 – 08:35  → COMPUTE OR-H / OR-L from prints; STAND BY
-└─ 08:35 – 15:00 CT  → ACTIVE
-                       │
-                       ├─ Inside OR?  → STAND DOWN (no position)
-                       │
-                       ├─ Break above OR-H?
-                       │   ├─ Run 5-of-5 confirmation (§2.2)
-                       │   ├─ Run regime gates (§6) — any RED → PASS
-                       │   ├─ Stretch >25% past OR-H?  → PASS
-                       │   └─ All clear → ENTER LONG, size per §7
-                       │
-                       └─ Break below OR-L?  → mirror of above
+ANCHOR / SESSION (snap.session.code, snap.session.anchorMode)
+├─ anchorMode != "LIVE"           → INFORMATIONAL_ONLY (no new entries)
+├─ code in {PRE_MARKET, OR_FORMING}→ WAIT (OR still forming; OR-H/OR-L not yet valid)
+├─ code == "ACTIVE"               → eligible for entries (run sub-tree below)
+├─ code in {LATE_MORNING, CHOP, AFTERNOON} → conditional WAIT (low-edge windows)
+└─ code in {CLOSE_RISK, POST_MARKET}→ STAND_DOWN (manage runners only)
+
+When code == "ACTIVE":
+├─ snap.or_levels.middleLock == true  → STAND DOWN (no position)
+│
+├─ Break above OR-H (price > orHigh)?
+│   ├─ Run 5-of-5 confirmation (§2.2)
+│   ├─ Run regime gates (§6) — any RED → PASS
+│   ├─ Stretch > 25% past OR-H?       → PASS
+│   └─ All clear                       → ENTER LONG, size per §7
+│
+└─ Break below OR-L?                   → mirror of above
 
 POSITION ON?
 ├─ < 10 pts profit
@@ -497,8 +523,8 @@ POSITION ON?
     └─ Runner — trail to prior rung; watch ORH/ORL on the 5m/15m
 
 DAILY STATE?
-├─ 2 full stops today  → STAND DOWN rest of session
-└─ Macro blackout      → STAND DOWN ±5 min
+├─ 2 full stops today        → STAND DOWN rest of session
+└─ snap.gates.news.blocked   → STAND DOWN until blackout label clears
 ```
 
 ---

@@ -351,6 +351,17 @@ function nowHHMMSS() {
   return d.toTimeString().slice(0,8);
 }
 
+// HTML-escape any value before concatenating it into innerHTML. ALL
+// snapshot / API fields are treated as untrusted text -- the dashboard
+// might publish a label or decision string sourced from an external
+// system, and we never want raw markup to slip into the DOM through
+// the chat UI. (Audit fix 7.)
+function _esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 // ---------- strip + edge + playbook polling ----------
 async function pollContext() {
   try {
@@ -369,11 +380,16 @@ async function pollContext() {
     }
     const alias = (s.alias || '').split('.')[0] || '--';
     symEl.textContent = alias;
+    // mid is a number from JSON; .toFixed() is intrinsically safe. STALE
+    // span is a fixed literal. No dynamic untrusted text in this branch,
+    // but we still build via concatenation of safe pieces.
     let midHtml = s.mid != null ? Number(s.mid).toFixed(2) : '-';
     if (s.stale) midHtml += ' <span class="stale">STALE</span>';
     midEl.innerHTML = midHtml;
     if (s.nearest) {
-      nEl.innerHTML = fmtP(s.nearest.distance) + ' to <b>' + s.nearest.label +
+      // s.nearest.label and s.nearest.decision come from the snapshot
+      // and must be escaped before going into innerHTML.
+      nEl.innerHTML = fmtP(s.nearest.distance) + ' to <b>' + _esc(s.nearest.label) +
         '</b><span style="color:var(--text-faint)">' +
         decisionGlyph(s.nearest.decision || '') + '</span>';
     } else { nEl.textContent = '--'; }
@@ -381,12 +397,14 @@ async function pollContext() {
     const anchor = (s.session && s.session.anchorMode) ||
                     (s.conviction && s.conviction.anchorMode) || '--';
     if (cs == null) {
-      cEl.innerHTML = anchor;
+      // anchor is a snapshot string -> textContent (safer than innerHTML
+      // when no markup is needed).
+      cEl.textContent = anchor;
     } else {
       const cls = cs >= 0 ? 'pos' : 'neg';
       const sign = cs >= 0 ? '+' : '';
       cEl.innerHTML = 'conv <span class="' + cls + '">' + sign + cs.toFixed(2)
-        + '</span> &middot; ' + anchor;
+        + '</span> &middot; ' + _esc(anchor);
     }
     return s.nearest ? s.nearest.label : null;
   } catch (e) {
@@ -404,8 +422,10 @@ async function pollLevel(label) {
     if (!r.ok) { target.textContent = 'level ' + label + ' not found'; return; }
     const j = await r.json();
     const e = j.edge_calculus || {};
-    const row = (k, v) => '<div class="k">' + k + '</div><div class="v">' +
-      (v == null ? '-' : v) + '</div>';
+    // Numeric fields are .toFixed(...) -> safe, but string fields (label,
+    // decision, size_tier) come from the snapshot and must be escaped.
+    const row = (k, v) => '<div class="k">' + _esc(k) + '</div><div class="v">' +
+      (v == null ? '-' : _esc(v)) + '</div>';
     target.innerHTML = '<div class="edge-grid">'
       + row('label',         j.label)
       + row('decision',      j.decision || '-')
@@ -421,7 +441,7 @@ async function pollLevel(label) {
       + row('stop',          e.invalidation_price != null ? e.invalidation_price.toFixed(2) : '-')
       + '</div>'
       + (e.reasons && e.reasons.length
-          ? '<div class="reasons"><ul>' + e.reasons.map(x => '<li>'+x+'</li>').join('') + '</ul></div>'
+          ? '<div class="reasons"><ul>' + e.reasons.map(x => '<li>' + _esc(x) + '</li>').join('') + '</ul></div>'
           : '');
   } catch (e) { target.textContent = 'edge fetch error: ' + e; }
 }
@@ -432,23 +452,19 @@ async function pollPlaybook() {
     const r = await fetch('/api/pax/playbook', {cache:'no-store'});
     if (!r.ok) { target.textContent = '-'; return; }
     const j = await r.json();
-    const head = '<div><span class="state">' + (j.current_state || '-') +
-      '</span>' + (j.active_level ? ' at <b>' + j.active_level + '</b>' : '') + '</div>';
+    // current_state, active_level, branch.name/.if/.then are all snapshot
+    // fields and must be escaped before going into innerHTML.
+    const head = '<div><span class="state">' + _esc(j.current_state || '-') +
+      '</span>' + (j.active_level ? ' at <b>' + _esc(j.active_level) + '</b>' : '') + '</div>';
     const branches = (j.branches || []).map(b =>
       '<div class="branch">' +
-        '<div class="nm">' + b.name + '</div>' +
-        '<div class="iff">if: ' + b.if + '</div>' +
-        '<div class="ths">then: ' + b.then + '</div>' +
+        '<div class="nm">' + _esc(b.name) + '</div>' +
+        '<div class="iff">if: ' + _esc(b.if) + '</div>' +
+        '<div class="ths">then: ' + _esc(b.then) + '</div>' +
       '</div>').join('');
     target.innerHTML = head +
       (branches || '<div style="color:var(--text-faint); padding-top:4px">no branches active</div>');
   } catch (e) { target.textContent = 'playbook fetch error: ' + e; }
-}
-
-function _esc(s) {
-  return String(s == null ? '' : s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 async function pollWhyNow() {

@@ -388,3 +388,172 @@ def test_stale_snapshot_only_bridge_degraded():
     # LEVEL_APPROACH would normally fire, but stale gate suppresses it.
     assert all(x["kind"] == "BRIDGE_DEGRADED" or x["kind"] == "BRIDGE_DEGRADED" for x in t)
     assert all(x["kind"] != "LEVEL_APPROACH" for x in t)
+
+
+# ---------------------------------------------------------------------------
+# Alias scoping (audit fix 3): trigger state must be partitioned by
+# snap["alias"] so switching instruments never inherits / suppresses
+# triggers that belong to a different instrument.
+# ---------------------------------------------------------------------------
+
+def test_alias_same_alias_dedups_normally():
+    """Re-iterating the same alias must still dedup edge fires."""
+    s = _live_snap_base()
+    s["alias"] = "NQM6.CME@RITHMIC"
+    s["trend_signal"] = {"kind": "STRONG_BULL", "eligible": True,
+                          "changedSinceLastTick": True,
+                          "bucketEnteredMs": 1000, "mid": 21330.0}
+    t1 = triggers.compute_triggers(s, 100)
+    # Same bucket on the same alias -> no fresh fire on the second poll.
+    s["trend_signal"]["changedSinceLastTick"] = True   # defensive
+    t2 = triggers.compute_triggers(s, 100)
+    # Both polls should surface the (lingering) chip but the cache key is
+    # the same -- firstSeenMs must NOT advance.
+    fires_t1 = [x for x in t1 if x["kind"] == "TREND_SIGNAL_FIRE"]
+    fires_t2 = [x for x in t2 if x["kind"] == "TREND_SIGNAL_FIRE"]
+    assert fires_t1 and fires_t2
+    assert fires_t1[0]["firstSeenMs"] == fires_t2[0]["firstSeenMs"]
+
+
+def test_alias_different_alias_same_bucket_fires_independently():
+    """Same bucketEnteredMs on alias B must produce its own fresh fire,
+    not inherit / be suppressed by alias A's state."""
+    s = _live_snap_base()
+    s["alias"] = "NQM6.CME@RITHMIC"
+    s["trend_signal"] = {"kind": "STRONG_BULL", "eligible": True,
+                          "changedSinceLastTick": True,
+                          "bucketEnteredMs": 1000, "mid": 21330.0}
+    t1 = triggers.compute_triggers(s, 100)
+    fires_a = [x for x in t1 if x["kind"] == "TREND_SIGNAL_FIRE"]
+    assert fires_a, "NQ must fire on the first poll"
+
+    # Different alias; identical bucket / kind. The detector must see
+    # prev_trend_bucket_ms == 0 (fresh alias) and emit.
+    s["alias"] = "MNQM6.CME@RITHMIC"
+    t2 = triggers.compute_triggers(s, 100)
+    fires_b = [x for x in t2 if x["kind"] == "TREND_SIGNAL_FIRE"]
+    assert fires_b, ("MNQ must fire independently of NQ even though the "
+                       "bucketEnteredMs and kind happen to match")
+    # Both aliases should now be tracked in state.
+    aliases = triggers.known_aliases_for_tests()
+    assert "NQM6.CME@RITHMIC" in aliases
+    assert "MNQM6.CME@RITHMIC" in aliases
+
+
+def test_alias_middle_lock_transitions_are_independent():
+    """middleLock ENTER / EXIT edges are per-alias."""
+    s = _live_snap_base()
+    # Alias A starts middleLock=False (initial state, no prev), then
+    # transitions to True.
+    s["alias"] = "NQM6.CME@RITHMIC"
+    s["or_levels"]["middleLock"] = False
+    triggers.compute_triggers(s, 100)
+    s["or_levels"]["middleLock"] = True
+    t_a_enter = triggers.compute_triggers(s, 100)
+    assert any(x["kind"] == "MIDDLE_LOCK_ENTER" for x in t_a_enter)
+
+    # Alias B (fresh state) -- middleLock=True on the first poll must
+    # NOT produce a transition (no prior value to compare).
+    s["alias"] = "MNQM6.CME@RITHMIC"
+    s["or_levels"]["middleLock"] = True
+    t_b_first = triggers.compute_triggers(s, 100)
+    assert all(x["kind"] not in ("MIDDLE_LOCK_ENTER", "MIDDLE_LOCK_EXIT")
+                 for x in t_b_first)
+
+
+def test_alias_conviction_flip_is_independent():
+    """Conviction sign flip on alias A must not pre-flip alias B."""
+    s = _live_snap_base()
+    s["alias"] = "NQM6.CME@RITHMIC"
+    s["conviction"]["score"] = 0.40
+    triggers.compute_triggers(s, 100)
+    s["conviction"]["score"] = -0.40   # flip on NQ
+    t_a = triggers.compute_triggers(s, 100)
+    assert any(x["kind"] == "CONVICTION_FLIP" for x in t_a)
+
+    # Alias B sees a positive score for the first time -- no transition
+    # because there is no prior value, NOT because NQ already flipped.
+    s["alias"] = "MNQM6.CME@RITHMIC"
+    s["conviction"]["score"] = 0.40
+    t_b = triggers.compute_triggers(s, 100)
+    assert all(x["kind"] != "CONVICTION_FLIP" for x in t_b)
+
+
+def test_alias_regime_change_is_independent():
+    """A's prev_regime must not leak into B's transition detection."""
+    s = _live_snap_base()
+
+    # Alias A: TRENDING_UP -> ABSORPTION_BID fires (existing test).
+    s["alias"] = "NQM6.CME@RITHMIC"
+    s["flow"]["regime"] = "TRENDING_UP"
+    triggers.compute_triggers(s, 100)
+    s["flow"]["regime"] = "ABSORPTION_BID"
+    s["flow"]["regimeConfidence"] = 0.8
+    t_a = triggers.compute_triggers(s, 100)
+    assert any(x["kind"] == "REGIME_CHANGE" for x in t_a)
+
+    # Alias B with a non-absorption baseline -- no transition yet.
+    s["alias"] = "ESM6.CME@RITHMIC"
+    s["flow"]["regime"] = "TRENDING_UP"
+    t_b_first = triggers.compute_triggers(s, 100)
+    assert all(x["kind"] != "REGIME_CHANGE" for x in t_b_first), (
+        "fresh alias seeing TRENDING_UP must not produce a REGIME_CHANGE")
+
+    # Alias B then enters absorption -- fires ON B (independent of A).
+    s["flow"]["regime"] = "ABSORPTION_BID"
+    s["flow"]["regimeConfidence"] = 0.7
+    t_b_enter = triggers.compute_triggers(s, 100)
+    assert any(x["kind"] == "REGIME_CHANGE" for x in t_b_enter), (
+        "B must transition independently of A's state")
+
+    # And A's prior REGIME_CHANGE chip is in A's linger cache, not B's.
+    b_edges = [x for x in t_b_enter if x["kind"] == "REGIME_CHANGE"]
+    # Exactly one fresh chip for B; A's chip is in A's bucket.
+    assert len(b_edges) == 1
+
+
+def test_alias_edge_linger_does_not_bleed_across_aliases():
+    """A TREND_SIGNAL_FIRE on NQ must not appear in MNQ's chip list."""
+    s = _live_snap_base()
+    s["alias"] = "NQM6.CME@RITHMIC"
+    s["trend_signal"] = {"kind": "STRONG_BULL", "eligible": True,
+                          "changedSinceLastTick": True,
+                          "bucketEnteredMs": 1000, "mid": 21330.0}
+    triggers.compute_triggers(s, 100)
+
+    # Switch to MNQ with no eligible trend signal of its own; the chip
+    # from NQ must NOT appear.
+    s["alias"] = "MNQM6.CME@RITHMIC"
+    s["trend_signal"] = {"kind": "NONE", "eligible": False,
+                          "changedSinceLastTick": False,
+                          "bucketEnteredMs": 0}
+    t = triggers.compute_triggers(s, 100)
+    assert all(x["kind"] != "TREND_SIGNAL_FIRE" for x in t)
+
+
+def test_alias_reset_state_clears_all_aliases():
+    s = _live_snap_base()
+    s["alias"] = "A"; s["trend_signal"] = {
+        "kind": "STRONG_BULL", "eligible": True,
+        "changedSinceLastTick": True, "bucketEnteredMs": 10, "mid": 1.0}
+    triggers.compute_triggers(s, 100)
+    s["alias"] = "B"
+    triggers.compute_triggers(s, 100)
+    assert set(triggers.known_aliases_for_tests()) >= {"A", "B"}
+    triggers.reset_state_for_tests()
+    assert triggers.known_aliases_for_tests() == []
+
+
+def test_alias_missing_falls_back_to_default_bucket():
+    """A snapshot with no alias key must still be processed; consecutive
+    no-alias polls share the same '__default__' bucket so dedup works."""
+    s = _live_snap_base()
+    s.pop("alias", None)
+    s["trend_signal"] = {"kind": "STRONG_BULL", "eligible": True,
+                          "changedSinceLastTick": True,
+                          "bucketEnteredMs": 1000, "mid": 21330.0}
+    t1 = triggers.compute_triggers(s, 100)
+    assert any(x["kind"] == "TREND_SIGNAL_FIRE" for x in t1)
+    # The fallback bucket must exist in alias registry.
+    aliases = triggers.known_aliases_for_tests()
+    assert triggers.ALIAS_DEFAULT in aliases

@@ -256,10 +256,10 @@ Current scenario tree for the active level. Text-shaped for both UI and Claude c
 
 Server-Sent Events. Spawns `claude` CLI per turn. Frames the snapshot digest into the user message; the system prompt is byte-identical across turns to maximize Anthropic ephemeral cache hits.
 
-**Exact CLI invocation:**
+**Exact CLI invocation (the `--bare` flag is conditional, see "Auth modes" below):**
 
 ```
-claude --bare -p "<user message + compact digest>" \
+claude [--bare] -p "<user message + compact digest>" \
   --model <models.live>                    \   # default claude-haiku-4-5
   --output-format stream-json --verbose --include-partial-messages \
   --tools ""                               \   # no tools; chat-only
@@ -268,11 +268,23 @@ claude --bare -p "<user message + compact digest>" \
 ```
 
 **Why each flag:**
-- `--bare` — skip auto-discovery of hooks/skills/plugins/MCP/CLAUDE.md/auto-memory. Deterministic across machines.
+- `--bare` (conditional, see Auth modes) — skip auto-discovery of hooks/skills/plugins/MCP/CLAUDE.md/auto-memory. Deterministic across machines.
 - `--output-format stream-json --verbose --include-partial-messages` — required combination for line-by-line partial-message events (per Claude CLI docs).
-- `--tools ""` — no built-in tools. Pax AI live chat is conversation over a digest, not agentic coding.
-- `--max-turns 1` — single response then exit. No agent loop.
-- `--append-system-prompt-file` — points at the rendered router skill + the active context skill (see section 8). Byte-identical text => Anthropic cache hit (5-min TTL).
+- `--tools ""` — no built-in tools. Pax AI live chat is conversation over a digest, not agentic coding. Active in **both** auth modes.
+- `--max-turns 1` — single response then exit. No agent loop. Active in **both** auth modes.
+- `--append-system-prompt-file` — points at the frozen system prompt file (router rules + concatenated skill bodies; see section 8). Byte-identical text across calls => Anthropic ephemeral prompt cache hit (5-min TTL).
+
+**Auth modes** (`pax_ai/claude_stream.py::_use_bare()`):
+
+The Claude CLI's `--bare` flag explicitly skips OAuth + keychain reads (per the official Claude Code docs). That makes it inappropriate for subscription-authenticated users by default, because the CLI would return "Not logged in".
+
+| Condition                                                                | `--bare` passed? | Notes                                                                                 |
+|---------------------------------------------------------------------------|------------------|---------------------------------------------------------------------------------------|
+| `ANTHROPIC_API_KEY` set in env (API-key mode)                             | YES              | Fastest cold start; recommended for scripted / CI / automation use.                  |
+| `PAX_AI_CLAUDE_BARE=1` set in env (manual opt-in)                         | YES              | Bypass auto-detection; assumes operator has set up an API key separately.            |
+| Neither env var set (subscription OAuth mode — typical individual user)   | NO               | CLI uses the operator's `claude auth login` OAuth keychain. Cold start ~1 s slower because the CLI now reads CLAUDE.md / hooks / skills from `~/.claude` and the cwd. `--tools ""` + `--max-turns 1` keep the run read-only and single-turn even in this mode. |
+
+The previous (pre-audit) version of this spec asserted `--bare` was always used. That contradicted reality and broke for OAuth subscribers — fixed.
 
 **SSE event shape sent to UI:**
 
