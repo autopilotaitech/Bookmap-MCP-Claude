@@ -40,11 +40,13 @@ _TABLES_FOR_COUNTS = (
 
 
 def _utc_day_bounds_ms(date_str: str) -> Tuple[int, int]:
-    """Return (start_ms, end_ms) for the UTC day.
+    """Return (start_ms, end_ms) for the UTC day - half-open interval.
 
-    end_ms is the start of the following day (midnight boundary), and queries
-    use <= so that rows stamped at exactly midnight are captured in the earlier
-    day's report.
+    end_ms is the start of the following day (midnight boundary). Queries
+    use the half-open predicate ``ts_ms >= start_ms AND ts_ms < end_ms`` so
+    a row stamped at exactly the next-day's UTC midnight belongs to the
+    LATER day, not this one. Matches the convention used by
+    pax_bus_replay._utc_day_bounds_ms and feature_bus.summary_today.
     """
     d = _dt.datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=_dt.timezone.utc)
     return (
@@ -137,12 +139,12 @@ def main(argv=None) -> int:
                     n = conn.execute(
                         "SELECT COUNT(*) FROM trade_outcomes to_ "
                         "JOIN ai_turns at_ ON to_.ai_turn_id=at_.id "
-                        "WHERE at_.ts_ms>=? AND at_.ts_ms<=?",
+                        "WHERE at_.ts_ms>=? AND at_.ts_ms<?",
                         (start_ms, end_ms),
                     ).fetchone()[0]
                 else:
                     n = conn.execute(
-                        f"SELECT COUNT(*) FROM {t} WHERE ts_ms>=? AND ts_ms<=?",
+                        f"SELECT COUNT(*) FROM {t} WHERE ts_ms>=? AND ts_ms<?",
                         (start_ms, end_ms),
                     ).fetchone()[0]
             except sqlite3.OperationalError:
@@ -154,7 +156,7 @@ def main(argv=None) -> int:
         sql = (
             "SELECT id, ts_ms, model, router_primary, elapsed_ms, "
             "total_cost_usd, snapshot_sha256, digest_sha256, snapshot_alias "
-            "FROM ai_turns WHERE ts_ms>=? AND ts_ms<=?"
+            "FROM ai_turns WHERE ts_ms>=? AND ts_ms<?"
         )
         params: List[Any] = [start_ms, end_ms]
         if args.alias:
@@ -205,7 +207,7 @@ def main(argv=None) -> int:
                 "SELECT to_.verdict, COUNT(*) AS n "
                 "FROM trade_outcomes to_ "
                 "JOIN ai_turns at_ ON to_.ai_turn_id=at_.id "
-                "WHERE at_.ts_ms>=? AND at_.ts_ms<=? "
+                "WHERE at_.ts_ms>=? AND at_.ts_ms<? "
                 "GROUP BY to_.verdict ORDER BY n DESC",
                 (start_ms, end_ms),
             ).fetchall()
@@ -232,7 +234,7 @@ def main(argv=None) -> int:
                 "to_.mid_at_t300s, to_.mid_at_t900s "
                 "FROM trade_outcomes to_ "
                 "JOIN ai_turns at_ ON to_.ai_turn_id=at_.id "
-                "WHERE at_.ts_ms>=? AND at_.ts_ms<=? AND to_.verdict=?",
+                "WHERE at_.ts_ms>=? AND at_.ts_ms<? AND to_.verdict=?",
                 (start_ms, end_ms, verdict),
             ).fetchall()
             lines.append(f"  {verdict}:")

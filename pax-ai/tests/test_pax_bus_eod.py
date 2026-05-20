@@ -355,3 +355,69 @@ def test_eod_no_off_limits_imports():
         elif isinstance(node, ast.Import):
             for n in node.names:
                 assert n.name not in forbidden, f"forbidden import: {n.name}"
+
+
+# ---------------------------------------------------------------------------
+# UTC-day boundary regression tests
+# ---------------------------------------------------------------------------
+#
+# Bug: EOD originally used `ts_ms <= end_ms` where end_ms = next-day midnight.
+# That counted rows stamped at the next-day's UTC midnight in the PREVIOUS
+# day's report. The half-open convention used by pax_bus_replay and
+# feature_bus.summary_today is `ts_ms >= start_ms AND ts_ms < end_ms`.
+# These tests pin the half-open convention.
+
+# 2026-01-15T23:59:59.999 UTC
+_UTC_2026_01_15_EOD_MS = 1768521599999
+# 2026-01-16T00:00:00.000 UTC (start of the next day)
+_UTC_2026_01_16_START_MS = 1768521600000
+
+
+def test_eod_counts_use_half_open_utc_day_bound(tmp_path):
+    """Row stamped at exactly next-day UTC midnight must NOT count in the
+    previous day's report."""
+    import re
+    db, snap, dig = _seed_eod_db(tmp_path)
+    _insert_ai_turn(db, _UTC_2026_01_15_EOD_MS,     model="claude-haiku-4-5")
+    _insert_ai_turn(db, _UTC_2026_01_16_START_MS,   model="claude-haiku-4-5")
+    rc = _run(["--date", "2026-01-15"], db, snap, dig, tmp_path / "r.md")
+    assert rc == 0
+    report = (tmp_path / "r.md").read_text(encoding="utf-8")
+    # Find the ai_turns line in the ## Counts block.
+    m = re.search(r"ai_turns\s+(\d+)", report)
+    assert m, f"ai_turns count line not found in:\n{report}"
+    assert int(m.group(1)) == 1, (
+        f"only the 23:59:59.999 row should be counted in 2026-01-15; "
+        f"got {m.group(1)} (report follows):\n{report}"
+    )
+    # The Turns section should also report total = 1.
+    m_total = re.search(r"total\s*:\s*(\d+)", report)
+    assert m_total, f"Turns 'total:' line not found in:\n{report}"
+    assert int(m_total.group(1)) == 1
+
+
+def test_eod_trade_outcomes_join_uses_half_open_bound(tmp_path):
+    """The trade_outcomes COUNT and the verdict / mid-drift joins all key
+    off ai_turns.ts_ms via the same half-open predicate."""
+    import re
+    db, snap, dig = _seed_eod_db(tmp_path)
+    _insert_ai_turn(db, _UTC_2026_01_15_EOD_MS)        # ai_turn id=1
+    _insert_ai_turn(db, _UTC_2026_01_16_START_MS)      # ai_turn id=2 (next day)
+    _insert_trade_outcome(db, ai_turn_id=1, verdict="ENTER_LONG")
+    _insert_trade_outcome(db, ai_turn_id=2, verdict="ENTER_LONG")
+    rc = _run(["--date", "2026-01-15"], db, snap, dig, tmp_path / "r.md")
+    assert rc == 0
+    report = (tmp_path / "r.md").read_text(encoding="utf-8")
+    # trade_outcomes count in the ## Counts block: only the id=1 outcome
+    # whose parent ai_turn fell in Jan 15.
+    m = re.search(r"trade_outcomes\s+(\d+)", report)
+    assert m, f"trade_outcomes count line missing in:\n{report}"
+    assert int(m.group(1)) == 1, (
+        f"only outcome for ai_turn at 23:59:59.999 should join in 2026-01-15; "
+        f"got {m.group(1)} (report follows):\n{report}"
+    )
+    # Verdict rollup must reflect the same single-row count.
+    # ENTER_LONG line should show n=1 (one outcome, not two).
+    m_enter = re.search(r"ENTER_LONG\s+(\d+)", report)
+    assert m_enter, "ENTER_LONG row missing from Verdicts section"
+    assert int(m_enter.group(1)) == 1
