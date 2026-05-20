@@ -339,6 +339,134 @@
         </div>
       </div>
 
+    <details id="todays-bus">
+      <summary>Today's Bus <span id="todays-bus-state-dot" title="status">o</span></summary>
+      <div id="todays-bus-body">
+        <div id="todays-bus-summary">UTC day -- (loading)</div>
+        <div id="todays-bus-recent-levels" style="white-space: pre-line">Recent level events: (loading)</div>
+        <div id="todays-bus-recent-triggers" style="white-space: pre-line">Recent triggers: (loading)</div>
+        <div id="todays-bus-disabled" style="display:none">
+          <p>Capture disabled. Set <code>feature_bus.enabled=true</code> in
+             <code>pax_ai_config.json</code> and restart Pax AI to enable
+             passive capture.</p>
+        </div>
+      </div>
+    </details>
+    <script>
+    (function() {
+      const det = document.getElementById("todays-bus");
+      const dot = document.getElementById("todays-bus-state-dot");
+      const sum = document.getElementById("todays-bus-summary");
+      const lvl = document.getElementById("todays-bus-recent-levels");
+      const trg = document.getElementById("todays-bus-recent-triggers");
+      const dis = document.getElementById("todays-bus-disabled");
+      let timers = [];
+
+      function clearTimers() {
+        timers.forEach(clearInterval);
+        timers = [];
+      }
+
+      function setDot(color, tip) {
+        if (!dot) return;
+        dot.textContent = "o";
+        dot.style.color = color;
+        dot.title = tip || "";
+      }
+
+      function setDisabled(yes) {
+        if (!dis || !sum || !lvl || !trg) return;
+        dis.style.display = yes ? "" : "none";
+        sum.style.display = yes ? "none" : "";
+        lvl.style.display = yes ? "none" : "";
+        trg.style.display = yes ? "none" : "";
+      }
+
+      async function pollStatusAndSummary() {
+        try {
+          const [statusR, sumR] = await Promise.all([
+            fetch("/api/pax/bus/status").then(r => r.json()),
+            fetch("/api/pax/bus/summary").then(r => r.json()),
+          ]);
+          if (!statusR.enabled) {
+            setDot("#888", "capture disabled");
+            setDisabled(true);
+            return;
+          }
+          setDisabled(false);
+          if (!statusR.healthy || !statusR.running) {
+            setDot("#d33", statusR.lastError || "unhealthy");
+          } else if ((statusR.lastWriteAgeMs ?? 0) >= 5000) {
+            setDot("#cc0", "idle - no recent writes");
+          } else {
+            setDot("#3c3", "live");
+          }
+          const c = sumR.counts || {};
+          const ago = statusR.lastWriteAgeMs == null ? "never"
+                      : (statusR.lastWriteAgeMs/1000).toFixed(1) + " s ago";
+          sum.textContent =
+            "UTC day " + sumR.date + ": " +
+            (c.snapshot_features||0) + " snapshots, " +
+            (c.level_events||0) + " level events, " +
+            (c.trigger_events||0) + " triggers, " +
+            (c.ai_turns||0) + " AI turns. Last write: " + ago + ".";
+        } catch (e) {
+          setDot("#d33", "fetch failed: " + e);
+        }
+      }
+
+      async function pollRecent() {
+        try {
+          const [lvR, trR] = await Promise.all([
+            fetch("/api/pax/bus/recent?table=level_events&limit=10").then(r => r.json()),
+            fetch("/api/pax/bus/recent?table=trigger_events&limit=10").then(r => r.json()),
+          ]);
+          if (lvR.enabled === false) return;
+          // Defense in depth: render DB-backed row values via textContent only.
+          // The divs use CSS white-space: pre-line so \n is visible.
+          if (lvl && (lvR.rows||[]).length) {
+            lvl.textContent = "Recent level events:\n" +
+              lvR.rows.map(r =>
+                new Date(r.ts_ms).toISOString().slice(11,19) + " " +
+                r.alias + " " + r.level_label + " " +
+                (r.prev_decision||"-") + "->" + (r.new_decision||"-") +
+                " (" + (r.prev_confidence||0).toFixed(2) + "->" +
+                (r.new_confidence||0).toFixed(2) + ")"
+              ).join("\n");
+          } else if (lvl) {
+            lvl.textContent = "Recent level events: (none today)";
+          }
+          if (trg && (trR.rows||[]).length) {
+            trg.textContent = "Recent triggers:\n" +
+              trR.rows.map(r =>
+                new Date(r.ts_ms).toISOString().slice(11,19) + " " +
+                r.alias + " " + r.kind + " " +
+                (r.label||"") + " " + r.severity
+              ).join("\n");
+          } else if (trg) {
+            trg.textContent = "Recent triggers: (none today)";
+          }
+        } catch (e) {
+          // Quiet: leave previous content in place.
+        }
+      }
+
+      function start() {
+        pollStatusAndSummary();
+        pollRecent();
+        timers.push(setInterval(pollStatusAndSummary, 2000));
+        timers.push(setInterval(pollRecent, 5000));
+      }
+
+      if (det) {
+        det.addEventListener("toggle", () => {
+          clearTimers();
+          if (det.open) start();
+        });
+      }
+    })();
+    </script>
+
       <div class="transcript-wrap">
         <div class="transcript" id="transcript"></div>
       </div>

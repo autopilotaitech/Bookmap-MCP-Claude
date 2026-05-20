@@ -27,7 +27,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Tuple
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 
 from . import DASHBOARD_URL, DEFAULT_PORT
 from . import poller, context as ctx_mod, edge_calculus, playbook, config
@@ -201,6 +201,60 @@ def _api_pax_health() -> Tuple[int, Dict[str, Any]]:
     }
 
 
+def _api_pax_bus_status() -> Tuple[int, Dict[str, Any]]:
+    """Phase-2 read-only endpoint: writer status + derived lastWriteAgeMs."""
+    body = feature_bus.status()
+    last_ms = body.get("lastWriteMs") or 0
+    if last_ms > 0:
+        import time as _t
+        body["lastWriteAgeMs"] = int(_t.time() * 1000) - int(last_ms)
+    else:
+        body["lastWriteAgeMs"] = None
+    return 200, body
+
+
+_RECENT_ALLOWED = ("level_events", "trigger_events",
+                   "microstructure_events", "ai_turns")
+
+
+def _api_pax_bus_recent(qs: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+    """Phase-2 read-only endpoint: most-recent N rows from one allowlisted table.
+
+    qs is a flat dict of query-string params (already URL-decoded). Values are
+    strings. Missing/garbage values fall back to documented defaults.
+
+    snapshot_features is summary-only in Phase 2; rejected with HTTP 400."""
+    table = qs.get("table")
+    if not table:
+        return 400, {"error": "missing 'table' query param",
+                      "allowed": list(_RECENT_ALLOWED)}
+    if table not in _RECENT_ALLOWED:
+        return 400, {"error": f"unknown table '{table}' (snapshot_features is "
+                                 "summary-only in Phase 2)",
+                      "allowed": list(_RECENT_ALLOWED)}
+    if not config.get("feature_bus.enabled", False):
+        return 200, {"enabled": False, "table": table, "rows": []}
+    # limit clamping + garbage tolerance
+    try:
+        limit = int(qs.get("limit") or 10)
+    except (TypeError, ValueError):
+        limit = 10
+    alias = qs.get("alias") or None
+    db_path = Path(config.get("feature_bus.db_path"))
+    if not db_path.exists():
+        return 200, {"enabled": True, "table": table, "rows": [],
+                      "warning": "db not yet created"}
+    rows = feature_bus.recent_events(table, limit=limit, alias=alias)
+    return 200, {"enabled": True, "table": table, "rows": rows}
+
+
+def _api_pax_bus_summary(qs: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+    """Phase-2 read-only endpoint: UTC-day rollup counters."""
+    date_str = qs.get("date") or None
+    body = feature_bus.summary_today(date_str)
+    return 200, body
+
+
 def _api_pax_skills() -> Tuple[int, Dict[str, Any]]:
     # Phase 4 wires the real router; for now we just enumerate what's on disk.
     skills_root = Path(__file__).parent.parent.parent / "skills"
@@ -334,6 +388,19 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(status, body); return
             if path == "/api/pax/health":
                 status, body = _api_pax_health()
+                self._send_json(status, body); return
+            if path == "/api/pax/bus/status":
+                status, body = _api_pax_bus_status()
+                self._send_json(status, body); return
+            if path == "/api/pax/bus/recent":
+                raw = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+                qs = {k: v[0] for k, v in raw.items()}
+                status, body = _api_pax_bus_recent(qs)
+                self._send_json(status, body); return
+            if path == "/api/pax/bus/summary":
+                raw = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+                qs = {k: v[0] for k, v in raw.items()}
+                status, body = _api_pax_bus_summary(qs)
                 self._send_json(status, body); return
             if path.startswith("/api/pax/level/"):
                 # URL-decode the segment. Snapshot labels include '+'

@@ -891,3 +891,177 @@ def _writer_loop() -> None:
         with _STATE_LOCK:
             _RUNNING = False
         sys.stderr.write("[feature_bus] writer stopped\n")
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 read-only helpers - UI observability only.
+# These NEVER touch the writer thread, the queue, or any record_* path.
+# They open the bus DB in read-only mode and return projected rows. The
+# endpoint layer in server.py wraps them with HTTP shape; the helpers
+# themselves can be unit-tested without HTTP.
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timedelta, timezone
+
+
+_RECENT_PROJECTION: Dict[str, tuple] = {
+    "level_events":          ("id", "ts_ms", "alias", "level_label", "level_price",
+                              "prev_decision", "new_decision",
+                              "prev_confidence", "new_confidence",
+                              "prev_proximity", "new_proximity",
+                              "trigger_reason"),
+    "trigger_events":        ("id", "ts_ms", "alias", "kind", "severity",
+                              "label", "headline", "details", "snapshot_ts_ms"),
+    "microstructure_events": ("id", "ts_ms", "alias", "event_type",
+                              "price", "side", "size"),
+    "ai_turns":              ("id", "ts_ms", "model", "deep", "router_primary",
+                              "user_text_raw", "snapshot_sha256", "digest_sha256",
+                              "total_cost_usd", "input_tokens", "output_tokens",
+                              "exit_code"),
+}
+# snapshot_features is INTENTIONALLY omitted - high-rate 1Hz table; recent-row
+# listing is a Phase 3+ concern. Summary counters are in summary_today().
+
+
+def _open_db_readonly(db_path: Path) -> sqlite3.Connection:
+    """Open the bus DB in read-only mode with a short busy timeout.
+    Raises FileNotFoundError when the DB file doesn't exist yet."""
+    if not Path(db_path).exists():
+        raise FileNotFoundError(str(db_path))
+    uri = f"file:{Path(db_path).as_posix()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=0.2,
+                            isolation_level=None, check_same_thread=False)
+    conn.execute("PRAGMA query_only=ON")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def recent_events(table: str, limit: int = 10,
+                   alias: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Read-only SELECT of most-recent rows from one of the four
+    projection-allowlisted tables. NEVER raises (except KeyError for
+    unknown tables - the endpoint converts that to HTTP 400)."""
+    if table not in _RECENT_PROJECTION:
+        raise KeyError(table)
+    if not config.get("feature_bus.enabled", False):
+        return []
+    # Clamp limit to [1, 50].
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        n = 10
+    n = max(1, min(50, n))
+    cols = _RECENT_PROJECTION[table]
+    sql = (f"SELECT {','.join(cols)} FROM {table} "
+           + ("WHERE alias=? " if alias is not None else "")
+           + "ORDER BY ts_ms DESC LIMIT ?")
+    params = ((alias, n) if alias is not None else (n,))
+    db_path = Path(config.get("feature_bus.db_path"))
+    try:
+        with _open_db_readonly(db_path) as conn:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+    except (FileNotFoundError, sqlite3.OperationalError):
+        return []
+
+
+def _utc_day_bounds_ms(date_str: Optional[str]) -> tuple:
+    """Return (start_ms, next_start_ms, date_str_normalized).
+    date_str None or invalid -> current UTC date."""
+    if date_str:
+        try:
+            d = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            d = datetime.now(timezone.utc)
+    else:
+        d = datetime.now(timezone.utc)
+    start = d.replace(hour=0, minute=0, second=0, microsecond=0)
+    next_start = start + timedelta(days=1)
+    return (int(start.timestamp() * 1000),
+            int(next_start.timestamp() * 1000),
+            start.strftime("%Y-%m-%d"))
+
+
+def _disabled_summary(date_str_norm: str) -> Dict[str, Any]:
+    return {
+        "enabled":        False,
+        "date":           date_str_norm,
+        "counts":         {},
+        "topAlias":       None,
+        "lastEventMs":    None,
+        "lastEventAgeMs": None,
+    }
+
+
+_SUMMARY_TABLES = (
+    "snapshot_features", "level_events", "microstructure_events",
+    "trigger_events", "ai_turns",
+)
+_EVENT_TABLES_FOR_LAST_TS = (
+    "level_events", "microstructure_events", "trigger_events", "ai_turns",
+)
+
+
+def summary_today(date_str: Optional[str] = None) -> Dict[str, Any]:
+    """Counters for one UTC day. See module docstring for full contract."""
+    start_ms, next_ms, date_norm = _utc_day_bounds_ms(date_str)
+    if not config.get("feature_bus.enabled", False):
+        return _disabled_summary(date_norm)
+    db_path = Path(config.get("feature_bus.db_path"))
+    out: Dict[str, Any] = {
+        "enabled":        True,
+        "date":           date_norm,
+        "counts":         {t: 0 for t in _SUMMARY_TABLES},
+        "topAlias":       None,
+        "lastEventMs":    None,
+        "lastEventAgeMs": None,
+    }
+    try:
+        conn = _open_db_readonly(db_path)
+    except (FileNotFoundError, sqlite3.OperationalError):
+        out["warning"] = "db not yet created"
+        return out
+    try:
+        with conn:
+            for t in _SUMMARY_TABLES:
+                try:
+                    n = conn.execute(
+                        f"SELECT COUNT(*) FROM {t} WHERE ts_ms>=? AND ts_ms<?",
+                        (start_ms, next_ms)).fetchone()[0]
+                except sqlite3.OperationalError:
+                    n = 0
+                out["counts"][t] = int(n)
+            # topAlias: count alias occurrences across all tables, pick the max.
+            # Query each table independently so a missing table doesn't kill
+            # the whole aggregation.
+            alias_counts: Dict[str, int] = {}
+            for t in _SUMMARY_TABLES:
+                try:
+                    rows = conn.execute(
+                        f"SELECT alias, COUNT(*) FROM {t} "
+                        f"WHERE ts_ms>=? AND ts_ms<? GROUP BY alias",
+                        (start_ms, next_ms)).fetchall()
+                    for r in rows:
+                        a = r[0]
+                        if a:
+                            alias_counts[a] = alias_counts.get(a, 0) + r[1]
+                except sqlite3.OperationalError:
+                    pass
+            if alias_counts:
+                out["topAlias"] = max(alias_counts, key=alias_counts.__getitem__)
+            # lastEventMs across event tables (NOT snapshot_features).
+            last_ts: Optional[int] = None
+            for t in _EVENT_TABLES_FOR_LAST_TS:
+                try:
+                    r = conn.execute(
+                        f"SELECT MAX(ts_ms) FROM {t} WHERE ts_ms>=? AND ts_ms<?",
+                        (start_ms, next_ms)).fetchone()
+                    if r and r[0] is not None:
+                        last_ts = max(last_ts or 0, int(r[0]))
+                except sqlite3.OperationalError:
+                    pass
+            if last_ts:
+                out["lastEventMs"] = last_ts
+                out["lastEventAgeMs"] = int(time.time() * 1000) - last_ts
+    finally:
+        conn.close()
+    return out
