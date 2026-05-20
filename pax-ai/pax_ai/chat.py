@@ -20,9 +20,9 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from . import claude_stream, poller, prompts, voice, config
+from . import claude_stream, poller, prompts, voice, config, journal
 
 
 # Single global abort flag for the most-recent chat. Replaced on every
@@ -166,6 +166,15 @@ def handle_chat_stream(wfile, user_text: str) -> None:
 
     full_msg, meta = build_user_message(user_text)
 
+    # Journal the user turn immediately. The normalized text (voice ->
+    # canonical jargon) is what we persist, not the raw transcript -- it
+    # matches what Claude sees in the digest.
+    journal.record("YOU", meta["user_normalized"], meta={
+        "router_primary":  meta["router_primary"],
+        "snapshot_stale":  meta["snapshot_stale"],
+        "snapshot_age_ms": meta["snapshot_age_ms"],
+    })
+
     # System prompt path - rendered at boot, cached on disk
     try:
         sp_path = prompts.write_frozen_prompt()
@@ -175,6 +184,7 @@ def handle_chat_stream(wfile, user_text: str) -> None:
         return
 
     model = config.get("models.live", "claude-haiku-4-5")
+    pax_collected: List[str] = []
 
     # Tell the UI the chat is starting + which skill is leading.
     try:
@@ -190,6 +200,7 @@ def handle_chat_stream(wfile, user_text: str) -> None:
         return
 
     def on_token(text: str) -> None:
+        pax_collected.append(text)
         try:
             wfile.write(_sse_event("token", {"text": text}))
             wfile.flush()
@@ -210,6 +221,19 @@ def handle_chat_stream(wfile, user_text: str) -> None:
         abort=abort,
     )
     elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+    # Journal the assistant turn (even on partial / aborted / errored runs
+    # so the audit trail is complete).
+    pax_text = "".join(pax_collected)
+    journal.record("PAX", pax_text, meta={
+        "model":          model,
+        "exit_code":      rc,
+        "elapsed_ms":     elapsed_ms,
+        "tokens_emitted": final_info.get("tokens_emitted", 0),
+        "aborted":        final_info.get("aborted", abort.is_set()),
+        "error":          final_info.get("error"),
+        "router_primary": meta["router_primary"],
+    })
 
     try:
         wfile.write(_sse_event("done", {

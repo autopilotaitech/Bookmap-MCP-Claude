@@ -31,7 +31,7 @@ from urllib.parse import urlparse
 
 from . import DASHBOARD_URL, DEFAULT_PORT
 from . import poller, context as ctx_mod, edge_calculus, playbook, config
-from . import chat as chat_mod, claude_stream, triggers
+from . import chat as chat_mod, claude_stream, triggers, journal
 
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -235,6 +235,15 @@ class _Handler(BaseHTTPRequestHandler):
                 aborted = chat_mod.request_abort()
                 self._send_json(200, {"aborted": aborted})
                 return
+            if path == "/api/pax/chat/forget":
+                target = payload.get("run_id")
+                deleted = journal.forget(target if target else None)
+                self._send_json(200, {
+                    "deleted":    deleted,
+                    "run_id":     target or journal.current_run_id(),
+                    "new_run_id": journal.current_run_id(),
+                })
+                return
             self._send_json(404, {"error": "not found", "path": path})
         except (BrokenPipeError, ConnectionResetError):
             return
@@ -294,6 +303,19 @@ class _Handler(BaseHTTPRequestHandler):
                 label = path[len("/api/pax/level/"):]
                 status, body = _api_pax_level(label)
                 self._send_json(status, body); return
+            if path == "/api/pax/chat/history":
+                from urllib.parse import parse_qs
+                q = parse_qs(urlparse(self.path).query)
+                limit = int(q.get("limit", [50])[0])
+                scope = q.get("scope", ["all"])[0]   # 'all' | 'run'
+                run = journal.current_run_id() if scope == "run" else None
+                rows = journal.recent(limit=limit, run_id=run)
+                self._send_json(200, {
+                    "rows":        rows,
+                    "run_id":      journal.current_run_id(),
+                    "scope":       scope,
+                })
+                return
             self._send_json(404, {"error": "not found", "path": path})
         except (BrokenPipeError, ConnectionResetError):
             return

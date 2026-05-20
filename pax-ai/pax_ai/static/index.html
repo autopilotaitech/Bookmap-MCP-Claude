@@ -209,6 +209,21 @@
   .turn .meta { font-size: 9.5px; color: var(--text-faint);
     font-family: 'JetBrains Mono', 'Consolas', monospace; margin-top: 3px; }
   .turn.error .msg { color: var(--red); font-size: 11px; }
+  /* —— history —— */
+  .turn.historical { opacity: 0.55; }
+  .turn.historical .who::after { content: ' \B7 history'; color: var(--text-faint);
+    font-size: 9.5px; letter-spacing: 0.4px; }
+  .hist-divider { font-size: 9.5px; color: var(--text-faint);
+    letter-spacing: 0.8px; padding: 6px 0 4px;
+    border-top: 1px dashed var(--line-2); margin-top: 6px;
+    text-transform: uppercase; text-align: center; }
+  .toast { position: absolute; bottom: 60px; left: 50%; transform: translateX(-50%);
+    background: rgba(54,214,255,0.16); border: 1px solid rgba(54,214,255,0.4);
+    color: var(--cyan); padding: 5px 10px; border-radius: 6px;
+    font-size: 11px; letter-spacing: 0.5px;
+    opacity: 0; transition: opacity 0.2s ease;
+    pointer-events: none; z-index: 50; }
+  .toast.show { opacity: 1; }
   /* —— input —— */
   .input {
     display: grid; grid-template-columns: 1fr auto auto;
@@ -288,6 +303,7 @@
         <div class="transcript" id="transcript"></div>
       </div>
     </div>
+    <div class="toast" id="toast"></div>
 
     <div class="input">
       <textarea id="chat-input" placeholder="ask about flow, levels, or tap the mic..." rows="1"></textarea>
@@ -563,8 +579,83 @@ async function sendChat() {
   const msg = (ta.value || '').trim();
   if (!msg) return;
   ta.value = '';                          // clear-on-send per spec
+  // Slash commands intercepted client-side. /forget wipes current run's
+  // history on the server AND clears the live transcript DOM.
+  if (msg === '/forget') {
+    await runForget();
+    return;
+  }
   await _streamChatMessage(msg);
 }
+
+async function runForget() {
+  try {
+    const r = await fetch('/api/pax/chat/forget', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+    const j = await r.json();
+    document.getElementById('transcript').innerHTML = '';
+    showToast('history cleared (' + (j.deleted || 0) + ' rows)');
+  } catch (e) {
+    showToast('forget failed: ' + e);
+  }
+}
+
+let _toastTimer = null;
+function showToast(text) {
+  const t = document.getElementById('toast');
+  if (!t) return;
+  t.textContent = text;
+  t.classList.add('show');
+  if (_toastTimer) clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
+}
+
+async function loadHistory() {
+  try {
+    const r = await fetch('/api/pax/chat/history?limit=50&scope=all', {cache:'no-store'});
+    if (!r.ok) return;
+    const j = await r.json();
+    const rows = j.rows || [];
+    if (!rows.length) return;
+    const transcript = document.getElementById('transcript');
+    // Insert each historical row at the front of the transcript.
+    // Rows arrive oldest-first so we just appendChild in order.
+    for (const row of rows) {
+      const kind = row.role === 'PAX' ? 'pax' : 'you';
+      const who  = row.role === 'PAX' ? 'PAX' : 'YOU';
+      const div = document.createElement('div');
+      div.className = 'turn historical ' + kind;
+      const whoEl = document.createElement('div');
+      whoEl.className = 'who ' + kind;
+      whoEl.innerHTML = '<b>' + who + '</b> &middot; ' + tsToHHMMSS(row.ts_ms);
+      div.appendChild(whoEl);
+      const msgEl = document.createElement('div');
+      msgEl.className = 'msg';
+      msgEl.textContent = row.text || '';
+      div.appendChild(msgEl);
+      transcript.appendChild(div);
+    }
+    const divider = document.createElement('div');
+    divider.className = 'hist-divider';
+    divider.textContent = '— session —';
+    transcript.appendChild(divider);
+    // Scroll to the bottom so the divider is in view, ready for new turns.
+    divider.scrollIntoView({block: 'end'});
+  } catch (e) { /* history is best-effort; silent on failure */ }
+}
+
+function tsToHHMMSS(ts_ms) {
+  if (!ts_ms) return '--';
+  const d = new Date(Number(ts_ms));
+  return d.toTimeString().slice(0,8);
+}
+
+// Load history once at page boot. Idempotent against multiple invocations
+// because the transcript only renders rows from /history at startup.
+loadHistory();
 
 function askAboutTrigger(kind, label, headline) {
   if (_chatInFlight) return;
