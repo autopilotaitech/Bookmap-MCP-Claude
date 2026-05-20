@@ -77,13 +77,30 @@ def test_level_approach_does_not_fire_when_far():
     assert all(x["kind"] != "LEVEL_APPROACH" for x in t)
 
 
-def test_level_approach_dedups_within_bucket():
+def test_level_approach_re_emits_while_in_proximity():
+    """LEVEL_APPROACH is a STATE condition, not an edge event. The chip
+    must stay visible on every poll while ticks_away <= prox_ticks. The
+    prior dedup-based behavior caused the chip to vanish on the second
+    poll -- exactly the "flicker" bug the user reported."""
     snap = _live_snap_base()
     snap["or_levels"]["levels"][0]["distance"] = 1.0
     t1 = triggers.compute_triggers(snap, snap_age_ms=100)
     t2 = triggers.compute_triggers(snap, snap_age_ms=100)
+    t3 = triggers.compute_triggers(snap, snap_age_ms=100)
     assert any(x["kind"] == "LEVEL_APPROACH" for x in t1)
-    assert all(x["kind"] != "LEVEL_APPROACH" for x in t2), "dedup should suppress second fire"
+    assert any(x["kind"] == "LEVEL_APPROACH" for x in t2), "must re-emit while in proximity"
+    assert any(x["kind"] == "LEVEL_APPROACH" for x in t3), "must re-emit while in proximity"
+
+
+def test_level_approach_disappears_when_price_leaves_proximity():
+    snap = _live_snap_base()
+    snap["or_levels"]["levels"][0]["distance"] = 1.0
+    t1 = triggers.compute_triggers(snap, snap_age_ms=100)
+    snap["or_levels"]["levels"][0]["distance"] = 50.0   # well outside 8 ticks
+    t2 = triggers.compute_triggers(snap, snap_age_ms=100)
+    assert any(x["kind"] == "LEVEL_APPROACH" for x in t1)
+    assert all(x["kind"] != "LEVEL_APPROACH" for x in t2), \
+        "must disappear once condition no longer holds"
 
 
 # ---------------------------------------------------------------------------
@@ -157,17 +174,47 @@ def test_trend_signal_no_change_flag_does_not_fire():
     assert all(x["kind"] != "TREND_SIGNAL_FIRE" for x in t)
 
 
-def test_trend_signal_same_bucket_does_not_fire_twice():
-    """Two polls with the same bucketEnteredMs must dedup, even if
-    changedSinceLastTick is True on both ticks (defensive)."""
+def test_trend_signal_lingers_after_fire_even_when_change_flag_clears():
+    """Edge trigger: once it fires, the chip must stay visible across
+    subsequent polls where changedSinceLastTick=False. This was the
+    "flicker like HFT 2 times" bug the user reported."""
     s = _live_snap_base()
     s["trend_signal"] = {"kind": "STRONG_BULL", "eligible": True,
                           "changedSinceLastTick": True,
                           "bucketEnteredMs": 1000, "mid": 21330.0}
     t1 = triggers.compute_triggers(s, 100)
+    # The dashboard typically sets changedSinceLastTick back to False on
+    # the very next poll, while bucketEnteredMs stays at 1000.
+    s["trend_signal"]["changedSinceLastTick"] = False
     t2 = triggers.compute_triggers(s, 100)
+    t3 = triggers.compute_triggers(s, 100)
+    assert any(x["kind"] == "TREND_SIGNAL_FIRE" for x in t1), "initial fire"
+    assert any(x["kind"] == "TREND_SIGNAL_FIRE" for x in t2), (
+        "must linger across the change-flag-false poll")
+    assert any(x["kind"] == "TREND_SIGNAL_FIRE" for x in t3), "still lingering"
+
+
+def test_trend_signal_linger_expires_after_window(monkeypatch):
+    """The linger cache must EVENTUALLY drop the chip. We monkeypatch
+    time.time so the test runs deterministically without sleeping."""
+    import pax_ai.triggers as trig_mod
+    fake_now = [1_000_000.0]
+    monkeypatch.setattr(trig_mod.time, "time", lambda: fake_now[0])
+    triggers.reset_state_for_tests()
+
+    s = _live_snap_base()
+    s["trend_signal"] = {"kind": "STRONG_BULL", "eligible": True,
+                          "changedSinceLastTick": True,
+                          "bucketEnteredMs": 1000, "mid": 21330.0}
+    t1 = triggers.compute_triggers(s, 100)
     assert any(x["kind"] == "TREND_SIGNAL_FIRE" for x in t1)
-    assert all(x["kind"] != "TREND_SIGNAL_FIRE" for x in t2)
+
+    # Advance wall clock past the linger window (default 15 s).
+    s["trend_signal"]["changedSinceLastTick"] = False
+    fake_now[0] += 16.0
+    t_expired = triggers.compute_triggers(s, 100)
+    assert all(x["kind"] != "TREND_SIGNAL_FIRE" for x in t_expired), \
+        "linger must expire after LINGER_MS"
 
 
 def test_trend_signal_new_bucket_refires_within_60s():
