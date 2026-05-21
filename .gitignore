@@ -46,3 +46,9 @@ Thumbs.db
 
 # Claude Code per-user permission grants (machine-local)
 .claude/settings.local.json
+
+# Phase 4B/5A bus-tools report outputs (generated; not source)
+reports/bus-eod-*.md
+reports/bus-prune-*.md
+reports/bus-replay-*.md
+reports/tune-recommendations-*.json
