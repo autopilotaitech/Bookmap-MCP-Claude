@@ -58,6 +58,9 @@ Invoke-JavaTest "com.openrange.PaxNativeSignalMarkerPolicyTest"
 Invoke-JavaTest "com.openrange.PaxChartTimeCoordsTest"
 Invoke-JavaTest "com.openrange.PaxTrendTriangleDedupTest"
 Invoke-JavaTest "com.openrange.PaxTrendSignalRuntimeStatusTest"
+Invoke-JavaTest "com.openrange.PaxTrendGlyphCacheTest"
+Invoke-JavaTest "com.openrange.PaxRepaintGuardTest"
+Invoke-JavaTest "com.openrange.PaxOpeningRangeRenderKeyTest"
 
 $jarPath = "build\libs\openrange-release.jar"
 & "$javaBin\jar.exe" @("--create", "--file", $jarPath, "-C", "build\classes", ".")

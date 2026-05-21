@@ -127,6 +127,27 @@ public class PaxOpeningRangeModule implements
     private static final long TRIANGLE_LOG_THROTTLE_MS = 60_000L;
     private static volatile long lastTriangleEmitLogMs = 0L;
     private static volatile long lastTriangleSkipLogMs = 0L;
+    /** Throttle for native trend marker emit/skip INFO logs. Same cadence as
+     *  the triangle audit lines so the bridge log stays readable when
+     *  multiple instruments are attached. */
+    private static volatile long lastTrendMarkerEmitLogMs = 0L;
+    private static volatile long lastTrendMarkerSkipLogMs = 0L;
+    private static volatile long lastSignalMarkerEmitLogMs = 0L;
+    private static volatile long lastSignalMarkerSkipLogMs = 0L;
+    private static volatile long lastDegradationLogMs = 0L;
+    /** Process-wide cache of trend-triangle PreparedImages. Each entry is
+     *  immutable; ~8 entries cover STRONG/WEAK x BULL/BEAR x 2 font sizes.
+     *  Replaces a per-redraw BufferedImage + Graphics2D allocation that
+     *  could fire up to 8 times per dashboard poll. */
+    private static final PaxTrendGlyphCache TREND_GLYPH_CACHE =
+            new PaxTrendGlyphCache(PaxOpeningRangeModule::buildTrendGlyphImage);
+
+    /** Sentinel values for the per-painter render-key memoization. A
+     *  computed key from {@link #triangleRenderKey} or the overlay key
+     *  computation can never collide with these because every code path
+     *  there returns a non-empty, non-sentinel string. */
+    static final String TRIANGLE_KEY_UNSET = "@unset";
+    static final String OVERLAY_KEY_UNSET  = "@unset";
 
     /**
      * Fine-grained repaint dispatch.
@@ -558,9 +579,13 @@ public class PaxOpeningRangeModule implements
             }
             Consumer<Object> consumer = consumersByAlias.get(symbol);
             if (consumer == null) {
-                try {
-                    Log.info("OpenRange native signal marker skipped reason=no_consumer alias=" + symbol);
-                } catch (Throwable ignored) { /* Log unavailable in tests */ }
+                long nowMs = System.currentTimeMillis();
+                if (nowMs - lastSignalMarkerSkipLogMs >= TRIANGLE_LOG_THROTTLE_MS) {
+                    lastSignalMarkerSkipLogMs = nowMs;
+                    try {
+                        Log.info("OpenRange native signal marker skipped reason=no_consumer alias=" + symbol);
+                    } catch (Throwable ignored) { /* Log unavailable in tests */ }
+                }
                 return false;
             }
             PaxTrendSignalModel.Kind kind = openingRangeMarkerKind(snapshot.signal());
@@ -575,14 +600,18 @@ public class PaxOpeningRangeModule implements
             int xOffset = -icon.getWidth() / 2;
             int yOffset = kind.isBull() ? 12 : -icon.getHeight() - 12;
             consumer.accept(new Marker(price / pips, xOffset, yOffset, icon));
-            try {
-                Log.info("OpenRange native signal marker emitted"
-                        + " symbol=" + symbol
-                        + " bias=" + snapshot.signal().bias()
-                        + " confidence=" + snapshot.signal().confidence()
-                        + " price=" + price
-                        + " dataPrice=" + (price / pips));
-            } catch (Throwable ignored) { /* Log unavailable in tests */ }
+            long nowMs = System.currentTimeMillis();
+            if (nowMs - lastSignalMarkerEmitLogMs >= TRIANGLE_LOG_THROTTLE_MS) {
+                lastSignalMarkerEmitLogMs = nowMs;
+                try {
+                    Log.info("OpenRange native signal marker emitted"
+                            + " symbol=" + symbol
+                            + " bias=" + snapshot.signal().bias()
+                            + " confidence=" + snapshot.signal().confidence()
+                            + " price=" + price
+                            + " dataPrice=" + (price / pips));
+                } catch (Throwable ignored) { /* Log unavailable in tests */ }
+            }
             return true;
         }
 
@@ -594,9 +623,13 @@ public class PaxOpeningRangeModule implements
             }
             Consumer<Object> consumer = consumersByAlias.get(alias);
             if (consumer == null) {
-                try {
-                    Log.info("OpenRange native trend marker skipped reason=no_consumer alias=" + alias);
-                } catch (Throwable ignored) { /* Log unavailable in tests */ }
+                long nowMs = System.currentTimeMillis();
+                if (nowMs - lastTrendMarkerSkipLogMs >= TRIANGLE_LOG_THROTTLE_MS) {
+                    lastTrendMarkerSkipLogMs = nowMs;
+                    try {
+                        Log.info("OpenRange native trend marker skipped reason=no_consumer alias=" + alias);
+                    } catch (Throwable ignored) { /* Log unavailable in tests */ }
+                }
                 return false;
             }
             String source = signal.eventMsSource != null && signal.eventMsSource.startsWith("pax_decision")
@@ -605,13 +638,17 @@ public class PaxOpeningRangeModule implements
             int xOffset = -icon.getWidth() / 2;
             int yOffset = signal.kind.isBull() ? 12 : -icon.getHeight() - 12;
             consumer.accept(new Marker(signal.mid / pips, xOffset, yOffset, icon));
-            try {
-                Log.info("OpenRange native trend marker emitted"
-                        + " alias=" + alias
-                        + " kind=" + signal.kind
-                        + " mid=" + signal.mid
-                        + " dataPrice=" + (signal.mid / pips));
-            } catch (Throwable ignored) { /* Log unavailable in tests */ }
+            long nowMs = System.currentTimeMillis();
+            if (nowMs - lastTrendMarkerEmitLogMs >= TRIANGLE_LOG_THROTTLE_MS) {
+                lastTrendMarkerEmitLogMs = nowMs;
+                try {
+                    Log.info("OpenRange native trend marker emitted"
+                            + " alias=" + alias
+                            + " kind=" + signal.kind
+                            + " mid=" + signal.mid
+                            + " dataPrice=" + (signal.mid / pips));
+                } catch (Throwable ignored) { /* Log unavailable in tests */ }
+            }
             return true;
         }
 
@@ -1277,6 +1314,26 @@ public class PaxOpeningRangeModule implements
          * from persistentShapes so polling never flickers the OR lines.
          */
         private final List<CanvasIcon> volatileShapes   = Collections.synchronizedList(new ArrayList<>());
+        /** Min-interval gap + emergency degradation guard. Bounded so a
+         *  stalled Pax AI cannot trigger storms of triangle/overlay rebuilds
+         *  on the chart callback thread. Persistent OR rebuilds bypass this
+         *  guard - OR levels are load-bearing. */
+        private final PaxRepaintGuard repaintGuard = new PaxRepaintGuard();
+        /** Memoized last rendered triangle bucket key. When unchanged across
+         *  consecutive ticks the entire clear+redraw is skipped - including
+         *  the no-shape outcome (e.g. dashboard ineligible, signal null,
+         *  showTrendTriangles=false). The sentinel TRIANGLE_KEY_UNSET marks
+         *  "never rendered yet" so the first tick always renders. */
+        private String lastTriangleRenderKey = TRIANGLE_KEY_UNSET;
+        /** Memoized last rendered overlay key + cached PreparedImage. When
+         *  the underlying model signature and font size are unchanged we
+         *  reuse the prior image instead of allocating a fresh
+         *  ~320x200 BufferedImage on every refresh. Sentinel OVERLAY_KEY_UNSET
+         *  marks "never rendered yet". */
+        private String lastOverlayKey = OVERLAY_KEY_UNSET;
+        private PreparedImage lastOverlayImage;
+        private int lastOverlayWidth;
+        private int lastOverlayHeight;
 
         PaxPainter(String alias, ScreenSpaceCanvas canvas) {
             this.alias = alias;
@@ -1290,25 +1347,76 @@ public class PaxOpeningRangeModule implements
             update();
         }
 
-        /** Dispatch by needs vector. Each bucket is independent. */
+        /** Dispatch by needs vector. Each bucket is independent. Overlay
+         *  and triangle buckets pass through {@link #repaintGuard}: min
+         *  interval gap + emergency degradation. Persistent OR shapes
+         *  bypass the guard so OR levels never drop during a degraded
+         *  window. The total wall-clock cost of this call is fed back into
+         *  the guard so a slow paint triggers automatic backoff. */
         synchronized void applyNeeds(RepaintNeeds needs) {
             if (needs == null || needs.isNone()) return;
-            if (needs.persistent) updatePersistent();
-            if (needs.triangles)  updateTriangles();
-            if (needs.overlay)    updateOverlay();
+            long startNanos = System.nanoTime();
+            long nowMs = System.currentTimeMillis();
+            try {
+                if (needs.persistent) updatePersistent();
+                if (needs.triangles) {
+                    if (repaintGuard.allowTriangle(nowMs, startNanos)) {
+                        updateTriangles();
+                    } else {
+                        trendSignalDirty.set(true);
+                        maybeLogDegradation(nowMs, "triangles");
+                    }
+                }
+                if (needs.overlay) {
+                    if (repaintGuard.allowOverlay(nowMs, startNanos)) {
+                        updateOverlay();
+                    } else {
+                        heatwaveDirty.set(true);
+                        maybeLogDegradation(nowMs, "overlay");
+                    }
+                }
+            } finally {
+                long durationNanos = System.nanoTime() - startNanos;
+                repaintGuard.recordApplyDurationNanos(durationNanos, startNanos + durationNanos);
+            }
         }
 
         /** Full repaint of every bucket. Used by onMoveEnd, init, and
          *  explicit rebuild paths. Force-syncs the InstrumentState's
          *  lastOrSignature so the next tick-driven check doesn't fire a
-         *  redundant persistent rebuild. */
+         *  redundant persistent rebuild. The guard's min-interval timers
+         *  are reset here so onMoveEnd never gets short-circuited - the
+         *  operator is actively interacting with the chart. The triangle
+         *  and overlay buckets are invoked with force=true so the
+         *  per-bucket render-key memoization cannot suppress the redraw
+         *  (e.g. onMoveEnd needs to re-anchor the canvas regardless of
+         *  whether the upstream model changed). The overlay image cache
+         *  IS preserved by clearVolatile() so the forced repaint still
+         *  reuses the prior PreparedImage when the model is unchanged. */
         synchronized void update() {
             InstrumentState state = instruments.get(alias);
             if (state == null) return;
+            repaintGuard.resetMinIntervals();
             updatePersistent();
-            updateTriangles();
-            updateOverlay();
+            updateTriangles(true);
+            updateOverlay(true);
             state.lastOrSignature = state.computeOrSignature();
+        }
+
+        /** Rate-limited heads-up that the guard tripped. Throttled across
+         *  the whole module so multiple instruments don't multiply the
+         *  Bookmap log line count. */
+        private void maybeLogDegradation(long nowMs, String bucket) {
+            if (!repaintGuard.isDegraded(System.nanoTime())) return;
+            if (nowMs - lastDegradationLogMs < TRIANGLE_LOG_THROTTLE_MS) return;
+            lastDegradationLogMs = nowMs;
+            try {
+                Log.info("OpenRange repaint degraded - skipping " + bucket
+                        + " bucket alias=" + alias
+                        + " lastDurationNanos=" + repaintGuard.lastDurationNanos()
+                        + " budgetNanos=" + repaintGuard.overrunBudgetNanos()
+                        + " degradationEntered=" + repaintGuard.degradationEnteredCount());
+            } catch (Throwable ignored) { /* Log unavailable in tests */ }
         }
 
         /** Persistent OR shapes only — torn down and re-added from current
@@ -1346,28 +1454,96 @@ public class PaxOpeningRangeModule implements
         }
 
         /** Dashboard conviction triangle shapes only. OpenRange buy/sell
-         *  markers are emitted through the native Indicator API. */
+         *  markers are emitted through the native Indicator API. Short-
+         *  circuits when the computed render key matches the prior render
+         *  - repeated dirty-bit fires with no semantic change cost zero
+         *  canvas mutation. Crucially this is true even for the
+         *  "no shapes intended" outcome (dashboard ineligible, signal
+         *  null, showTrendTriangles=false); the previous gate required
+         *  triangleShapes to be non-empty, which let those no-op states
+         *  storm clear+redraw on every poll. */
         synchronized void updateTriangles() {
-            InstrumentState state = instruments.get(alias);
-            if (state == null) return;
-            clearTriangles();
-            if (loadSettings().showTrendTriangles) {
-                addTrendTriangles(state);
-            }
+            updateTriangles(false);
         }
 
-        /** Volatile overlay shapes only — Heatwave Quant Box and signal
-         *  badge. Fired on heatwaveDirty at the 1Hz dashboard cadence. */
-        synchronized void updateOverlay() {
+        /** Force overload used by {@link #update()} so onMoveEnd / explicit
+         *  rebuild paths bypass the render-key memoization. The cached
+         *  PreparedImage for the overlay survives independently via
+         *  clearVolatile()'s deliberate non-clear of lastOverlayImage. */
+        private void updateTriangles(boolean force) {
             InstrumentState state = instruments.get(alias);
             if (state == null) return;
-            clearVolatile();
+            boolean show = loadSettings().showTrendTriangles;
+            PaxTrendSignalModel signal = trendSignals.snapshot();
+            String renderKey = triangleRenderKey(show, signal,
+                    state.lastEmittedKind, state.lastEmittedBucketEnteredMs,
+                    state.liveTriangles.size());
+            if (!force && renderKey.equals(lastTriangleRenderKey)) {
+                return;
+            }
+            clearTriangles();
+            if (show) {
+                addTrendTriangles(state);
+            }
+            lastTriangleRenderKey = renderKey;
+        }
+
+        /** Volatile overlay shapes only - Heatwave Quant Box and signal
+         *  badge. Fired on heatwaveDirty at the 1Hz dashboard cadence.
+         *  Short-circuits when the overlay key (model semantic signature +
+         *  font size + age bucket) is unchanged so we don't rebuild a
+         *  ~320x200 BufferedImage on every fetcher repaint. When the key
+         *  changes but the cached image survives (e.g. onMoveEnd rebuilt
+         *  shapes without the underlying model changing) the cached
+         *  PreparedImage is reused too. The previous gate required
+         *  volatileShapes to be non-empty, which storm-fired no-op
+         *  paths (badge hidden + no heatwave + idle ticks). */
+        synchronized void updateOverlay() {
+            updateOverlay(false);
+        }
+
+        private void updateOverlay(boolean force) {
+            InstrumentState state = instruments.get(alias);
+            if (state == null) return;
             PaxOpeningRangeUiSettings ui = loadSettings();
+            String overlayKey = computeOverlayKey(ui, state);
+            if (!force && overlayKey.equals(lastOverlayKey)) {
+                return;
+            }
+            clearVolatile();
             if (ui.showHeatwaveBox) {
-                addHeatwaveBox(ui);
+                boolean cacheHit = lastOverlayImage != null
+                        && overlayKey.equals(lastOverlayKey);
+                addHeatwaveBox(ui, cacheHit);
             } else {
                 addSignalStatus(state.featureCache.latest());
             }
+            lastOverlayKey = overlayKey;
+        }
+
+        /** Stable key for the overlay bucket. Heatwave path: model semantic
+         *  signature + font size + ~1s age bucket so the age tick advances
+         *  the cache without rebuilding more often than that. Badge path:
+         *  badge text + color state. */
+        private String computeOverlayKey(PaxOpeningRangeUiSettings ui, InstrumentState state) {
+            if (ui.showHeatwaveBox) {
+                long nowMs = System.currentTimeMillis();
+                PaxHeatwaveModel model = heatwave.effectiveModel(nowMs);
+                if (model == null) {
+                    model = PaxHeatwaveModel.noData(nowMs);
+                }
+                long ageBucket = (nowMs - model.fetchedAtMs) / 1000L;
+                return "HW|" + ui.clampedHeatwaveFontSize() + "|"
+                        + ui.clampedHeatwaveBoxX() + "|" + ui.clampedHeatwaveBoxY() + "|"
+                        + ageBucket + "|" + heatwaveModelKey(model);
+            }
+            PaxOpeningRangeFeatureSnapshot snap = state.featureCache.latest();
+            if (snap == null || snap.signal() == null) return "BADGE|EMPTY";
+            return "BADGE|" + snap.colorState() + "|" + snap.badgeText();
+        }
+
+        private String heatwaveModelKey(PaxHeatwaveModel model) {
+            return PaxOpeningRangeModule.heatwaveModelKey(model);
         }
 
         /**
@@ -1540,21 +1716,32 @@ public class PaxOpeningRangeModule implements
                     new CompositeVerticalCoordinate(CompositeCoordinateBase.DATA_ZERO, yPxBottom, anchorPrice));
         }
 
-        private void addHeatwaveBox(PaxOpeningRangeUiSettings ui) {
+        private void addHeatwaveBox(PaxOpeningRangeUiSettings ui, boolean reuseCache) {
             long now = System.currentTimeMillis();
-            // effectiveModel synthesizes a DASHBOARD_OFFLINE carrier when the
-            // fetcher has never had a successful response. Otherwise it
-            // returns the last parsed model (which may itself be a
-            // BRIDGE_OFFLINE carrier if the dashboard said so).
-            PaxHeatwaveModel model = heatwave.effectiveModel(now);
-            if (model == null) {
-                model = PaxHeatwaveModel.noData(now);
+            PreparedImage image;
+            int w, h;
+            if (reuseCache && lastOverlayImage != null) {
+                image = lastOverlayImage;
+                w = lastOverlayWidth;
+                h = lastOverlayHeight;
+            } else {
+                // effectiveModel synthesizes a DASHBOARD_OFFLINE carrier when
+                // the fetcher has never had a successful response. Otherwise
+                // it returns the last parsed model (which may itself be a
+                // BRIDGE_OFFLINE carrier if the dashboard said so).
+                PaxHeatwaveModel model = heatwave.effectiveModel(now);
+                if (model == null) {
+                    model = PaxHeatwaveModel.noData(now);
+                }
+                image = PaxHeatwavePainter.render(model, now, ui.clampedHeatwaveFontSize());
+                w = image.getReadOnlyImage().getWidth();
+                h = image.getReadOnlyImage().getHeight();
+                lastOverlayImage = image;
+                lastOverlayWidth = w;
+                lastOverlayHeight = h;
             }
-            PreparedImage image = PaxHeatwavePainter.render(model, now, ui.clampedHeatwaveFontSize());
             int x = ui.clampedHeatwaveBoxX();
             int y = ui.clampedHeatwaveBoxY();
-            int w = image.getReadOnlyImage().getWidth();
-            int h = image.getReadOnlyImage().getHeight();
             addVolatileShape(image,
                     new CompositeHorizontalCoordinate(CompositeCoordinateBase.PIXEL_ZERO, x, 0),
                     new CompositeVerticalCoordinate(CompositeCoordinateBase.PIXEL_ZERO, y, 0),
@@ -1734,11 +1921,17 @@ public class PaxOpeningRangeModule implements
         private void clearTriangles() {
             for (CanvasIcon shape : triangleShapes) canvas.removeShape(shape);
             triangleShapes.clear();
+            lastTriangleRenderKey = "";
         }
 
         private void clearVolatile() {
             for (CanvasIcon shape : volatileShapes) canvas.removeShape(shape);
             volatileShapes.clear();
+            // Note: lastOverlayKey + lastOverlayImage deliberately NOT
+            // cleared. The cached PreparedImage outlives one clear/add
+            // cycle (e.g. update() forced a full repaint on onMoveEnd
+            // while the underlying model is unchanged) so we never pay
+            // the Graphics2D allocation cost twice for the same model.
         }
 
         @Override
@@ -1748,6 +1941,58 @@ public class PaxOpeningRangeModule implements
             clearPersistent();
             canvas.dispose();
         }
+    }
+
+    /** Stable cache key for the triangle bucket. Includes the upstream
+     *  signal identity (kind + bucketEnteredMs + eligibility + alias)
+     *  plus the last-emitted state - so a fresh successful fetch with
+     *  no semantic change produces the same key, and so the "no shapes
+     *  intended" outcomes (showTrendTriangles=false, signal null) also
+     *  produce stable keys that short-circuit on the next tick. */
+    static String triangleRenderKey(boolean show,
+                                      PaxTrendSignalModel signal,
+                                      String lastEmittedKind,
+                                      long lastEmittedBucketEnteredMs,
+                                      int liveTriangleCount) {
+        if (!show) return "OFF";
+        if (signal == null) return "NULL";
+        StringBuilder sb = new StringBuilder(96);
+        sb.append(signal.kind).append('|')
+          .append(signal.bucketEnteredMs).append('|')
+          .append(signal.eligible).append('|')
+          .append(signal.alias).append('|')
+          .append(lastEmittedKind).append('|')
+          .append(lastEmittedBucketEnteredMs).append('|')
+          .append(liveTriangleCount);
+        return sb.toString();
+    }
+
+    /** Stable cache key for the heatwave model semantic content. Used by
+     *  the overlay-render memoization to detect when the model content
+     *  (state, verdict, scoreText, all rows) is unchanged so the cached
+     *  PreparedImage can be reused. Pure function of the model - no
+     *  reads against instance fields - so it is directly unit-testable. */
+    static String heatwaveModelKey(PaxHeatwaveModel model) {
+        if (model == null) return "NULL";
+        StringBuilder sb = new StringBuilder(160);
+        sb.append(model.state).append('|')
+          .append(model.verdict).append('|')
+          .append(model.verdictTone).append('|')
+          .append(model.scoreText).append('|')
+          .append(model.ok).append('|')
+          .append(model.offlineReason);
+        if (model.rows != null) {
+            for (PaxHeatwaveModel.Row row : model.rows) {
+                if (row == null) {
+                    sb.append("|<null>");
+                } else {
+                    sb.append('|').append(row.label).append(':')
+                      .append(row.scoreText).append(':')
+                      .append(row.tone).append(':').append(row.hint);
+                }
+            }
+        }
+        return sb.toString();
     }
 
     private static PreparedImage solidPixel(Color color) {
@@ -1760,6 +2005,11 @@ public class PaxOpeningRangeModule implements
      * Build a {@link PreparedImage} containing the ▲ / ▼ trend-triangle glyph
      * at the given font size, in the bull/bear color, with weak/strong alpha.
      *
+     * <p>Cached: glyphs are immutable, so repeated calls with the same
+     * {@code (kind, fontSize)} return the same {@link PreparedImage} from
+     * {@link #TREND_GLYPH_CACHE}. The cache short-circuits the Graphics2D
+     * allocation that previously fired up to 8 times per dashboard poll.</p>
+     *
      * <p>Uses {@link Graphics2D#drawString} on a transparent ARGB scratch
      * image — identical primitive class to {@code labelImage} which paints
      * the OR HIGH/LOW labels reliably on Bookmap 7.4. Strong = full alpha,
@@ -1767,6 +2017,11 @@ public class PaxOpeningRangeModule implements
      * 1×1 transparent placeholder.
      */
     static PreparedImage trendGlyphImage(PaxTrendSignalModel.Kind kind, int fontSize) {
+        return TREND_GLYPH_CACHE.get(kind, fontSize);
+    }
+
+    /** Uncached underlying renderer used by the cache. */
+    static PreparedImage buildTrendGlyphImage(PaxTrendSignalModel.Kind kind, int fontSize) {
         if (kind == null || kind == PaxTrendSignalModel.Kind.NONE) {
             BufferedImage placeholder = new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB);
             return new PreparedImage(placeholder);
