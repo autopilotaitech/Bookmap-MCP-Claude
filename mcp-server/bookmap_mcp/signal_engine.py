@@ -142,6 +142,50 @@ from .dashboard import (
     _level_composite,
 )
 
+# Institutional-thesis helpers + cache + code tuples --------------------------
+from .dashboard import (
+    _LEVEL_TOUCH_STATE,
+    _TOUCH_HISTORY_DEPTH,
+    _TOUCH_TICKS,
+    _APPROACH_PROX_PTS,
+    _ACCEPT_HOLD_POLLS,
+    _REJECT_BACKOFF_PTS,
+    _THESIS_STATE_CODES,
+    _THESIS_THESIS_CODES,
+    _THESIS_LIQ_CODES,
+    _THESIS_AGG_CODES,
+    _THESIS_BOOK_CODES,
+    _THESIS_EXEC_CODES,
+    _thesis_classify_touch_state,
+    _thesis_micro_at_price,
+    _thesis_liquidity_quality,
+    _thesis_select_thesis,
+    _thesis_aggressor_flow,
+    _thesis_book_state,
+    _thesis_execution_read,
+    _thesis_confidence,
+    _thesis_invalidations,
+    _thesis_for_level,
+)
+
+# Institutional signal composer ---------------------------------------------
+from .dashboard import (
+    compute_institutional_signals,
+    _signal_type_from_thesis,
+    _signal_aggressor_align_required,
+    _signal_size_tier_from_confidence,
+    _SIGNAL_TYPE_CODES,
+    _SIGNAL_DIRECTION_CODES,
+)
+
+# Institutional chart-events composer ---------------------------------------
+from .dashboard import (
+    compute_institutional_chart_events,
+    _CHART_EVENT_TYPES,
+    _CHART_SEVERITY_RANKS,
+    _CHART_COLORS,
+)
+
 # Conviction sources (17) ----------------------------------------------------
 from .dashboard import (
     _source_flow_ofi,
@@ -173,6 +217,7 @@ from .dashboard import (
     compute_session_conviction,
     pax_decision,
     trade_decision,
+    compute_institutional_thesis,
 )
 
 
@@ -218,6 +263,24 @@ __all__ = [
     "_vp_context", "_vp_at_level", "_book_at_level", "_vwap_or_at_level",
     "_conviction_at_level", "_detect_hvn_lvn", "_score_level",
     "_level_composite",
+    # Institutional thesis
+    "_LEVEL_TOUCH_STATE", "_TOUCH_HISTORY_DEPTH", "_TOUCH_TICKS",
+    "_APPROACH_PROX_PTS", "_ACCEPT_HOLD_POLLS", "_REJECT_BACKOFF_PTS",
+    "_THESIS_STATE_CODES", "_THESIS_THESIS_CODES", "_THESIS_LIQ_CODES",
+    "_THESIS_AGG_CODES", "_THESIS_BOOK_CODES", "_THESIS_EXEC_CODES",
+    "_thesis_classify_touch_state", "_thesis_micro_at_price",
+    "_thesis_liquidity_quality", "_thesis_select_thesis",
+    "_thesis_aggressor_flow", "_thesis_book_state",
+    "_thesis_execution_read", "_thesis_confidence",
+    "_thesis_invalidations", "_thesis_for_level",
+    # Institutional signal composer
+    "compute_institutional_signals",
+    "_signal_type_from_thesis", "_signal_aggressor_align_required",
+    "_signal_size_tier_from_confidence",
+    "_SIGNAL_TYPE_CODES", "_SIGNAL_DIRECTION_CODES",
+    # Institutional chart events
+    "compute_institutional_chart_events",
+    "_CHART_EVENT_TYPES", "_CHART_SEVERITY_RANKS", "_CHART_COLORS",
     # Sources
     "_source_flow_ofi", "_source_flow_cvd", "_source_flow_vpt_absorption",
     "_source_regime", "_source_bias_score", "_source_vwap_dislocation",
@@ -230,4 +293,5 @@ __all__ = [
     "compute_or_levels", "compute_tape_flow", "compute_vwap_bias",
     "compute_vp_bias", "compute_session_conviction", "pax_decision",
     "trade_decision",
+    "compute_institutional_thesis",
 ]

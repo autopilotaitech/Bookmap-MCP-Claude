@@ -7,12 +7,27 @@ import java.util.Map;
 
 /**
  * Parses the dashboard's {@code /api/snapshot} JSON and extracts the
- * {@code trend_signal} block. Self-contained tokenizer (no third-party
- * JSON dependency), same pattern as {@link PaxHeatwaveSnapshotParser}.
+ * authoritative buy/sell entry source: {@code snap["institutional_signals"]}.
  *
- * <p>Missing / null / unknown-kind values resolve to {@link PaxTrendSignalModel.Kind#NONE}
- * — the dashboard side is the single source of truth for trend mapping;
- * the painter must never invent a kind on its own.</p>
+ * <p>The parser walks the institutional-signal array and emits a
+ * {@link PaxTrendSignalModel} only when a {@code PAY_FOR_TRADE} signal with
+ * direction {@code LONG} or {@code SHORT} exists. Mapping:</p>
+ * <ul>
+ *   <li>LONG + (FULL or confidence&gt;=0.70) -&gt; STRONG_BULL; else WEAK_BULL.</li>
+ *   <li>SHORT + (FULL or confidence&gt;=0.70) -&gt; STRONG_BEAR; else WEAK_BEAR.</li>
+ *   <li>{@code signal.price} -&gt; model {@code mid} (chart anchor at the level).</li>
+ *   <li>{@code signal.timestamp_ms} -&gt; model {@code eventMs}.</li>
+ *   <li>{@code signal.id} -&gt; bucketEnteredMs (hash) for dedup.</li>
+ *   <li>{@code eventMsSource} = {@code "institutional_signal"}.</li>
+ * </ul>
+ *
+ * <p>No fallback to {@code trend_signal} or {@code pax.decision} for entry
+ * markers — those are generic trend bias, not level-anchored institutional
+ * signals. If no PAY_FOR_TRADE signal is present the parser returns
+ * {@link PaxTrendSignalModel#none(long)}.</p>
+ *
+ * <p>Self-contained tokenizer (no third-party JSON dependency), same pattern
+ * as {@link PaxHeatwaveSnapshotParser}.</p>
  */
 final class PaxTrendSignalSnapshotParser {
 
@@ -40,81 +55,200 @@ final class PaxTrendSignalSnapshotParser {
         return distill((Map<?, ?>) root, fetchedAtMs);
     }
 
+    /** Parse the full evidence-trail array from
+     *  {@code snap["institutional_chart_events"]}.
+     *
+     *  <p>Returns empty list on missing key / malformed JSON / non-ok
+     *  health. Never throws — chart painter must continue rendering prior
+     *  history even on a bad payload.</p>
+     */
+    static List<PaxInstitutionalChartEvent> parseChartEvents(String json) {
+        if (json == null || json.isEmpty()) {
+            return java.util.Collections.emptyList();
+        }
+        Object root;
+        try {
+            root = new Tokenizer(json).parseValue(true);
+        } catch (RuntimeException e) {
+            return java.util.Collections.emptyList();
+        }
+        if (!(root instanceof Map)) {
+            return java.util.Collections.emptyList();
+        }
+        Map<?, ?> rootMap = (Map<?, ?>) root;
+        Object healthObj = rootMap.get("health");
+        if (healthObj instanceof String && !"ok".equalsIgnoreCase((String) healthObj)) {
+            return java.util.Collections.emptyList();
+        }
+        Object evsObj = rootMap.get("institutional_chart_events");
+        if (!(evsObj instanceof List)) {
+            return java.util.Collections.emptyList();
+        }
+        List<?> evs = (List<?>) evsObj;
+        ArrayList<PaxInstitutionalChartEvent> out = new ArrayList<>(evs.size());
+        for (Object o : evs) {
+            if (!(o instanceof Map)) continue;
+            Map<?, ?> e = (Map<?, ?>) o;
+            String id = asString(e.get("id"));
+            String alias = asString(e.get("alias"));
+            String label = asString(e.get("label"));
+            Double priceObj = asDouble(e.get("price"));
+            String side = asString(e.get("side"));
+            String eventType = asString(e.get("event_type"));
+            String direction = asString(e.get("direction"));
+            String executionRead = asString(e.get("execution_read"));
+            String markerText = asString(e.get("marker_text"));
+            String markerColorHint = asString(e.get("marker_color_hint"));
+            String severity = asString(e.get("severity"));
+            long timestampMs = asLong(e.get("timestamp_ms"), 0L);
+            String source = asString(e.get("source"));
+            Double confObj = asDouble(e.get("confidence"));
+            double price = priceObj == null ? Double.NaN : priceObj.doubleValue();
+            double confidence = confObj == null ? Double.NaN : confObj.doubleValue();
+            out.add(new PaxInstitutionalChartEvent(
+                    id, alias, label, price, side, eventType, direction,
+                    executionRead, markerText, markerColorHint, severity,
+                    timestampMs, source, confidence));
+        }
+        return out;
+    }
+
+    /** Parse ALL institutional signal events from {@code snap["institutional_signals"]}.
+     *
+     * <p>Returns an empty list when {@code institutional_signals} is missing,
+     * empty, malformed, or when the dashboard reports a non-ok health. The
+     * fetcher feeds this list to {@link PaxInstitutionalSignalsHistory#merge}
+     * on every poll; the history layer is what survives empty polls — the
+     * parser itself is stateless.</p>
+     *
+     * <p>This method does NOT throw on missing fields; it simply skips
+     * malformed entries. The painter then drops entries that aren't
+     * renderable ({@link PaxInstitutionalSignalEvent#isRenderable()}).</p>
+     */
+    static List<PaxInstitutionalSignalEvent> parseInstitutionalEvents(String json) {
+        if (json == null || json.isEmpty()) {
+            return java.util.Collections.emptyList();
+        }
+        Object root;
+        try {
+            root = new Tokenizer(json).parseValue(true);
+        } catch (RuntimeException e) {
+            return java.util.Collections.emptyList();
+        }
+        if (!(root instanceof Map)) {
+            return java.util.Collections.emptyList();
+        }
+        Map<?, ?> rootMap = (Map<?, ?>) root;
+        Object healthObj = rootMap.get("health");
+        if (healthObj instanceof String && !"ok".equalsIgnoreCase((String) healthObj)) {
+            return java.util.Collections.emptyList();
+        }
+        Object sigsObj = rootMap.get("institutional_signals");
+        if (!(sigsObj instanceof List)) {
+            return java.util.Collections.emptyList();
+        }
+        List<?> sigs = (List<?>) sigsObj;
+        ArrayList<PaxInstitutionalSignalEvent> out = new ArrayList<>(sigs.size());
+        for (Object o : sigs) {
+            if (!(o instanceof Map)) continue;
+            Map<?, ?> s = (Map<?, ?>) o;
+            String id = asString(s.get("id"));
+            String signalType = asString(s.get("signal_type"));
+            String direction = asString(s.get("direction"));
+            String executionRead = asString(s.get("execution_read"));
+            String label = asString(s.get("label"));
+            Double priceObj = asDouble(s.get("price"));
+            Double confObj = asDouble(s.get("confidence"));
+            long timestampMs = asLong(s.get("timestamp_ms"), 0L);
+            double price = priceObj == null ? Double.NaN : priceObj.doubleValue();
+            double confidence = confObj == null ? Double.NaN : confObj.doubleValue();
+            out.add(new PaxInstitutionalSignalEvent(
+                    id, signalType, direction, executionRead,
+                    price, timestampMs, label, confidence));
+        }
+        return out;
+    }
+
     private static PaxTrendSignalModel distill(Map<?, ?> root, long fetchedAtMs) {
         // Hard gate: only emit a renderable kind when the dashboard says
-        // health=ok. If the dashboard returned an offline payload, the
-        // trend_signal block is absent OR stale — refuse to render.
+        // health=ok. If the dashboard returned an offline payload, refuse
+        // to render.
         Object healthObj = root.get("health");
         if (healthObj instanceof String && !"ok".equalsIgnoreCase((String) healthObj)) {
             return PaxTrendSignalModel.none(fetchedAtMs);
         }
-        PaxTrendSignalModel paxMarker = paxDecisionMarker(root, fetchedAtMs);
-        if (paxMarker != null) {
-            return paxMarker;
+        // Authoritative source: snap["institutional_signals"]. No fallback
+        // to trend_signal or pax.decision for entry markers — those are
+        // generic trend bias, not level-anchored institutional signals.
+        PaxTrendSignalModel ins = institutionalSignalMarker(root, fetchedAtMs);
+        if (ins != null) {
+            return ins;
         }
-        Map<?, ?> ts = asMap(root.get("trend_signal"));
-        if (ts == null) {
-            // Missing entirely (older dashboard, error path) → NONE.
-            return PaxTrendSignalModel.none(fetchedAtMs);
-        }
-        String kindStr = asString(ts.get("kind"));
-        PaxTrendSignalModel.Kind kind = PaxTrendSignalModel.Kind.from(kindStr);
-        String alias = asString(ts.get("alias"));
-        Double midObj = asDouble(ts.get("mid"));
-        double mid = (midObj == null) ? Double.NaN : midObj.doubleValue();
-        long eventMs = asLong(ts.get("eventMs"), 0L);
-        long asOfMs = asLong(ts.get("asOfMs"), 0L);
-        long bucketEnteredMs = asLong(ts.get("bucketEnteredMs"), 0L);
-        boolean changed = Boolean.TRUE.equals(ts.get("changedSinceLastTick"));
+        return PaxTrendSignalModel.none(fetchedAtMs);
+    }
 
-        // New plot-eligibility fields. Missing `eligible` defaults to FALSE
-        // for safety — an old or partial dashboard payload that omits the
-        // field cannot accidentally trigger a triangle emit. The painter
-        // gates on this in PaxTrendTriangleDedup.shouldEmit.
-        boolean eligible = Boolean.TRUE.equals(ts.get("eligible"));
-        String blockedReason = asString(ts.get("blockedReason"));
-        String eventMsSource = asString(ts.get("eventMsSource"));
-        return new PaxTrendSignalModel(kind, alias, mid, eventMs, asOfMs,
-                bucketEnteredMs, changed, fetchedAtMs,
-                eligible, blockedReason, eventMsSource);
+    /** Walk snap["institutional_signals"] and pick the most recent
+     *  PAY_FOR_TRADE LONG/SHORT entry. Returns null when no such signal
+     *  exists, the array is absent / malformed, or the chosen signal has
+     *  no usable price / timestamp. */
+    private static PaxTrendSignalModel institutionalSignalMarker(Map<?, ?> root, long fetchedAtMs) {
+        Object sigsObj = root.get("institutional_signals");
+        if (!(sigsObj instanceof List)) {
+            return null;
+        }
+        List<?> sigs = (List<?>) sigsObj;
+        Map<?, ?> best = null;
+        long bestTs = Long.MIN_VALUE;
+        for (Object o : sigs) {
+            if (!(o instanceof Map)) continue;
+            Map<?, ?> s = (Map<?, ?>) o;
+            if (!"PAY_FOR_TRADE".equals(asString(s.get("execution_read")))) continue;
+            String dir = asString(s.get("direction"));
+            if (!"LONG".equals(dir) && !"SHORT".equals(dir)) continue;
+            long ts = asLong(s.get("timestamp_ms"), 0L);
+            if (ts >= bestTs) {
+                bestTs = ts;
+                best = s;
+            }
+        }
+        if (best == null) {
+            return null;
+        }
+        String dir = asString(best.get("direction"));
+        String sizeTier = asString(best.get("size_tier"));
+        Double conf = asDouble(best.get("confidence"));
+        boolean strong = "FULL".equals(sizeTier)
+                || (conf != null && conf.doubleValue() >= 0.70);
+        PaxTrendSignalModel.Kind kind;
+        if ("LONG".equals(dir)) {
+            kind = strong ? PaxTrendSignalModel.Kind.STRONG_BULL
+                          : PaxTrendSignalModel.Kind.WEAK_BULL;
+        } else {
+            kind = strong ? PaxTrendSignalModel.Kind.STRONG_BEAR
+                          : PaxTrendSignalModel.Kind.WEAK_BEAR;
+        }
+        Double price = asDouble(best.get("price"));
+        if (price == null || price.doubleValue() <= 0.0) {
+            return null;
+        }
+        String alias = asString(root.get("alias"));
+        if (alias == null) {
+            alias = asString(best.get("alias"));
+        }
+        String id = asString(best.get("id"));
+        long bucketEnteredMs = (id == null || id.isEmpty())
+                ? bestTs
+                : Integer.toUnsignedLong(id.hashCode());
+        long eventMs = bestTs > 0 ? bestTs : fetchedAtMs;
+        return new PaxTrendSignalModel(kind, alias == null ? "" : alias,
+                price.doubleValue(), eventMs, fetchedAtMs, bucketEnteredMs,
+                true, fetchedAtMs,
+                /*eligible=*/true,
+                /*blockedReason=*/dir,
+                /*eventMsSource=*/"institutional_signal");
     }
 
     // ─── Shape helpers ─────────────────────────────────────────────────────
-
-    private static PaxTrendSignalModel paxDecisionMarker(Map<?, ?> root, long fetchedAtMs) {
-        Map<?, ?> pax = asMap(root.get("pax"));
-        if (pax == null) {
-            return null;
-        }
-        String decision = asString(pax.get("decision"));
-        if (decision == null || !decision.startsWith("ENTER_")) {
-            return null;
-        }
-        String sizeTier = asString(pax.get("size_tier"));
-        if (!"FULL".equals(sizeTier) && !"HALF".equals(sizeTier)) {
-            return null;
-        }
-        Double entry = asDouble(pax.get("entry"));
-        if (entry == null || entry.doubleValue() <= 0.0) {
-            return null;
-        }
-        boolean isLong = decision.contains("LONG");
-        boolean isShort = decision.contains("SHORT");
-        if (!isLong && !isShort) {
-            return null;
-        }
-        boolean strong = "FULL".equals(sizeTier);
-        PaxTrendSignalModel.Kind kind = isLong
-                ? (strong ? PaxTrendSignalModel.Kind.STRONG_BULL : PaxTrendSignalModel.Kind.WEAK_BULL)
-                : (strong ? PaxTrendSignalModel.Kind.STRONG_BEAR : PaxTrendSignalModel.Kind.WEAK_BEAR);
-        String alias = asString(root.get("alias"));
-        String level = asString(pax.get("level_label"));
-        String key = decision + "|" + (level == null ? "" : level) + "|" + sizeTier;
-        long bucket = Integer.toUnsignedLong(key.hashCode());
-        return new PaxTrendSignalModel(kind, alias, entry.doubleValue(),
-                fetchedAtMs, fetchedAtMs, bucket, true, fetchedAtMs,
-                true, decision, "pax_decision");
-    }
 
     private static Map<?, ?> asMap(Object o) {
         return (o instanceof Map) ? (Map<?, ?>) o : null;

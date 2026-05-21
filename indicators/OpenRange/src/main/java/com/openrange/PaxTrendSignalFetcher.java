@@ -5,8 +5,11 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import velox.api.layer1.common.Log;
 
@@ -37,6 +40,10 @@ final class PaxTrendSignalFetcher {
     private volatile String url = DEFAULT_URL;
     private volatile int pollMs = 1000;
     private volatile PaxTrendSignalModel latest;
+    private final AtomicReference<List<PaxInstitutionalSignalEvent>> latestEvents =
+            new AtomicReference<>(Collections.emptyList());
+    private final AtomicReference<List<PaxInstitutionalChartEvent>> latestChartEvents =
+            new AtomicReference<>(Collections.emptyList());
     private final AtomicInteger consecutiveFailures = new AtomicInteger(0);
     private final AtomicLong lastWarnLogMs = new AtomicLong(0L);
     /** Last failure reason (short, never contains the token) and timestamp.
@@ -76,6 +83,23 @@ final class PaxTrendSignalFetcher {
     void stop() { stopWorkerInternal(); }
 
     PaxTrendSignalModel snapshot() { return latest; }
+
+    /** Latest institutional signal events parsed from the most recent
+     *  successful poll. NEVER null; empty when no successful fetch has
+     *  occurred yet OR the latest payload had no institutional_signals.
+     *  The painter merges this into its durable history; the fetcher
+     *  intentionally never clears prior history on empty polls. */
+    List<PaxInstitutionalSignalEvent> latestInstitutionalEvents() {
+        return latestEvents.get();
+    }
+
+    /** Latest institutional chart events (the evidence-trail payload).
+     *  Never null; empty until a successful fetch or when the latest
+     *  payload had no institutional_chart_events. The painter merges this
+     *  into its durable history; empty polls do not clear prior markers. */
+    List<PaxInstitutionalChartEvent> latestInstitutionalChartEvents() {
+        return latestChartEvents.get();
+    }
 
     String lastFailureReason() { return lastFailureReason; }
     long lastFailureAtMs() { return lastFailureAtMs; }
@@ -155,7 +179,13 @@ final class PaxTrendSignalFetcher {
                 return false;
             }
             PaxTrendSignalModel parsed = PaxTrendSignalSnapshotParser.parse(resp.body(), nowMs);
+            List<PaxInstitutionalSignalEvent> events =
+                    PaxTrendSignalSnapshotParser.parseInstitutionalEvents(resp.body());
+            List<PaxInstitutionalChartEvent> chartEvents =
+                    PaxTrendSignalSnapshotParser.parseChartEvents(resp.body());
             latest = parsed;
+            latestEvents.set(events);
+            latestChartEvents.set(chartEvents);
             consecutiveFailures.set(0);
             fireRepaintIfNeeded(parsed, nowMs);
             return true;

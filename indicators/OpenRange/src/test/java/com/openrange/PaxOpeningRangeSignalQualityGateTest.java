@@ -11,6 +11,30 @@ public class PaxOpeningRangeSignalQualityGateTest {
         blocksLongOnInsufficientCvdSamples();
         blocksShortOnInsufficientCvdSamples();
         allowsWhenThresholdDisabledEvenWithoutSamples();
+        blocksWideRangeQuality();
+        blocksWideRangeQualityCaseInsensitive();
+    }
+
+    private static void blocksWideRangeQuality() {
+        PaxOpeningRangeSignalQualityGate gate = new PaxOpeningRangeSignalQualityGate(settings(70, 70, true));
+
+        PaxOpeningRangeSignal gated = gate.apply(signalWithQuality(82, 91, "WIDE"),
+                PaxOpeningRangeCrossMarketStatus.CONFIRM);
+
+        assertEquals(PaxOpeningRangeSignalAction.BLOCK_SIGNAL, gated.action(),
+                "WIDE range quality must block an otherwise-strong allowed signal");
+        assertContains(gated.reason(), "Wide opening range", "reason");
+    }
+
+    private static void blocksWideRangeQualityCaseInsensitive() {
+        PaxOpeningRangeSignalQualityGate gate = new PaxOpeningRangeSignalQualityGate(settings(70, 70, true));
+
+        PaxOpeningRangeSignal gated = gate.apply(signalWithQuality(82, 91, " wide "),
+                PaxOpeningRangeCrossMarketStatus.CONFIRM);
+
+        assertEquals(PaxOpeningRangeSignalAction.BLOCK_SIGNAL, gated.action(),
+                "WIDE match must be case-insensitive and tolerate surrounding whitespace");
+        assertContains(gated.reason(), "Wide opening range", "reason");
     }
 
     private static void blocksLongOnInsufficientCvdSamples() {
@@ -101,6 +125,10 @@ public class PaxOpeningRangeSignalQualityGateTest {
     }
 
     private static PaxOpeningRangeSignal signal(int cvdPercentile, int psPercentile) {
+        return signalWithQuality(cvdPercentile, psPercentile, "OK");
+    }
+
+    private static PaxOpeningRangeSignal signalWithQuality(int cvdPercentile, int psPercentile, String rangeQuality) {
         return new PaxOpeningRangeSignal(
                 PaxOpeningRangeSignalAction.ALLOW_SIGNAL,
                 PaxOpeningRangeSignalBias.LONG,
@@ -119,7 +147,7 @@ public class PaxOpeningRangeSignalQualityGateTest {
                 2.1,
                 cvdPercentile,
                 psPercentile,
-                "OK");
+                rangeQuality);
     }
 
     private static PaxOpeningRangeSignal shortSignal(int cvdPercentile, int psPercentile) {

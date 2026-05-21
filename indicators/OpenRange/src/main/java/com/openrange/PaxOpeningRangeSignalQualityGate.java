@@ -14,6 +14,9 @@ public class PaxOpeningRangeSignalQualityGate {
         if (settings.blockCrossMarketDivergence() && crossMarketStatus == PaxOpeningRangeCrossMarketStatus.DIVERGE) {
             return blocked(signal, "Cross-market divergence blocks signal.");
         }
+        if (signal.rangeQuality() != null && "WIDE".equalsIgnoreCase(signal.rangeQuality().trim())) {
+            return blocked(signal, "Wide opening range blocks signal.");
+        }
         if (!passesDirectionalPercentile(signal.bias(), signal.cvdPercentile(), settings.minCvdPercentile())) {
             return blocked(signal, "CVD percentile " + signal.cvdPercentile()
                     + " outside gate " + settings.minCvdPercentile() + ".");

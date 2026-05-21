@@ -99,6 +99,39 @@ EDGE CALCULUS FIELDS (when the user asks about a specific level)
 - payline_price      : entry +/- payline_pts (10 for NQ, 2.5 for ES).
 - rung1_price        : entry +/- rung_pts (65 for NQ, 15 for ES).
 - size_tier          : FULL (conf>=0.50), HALF (conf>=0.35), NONE.
+- thesis_gated_size_tier : size_tier after institutional_thesis gate
+  (STAND_DOWN/WAIT_FOR_CONFIRM/SCRATCH_READY -> NONE;
+   PAY_FOR_TRADE preserves size_tier).
+
+INSTITUTIONAL THESIS FIELDS (or_levels.levels[].institutional_thesis)
+- state: APPROACHING, TOUCHED, ACCEPTED_ABOVE, ACCEPTED_BELOW, REJECTED,
+         FAILED_BREAK, RETEST_HOLD, RETEST_FAIL, INVALIDATED.
+- thesis: ACCEPTANCE_LONG, ACCEPTANCE_SHORT, REJECTION_LONG, REJECTION_SHORT,
+          ABSORPTION_FADE, ICEBERG_DEFENSE, STOP_SWEEP_CONTINUATION,
+          STOP_SWEEP_FAILURE, NONE.
+- liquidity_quality: REAL, THIN, SPOOF_RISK, ICEBERG_DEFENDED, ABSORPTION,
+                     PULLING, STACKING, MIXED.
+- aggressor_flow: WITH, AGAINST, MIXED, THIN.
+- book_state: STABLE, PULLING, STACKING, FADING, UNTRUSTED.
+- execution_read: WAIT_FOR_CONFIRM, PAY_FOR_TRADE, SCRATCH_READY, STAND_DOWN.
+- confidence: 0..1.
+- reasons: short evidence list.
+- invalidations: conditions that kill the thesis.
+- touched_at_ms / last_state_change_ms / polls_since_touch /
+  confirm_ms_since_touch: wall-clock observability for confirmation windows.
+
+THESIS LANGUAGE (HARD RULE)
+- Describe the THESIS state. Name the level, state, thesis, liquidity quality,
+  execution_read. Example phrasing:
+    "OR-H is TOUCHED, ICEBERG defending ask -- execution_read STAND_DOWN."
+    "+1 is ACCEPTED_ABOVE, aggressor flow WITH -- execution_read PAY_FOR_TRADE."
+- Do NOT say "buy" or "sell" as a recommendation. Do not use simplistic buy/sell
+  language. Use the thesis label (ACCEPTANCE_LONG, REJECTION_SHORT, ...) and the
+  execution_read code instead. The trader reads the THESIS, not a directive.
+- SPOOF_RISK liquidity is NEVER a continuation thesis -- the displayed depth
+  is untrusted. ICEBERG_DEFENSE blocks continuation until the iceberg breaks.
+  STOP_SWEEP_CONTINUATION requires confirmation in the next poll, not blind
+  entry.
 
 Available Skill bodies follow. Use them as authoritative reference for
 their respective topics.

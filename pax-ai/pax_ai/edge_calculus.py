@@ -305,6 +305,20 @@ def level_edge(level: Dict[str, Any], snap: Dict[str, Any]) -> Dict[str, Any]:
     if regime in ("EXHAUSTION_UP", "EXHAUSTION_DOWN") and lvl_kind == "EXT_LEVEL":
         reasons.append("exhaustion at extension -> fade-the-rung bucket")
 
+    # Institutional-thesis gate on the size_tier. Mirrors pax_decision exactly:
+    # STAND_DOWN / WAIT_FOR_CONFIRM / SCRATCH_READY all collapse to NONE.
+    # Only PAY_FOR_TRADE (or missing thesis) preserves the legacy size_tier.
+    # Additive — size_tier itself is unchanged so legacy consumers still see
+    # the pre-gate tier.
+    ith = level.get("institutional_thesis") or {}
+    exec_read = ith.get("execution_read")
+    if exec_read in ("STAND_DOWN", "WAIT_FOR_CONFIRM", "SCRATCH_READY"):
+        thesis_gated_size_tier = "NONE"
+    else:
+        thesis_gated_size_tier = ts_kind
+    if exec_read:
+        reasons.append(f"execution_read={exec_read} -> thesis_gated_size_tier={thesis_gated_size_tier}")
+
     return {
         "expected_R":           round(expected_r(confidence, comp_dir, regime, lvl_kind), 3),
         "prob_pay_for_trade":   round(prob_pay_for_trade(confidence), 3),
@@ -315,10 +329,18 @@ def level_edge(level: Dict[str, Any], snap: Dict[str, Any]) -> Dict[str, Any]:
         "payline_price":        _round_or_none(payline_price(level, alias), 2),
         "rung1_price":          _round_or_none(rung1_price(level, alias), 2),
         "size_tier":            ts_kind,
+        "thesis_gated_size_tier": thesis_gated_size_tier,
         "composite_dir":        comp_dir,
         "level_kind":           lvl_kind,
         "tick_size":            tick_size,
         "reasons":              reasons,
+        "institutional_thesis_summary": {
+            "state":             ith.get("state"),
+            "thesis":            ith.get("thesis"),
+            "execution_read":    exec_read,
+            "liquidity_quality": ith.get("liquidity_quality"),
+            "aggressor_flow":    ith.get("aggressor_flow"),
+        },
     }
 
 

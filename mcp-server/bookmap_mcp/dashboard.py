@@ -944,6 +944,1194 @@ def _score_level(side: str, price: float, mid: float,
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Institutional thesis — per-level state machine + thesis selector.
+#
+# Each OR / extension level gets a thesis payload describing post-touch
+# acceptance, rejection, iceberg defense, spoof risk, stop-sweep continuation,
+# etc. The payload is ADDITIVE — legacy decision/score/composite fields stay.
+#
+# Cache: _LEVEL_TOUCH_STATE keyed by (alias, side, label). Rolling history of
+# the last _TOUCH_HISTORY_DEPTH poll observations so we can detect acceptance
+# (consecutive polls past the level after touch) and rejection (reversal back
+# into range after touch). Confirmation windows are poll-count today; wall
+# clock observability is exposed via touched_at_ms / last_state_change_ms /
+# polls_since_touch / confirm_ms_since_touch so consumers can build 1s/5s/15s
+# gates without changing the payload shape.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_LEVEL_TOUCH_STATE: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+_LEVEL_TOUCH_LOCK = threading.RLock()
+_TOUCH_HISTORY_DEPTH = 16
+_TOUCH_TICKS = 1.0                          # |dist| ≤ 1 tick = TOUCHED
+_APPROACH_PROX_PTS = PROX_TICKS * NQ_TICK   # 12.5 pts; matches level proximity
+_RETEST_PROX_PTS = NQ_TICK * 12             # 3.0 pts; tighter than approach
+_ACCEPT_HOLD_POLLS = 2                      # consecutive polls past level → ACCEPTED
+_REJECT_BACKOFF_PTS = NQ_RUNG_PTS * 0.5     # reversal must clear this to be REJECTED
+
+_THESIS_STATE_CODES = (
+    "APPROACHING", "TOUCHED",
+    "ACCEPTED_ABOVE", "ACCEPTED_BELOW",
+    "REJECTED", "FAILED_BREAK",
+    "RETEST_HOLD", "RETEST_FAIL",
+    "INVALIDATED",
+)
+_THESIS_THESIS_CODES = (
+    "ACCEPTANCE_LONG", "ACCEPTANCE_SHORT",
+    "REJECTION_LONG", "REJECTION_SHORT",
+    "ABSORPTION_FADE",
+    "ICEBERG_DEFENSE",
+    "STOP_SWEEP_CONTINUATION", "STOP_SWEEP_FAILURE",
+    "NONE",
+)
+_THESIS_LIQ_CODES = (
+    "REAL", "THIN", "SPOOF_RISK", "ICEBERG_DEFENDED",
+    "ABSORPTION", "PULLING", "STACKING", "MIXED",
+)
+_THESIS_AGG_CODES = ("WITH", "AGAINST", "MIXED", "THIN")
+_THESIS_BOOK_CODES = ("STABLE", "PULLING", "STACKING", "FADING", "UNTRUSTED")
+_THESIS_EXEC_CODES = ("WAIT_FOR_CONFIRM", "PAY_FOR_TRADE", "SCRATCH_READY", "STAND_DOWN")
+
+
+def _thesis_classify_touch_state(side: str,
+                                 curr_dist_pts: float,
+                                 prior_history: List[Dict[str, Any]],
+                                 prior_state: str = "") -> Tuple[str, List[str]]:
+    """Classify the per-level touch state from current distance + recent history.
+
+    `prior_history` is oldest-first list of {"ts_ms", "dist_pts"} from the
+    last ≤_TOUCH_HISTORY_DEPTH polls (NOT including the current observation).
+    `prior_state` is the state recorded on the previous poll, used for retest
+    classification of an already-accepted level.
+
+    Sign convention: dist_pts = mid - level_price. For side='above' the
+    breakout direction is positive distance; for side='below' negative.
+    """
+    reasons: List[str] = []
+    breakout_sign = 1.0 if side == "above" else -1.0
+    abs_dist = abs(curr_dist_pts)
+    is_touched = abs_dist <= _TOUCH_TICKS * NQ_TICK
+    in_approach = abs_dist <= _APPROACH_PROX_PTS
+    past_now = (curr_dist_pts * breakout_sign) > _TOUCH_TICKS * NQ_TICK
+    inside_now = (curr_dist_pts * breakout_sign) < -_REJECT_BACKOFF_PTS
+
+    # History scan: was the level touched in the recent window, and how many
+    # consecutive polls past the level followed?
+    touched_idx = None
+    polls_past_after_touch = 0
+    for i, h in enumerate(prior_history):
+        try:
+            d = float(h.get("dist_pts") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if abs(d) <= _TOUCH_TICKS * NQ_TICK:
+            touched_idx = i
+            polls_past_after_touch = 0
+            continue
+        if touched_idx is not None and (d * breakout_sign) > _TOUCH_TICKS * NQ_TICK:
+            polls_past_after_touch += 1
+        elif touched_idx is not None and (d * breakout_sign) < -_REJECT_BACKOFF_PTS:
+            # reversal past the rejection backoff already in history
+            # → REJECTED was the right call earlier; don't keep counting past
+            polls_past_after_touch = 0
+
+    # Retest of an already-accepted level — price must come back close to the
+    # level (NOT just within wide proximity) for it to count as a retest.
+    if prior_state in ("ACCEPTED_ABOVE", "ACCEPTED_BELOW"):
+        if inside_now:
+            reasons.append("retest failed back into range")
+            return "RETEST_FAIL", reasons
+        if abs_dist <= _RETEST_PROX_PTS:
+            reasons.append("retest holding near accepted level")
+            return "RETEST_HOLD", reasons
+        return prior_state, ["holding prior acceptance"]
+
+    # Post-rejection / post-failed-break invalidation
+    if prior_state in ("REJECTED", "FAILED_BREAK"):
+        consec = polls_past_after_touch + (1 if past_now else 0)
+        if past_now and consec >= _ACCEPT_HOLD_POLLS:
+            reasons.append("post-rejection break invalidates prior thesis")
+            return "INVALIDATED", reasons
+
+    # Touch in the current poll
+    if is_touched:
+        reasons.append(f"|dist|={abs_dist:.2f}p ≤ touch threshold")
+        return "TOUCHED", reasons
+
+    # Past-acceptance logic
+    if touched_idx is not None and past_now:
+        consec = polls_past_after_touch + 1
+        if consec >= _ACCEPT_HOLD_POLLS:
+            reasons.append(f"{consec} consecutive polls past level after touch")
+            return ("ACCEPTED_ABOVE" if side == "above" else "ACCEPTED_BELOW"), reasons
+        reasons.append("crossed but acceptance not yet confirmed")
+        return "APPROACHING", reasons
+
+    # Reversal-from-touch
+    if touched_idx is not None and inside_now:
+        reasons.append("touched then reversed back into range")
+        return "REJECTED", reasons
+
+    # Failed break: pushed past then reversed before acceptance
+    if touched_idx is not None and polls_past_after_touch >= 1 and (
+            curr_dist_pts * breakout_sign) < 0:
+        reasons.append("pushed past then reversed before acceptance")
+        return "FAILED_BREAK", reasons
+
+    if in_approach:
+        reasons.append("within proximity, no touch yet")
+        return "APPROACHING", reasons
+
+    return "", reasons
+
+
+def _ps_rotation_value(ps_obj: Optional[Dict[str, Any]]) -> str:
+    """Read pull_stack rotation as a canonical string regardless of payload shape.
+
+    Live bridge emits a bare string ("ROTATION_UP" | "ROTATION_DN" | "NONE").
+    Some historical / synthetic test payloads nest it as {"direction": ...}
+    or use the older "rot_dir" key. Anything else → "NONE".
+    """
+    if not ps_obj or not isinstance(ps_obj, dict):
+        return "NONE"
+    raw = ps_obj.get("rotation")
+    if isinstance(raw, str):
+        return raw or "NONE"
+    if isinstance(raw, dict):
+        d = raw.get("direction")
+        if isinstance(d, str) and d:
+            return d
+    legacy = ps_obj.get("rot_dir")
+    if isinstance(legacy, str) and legacy:
+        return legacy
+    return "NONE"
+
+
+def _thesis_micro_at_price(me_obj: Optional[Dict[str, Any]], price: float,
+                           window_ticks: float = 4.0) -> List[Dict[str, Any]]:
+    """Return microstructure events from `me_obj` within window_ticks of price."""
+    if not me_obj or not isinstance(me_obj, dict):
+        return []
+    if "_error" in me_obj:
+        return []
+    band = window_ticks * NQ_TICK
+    out: List[Dict[str, Any]] = []
+    for ev in (me_obj.get("events") or [])[-30:]:
+        ep = ev.get("price")
+        try:
+            ep_f = float(ep) if ep is not None else None
+        except (TypeError, ValueError):
+            continue
+        if ep_f is None or abs(ep_f - price) > band:
+            continue
+        out.append(ev)
+    return out
+
+
+def _thesis_liquidity_quality(side: str, price: float,
+                              me_obj: Optional[Dict[str, Any]],
+                              ps_obj: Optional[Dict[str, Any]],
+                              lt_obj: Optional[Dict[str, Any]],
+                              tape_obj: Optional[Dict[str, Any]]
+                              ) -> Tuple[str, List[str]]:
+    """Classify displayed-depth trustworthiness at this level.
+
+    Evidence priority (most authoritative first):
+      SPOOF_RISK       — recent SPOOF event near price (any side)
+      ICEBERG_DEFENDED — ICEBERG event on the defending side at price
+      ABSORPTION       — large aggressor flow into level against breakout dir
+      PULLING/STACKING — pull_stack rotation away/toward
+      THIN             — no significant depth in long-term liquidity
+      REAL             — depth visible, no anomaly
+    """
+    reasons: List[str] = []
+    events = _thesis_micro_at_price(me_obj, price)
+    is_above = (side == "above")
+    defender_side_str = "ASK" if is_above else "BID"
+
+    has_spoof = False
+    has_defender_iceberg = False
+    for ev in events:
+        kind = (ev.get("kind") or "").upper()
+        is_bid = ev.get("isBid")
+        ev_side = "BID" if is_bid is True else "ASK" if is_bid is False else None
+        if kind == "SPOOF":
+            has_spoof = True
+            reasons.append(f"SPOOF@{ev.get('price')}/{ev_side}")
+        elif kind == "ICEBERG" and ev_side == defender_side_str:
+            has_defender_iceberg = True
+            reasons.append(f"ICEBERG@{ev.get('price')}/{ev_side}")
+
+    if has_spoof:
+        return "SPOOF_RISK", reasons
+    if has_defender_iceberg:
+        return "ICEBERG_DEFENDED", reasons
+
+    # tape_obj-based absorption hint: large counter-direction aggressor at level
+    if tape_obj and isinstance(tape_obj, dict):
+        delta = tape_obj.get("deltaScore")
+        if isinstance(delta, (int, float)) and abs(float(delta)) >= 0.8:
+            # absorption = aggressor flow AGAINST the breakout direction
+            absorbed = (delta > 0 and not is_above) or (delta < 0 and is_above)
+            if absorbed:
+                reasons.append(f"absorption tape={delta:+.2f} at {side}")
+                return "ABSORPTION", reasons
+
+    # ps_obj rotation hint. Accepts live string shape, nested dict, or rot_dir.
+    rot = _ps_rotation_value(ps_obj)
+    if rot != "NONE":
+        if rot == ("ROTATION_UP" if is_above else "ROTATION_DN"):
+            return "STACKING", reasons + [f"book stacking {side}"]
+        if rot == ("ROTATION_DN" if is_above else "ROTATION_UP"):
+            return "PULLING", reasons + [f"book pulling {side}"]
+
+    if lt_obj and isinstance(lt_obj, dict):
+        bids = lt_obj.get("bids") or []
+        asks = lt_obj.get("asks") or []
+        if isinstance(bids, list) and isinstance(asks, list):
+            if not bids and not asks:
+                return "THIN", reasons + ["empty long-term depth"]
+    return "REAL", reasons
+
+
+def _thesis_select_thesis(state: str, side: str, liquidity: str,
+                          aggressor: str,
+                          me_obj: Optional[Dict[str, Any]],
+                          price: float) -> Tuple[str, List[str]]:
+    """Select the thesis label from state + liquidity + microstructure."""
+    reasons: List[str] = []
+    if liquidity == "SPOOF_RISK":
+        return "NONE", ["spoof_risk -> no continuation thesis"]
+    if liquidity == "ICEBERG_DEFENDED":
+        return "ICEBERG_DEFENSE", ["iceberg defending level"]
+
+    events = _thesis_micro_at_price(me_obj, price)
+    has_sweep = any((ev.get("kind") or "").upper() == "STOP_SWEEP" for ev in events)
+
+    if state == "ACCEPTED_ABOVE":
+        return "ACCEPTANCE_LONG", ["accepted above level"]
+    if state == "ACCEPTED_BELOW":
+        return "ACCEPTANCE_SHORT", ["accepted below level"]
+    if state == "REJECTED":
+        if side == "above":
+            return "REJECTION_SHORT", ["rejected at upper level"]
+        return "REJECTION_LONG", ["rejected at lower level"]
+    if state == "TOUCHED" and has_sweep:
+        return "STOP_SWEEP_CONTINUATION", ["sweep at level; awaiting confirm"]
+    if state == "FAILED_BREAK":
+        if has_sweep:
+            return "STOP_SWEEP_FAILURE", ["sweep reversed before acceptance"]
+        return "NONE", ["failed break, no clear thesis"]
+    if liquidity == "ABSORPTION":
+        return "ABSORPTION_FADE", ["absorption against breakout direction"]
+    return "NONE", reasons
+
+
+def _thesis_aggressor_flow(side: str,
+                           tape_obj: Optional[Dict[str, Any]]
+                           ) -> Tuple[str, List[str]]:
+    if not tape_obj or not isinstance(tape_obj, dict):
+        return "THIN", ["no tape_flow"]
+    delta = tape_obj.get("deltaScore")
+    if not isinstance(delta, (int, float)):
+        return "THIN", ["tape_flow has no deltaScore"]
+    delta_f = float(delta)
+    if abs(delta_f) < 0.10:
+        return "MIXED", [f"deltaScore {delta_f:+.2f} near zero"]
+    breakout_positive = (side == "above")
+    aligned = (breakout_positive and delta_f > 0) or (not breakout_positive and delta_f < 0)
+    return ("WITH" if aligned else "AGAINST"), [f"deltaScore {delta_f:+.2f}"]
+
+
+def _thesis_book_state(side: str, price: float,
+                       ps_obj: Optional[Dict[str, Any]],
+                       me_obj: Optional[Dict[str, Any]]
+                       ) -> Tuple[str, List[str]]:
+    events = _thesis_micro_at_price(me_obj, price)
+    if any((ev.get("kind") or "").upper() == "SPOOF" for ev in events):
+        return "UNTRUSTED", ["recent SPOOF near level"]
+    rot = _ps_rotation_value(ps_obj)
+    is_above = (side == "above")
+    if rot != "NONE":
+        if rot == ("ROTATION_UP" if is_above else "ROTATION_DN"):
+            return "STACKING", [f"rotation toward {side}"]
+        if rot == ("ROTATION_DN" if is_above else "ROTATION_UP"):
+            return "PULLING", [f"rotation away from {side}"]
+    if ps_obj and isinstance(ps_obj, dict):
+        bbo_z = ps_obj.get("bboZScore") or ps_obj.get("bbo_z") or 0.0
+        try:
+            if float(bbo_z) <= -2.0:
+                return "FADING", [f"bbo_z {float(bbo_z):.2f}"]
+        except (TypeError, ValueError):
+            pass
+    return "STABLE", []
+
+
+def _thesis_execution_read(state: str, thesis: str, liquidity: str,
+                           aggressor: str) -> Tuple[str, List[str]]:
+    if liquidity == "SPOOF_RISK":
+        return "STAND_DOWN", ["spoof_risk"]
+    if thesis == "ICEBERG_DEFENSE":
+        return "STAND_DOWN", ["iceberg defense"]
+    if thesis == "ABSORPTION_FADE":
+        return "STAND_DOWN", ["absorption against direction"]
+    if state in ("RETEST_FAIL", "INVALIDATED"):
+        return "SCRATCH_READY", ["prior thesis invalidated"]
+    if thesis in ("ACCEPTANCE_LONG", "ACCEPTANCE_SHORT") and aggressor == "WITH":
+        return "PAY_FOR_TRADE", ["acceptance + aligned flow"]
+    if thesis in ("REJECTION_LONG", "REJECTION_SHORT") and aggressor == "AGAINST":
+        return "PAY_FOR_TRADE", ["rejection + aligned counter-flow"]
+    if thesis == "STOP_SWEEP_FAILURE":
+        # Failure flips the entry direction to opposite the failed sweep.
+        # Confirming aggressor flow = counter to the failed breakout = "AGAINST".
+        if aggressor == "AGAINST":
+            return "PAY_FOR_TRADE", ["sweep failure + confirming counter-flow"]
+        return "WAIT_FOR_CONFIRM", ["sweep failure but flow not confirming"]
+    if thesis == "STOP_SWEEP_CONTINUATION":
+        return "WAIT_FOR_CONFIRM", ["sweep continuation requires acceptance confirm"]
+    if state == "TOUCHED":
+        return "WAIT_FOR_CONFIRM", ["touched, awaiting acceptance/rejection"]
+    return "WAIT_FOR_CONFIRM", []
+
+
+def _thesis_confidence(state: str, thesis: str, liquidity: str,
+                       aggressor: str, execution_read: str) -> float:
+    """0..1 conviction in the thesis as currently classified."""
+    base = {
+        "PAY_FOR_TRADE":    0.70,
+        "WAIT_FOR_CONFIRM": 0.35,
+        "SCRATCH_READY":    0.55,
+        "STAND_DOWN":       0.80,   # high-confidence DO NOT TRADE
+    }.get(execution_read, 0.30)
+    bumps = 0.0
+    if state in ("ACCEPTED_ABOVE", "ACCEPTED_BELOW"):
+        bumps += 0.05
+    if state in ("REJECTED", "RETEST_FAIL", "INVALIDATED"):
+        bumps += 0.05
+    if liquidity in ("ICEBERG_DEFENDED", "SPOOF_RISK"):
+        bumps += 0.05
+    if aggressor == "WITH" and thesis in ("ACCEPTANCE_LONG", "ACCEPTANCE_SHORT"):
+        bumps += 0.05
+    return max(0.0, min(1.0, base + bumps))
+
+
+def _thesis_invalidations(state: str, thesis: str, side: str) -> List[str]:
+    out: List[str] = []
+    if thesis == "ICEBERG_DEFENSE":
+        out.append("invalidated when ICEBERG event ceases AND price holds past level for ≥2 polls")
+    if thesis in ("ACCEPTANCE_LONG", "ACCEPTANCE_SHORT"):
+        out.append(f"invalidated by RETEST_FAIL or cross back into range > {_REJECT_BACKOFF_PTS:.1f}p")
+    if thesis in ("REJECTION_LONG", "REJECTION_SHORT"):
+        out.append("invalidated by re-touch + acceptance in breakout direction")
+    if thesis == "STOP_SWEEP_CONTINUATION":
+        out.append("invalidated by reversal back through swept level within 2 polls")
+    if thesis == "ABSORPTION_FADE":
+        out.append("invalidated when price moves past level on continued aggressor flow")
+    if state == "TOUCHED":
+        out.append(f"acceptance fails if price retreats > {_REJECT_BACKOFF_PTS:.1f}p before {_ACCEPT_HOLD_POLLS} polls past")
+    return out
+
+
+def _thesis_for_level(level_label: str, side: str, price: float,
+                      mid: float, alias: str, snap: Dict[str, Any],
+                      now_ms: int) -> Dict[str, Any]:
+    """Build the institutional_thesis dict for one OR/extension level.
+
+    Mutates _LEVEL_TOUCH_STATE in place (under lock) to record the rolling
+    history and the wall-clock anchors (touched_at_ms, last_state_change_ms).
+    """
+    key = (alias or "", side, level_label)
+    # Sign convention: dist_pts = mid - level_price.
+    # side='above' → past-when (mid - price) > 0
+    # side='below' → past-when (mid - price) < 0
+    dist_pts = mid - price
+
+    with _LEVEL_TOUCH_LOCK:
+        rec = _LEVEL_TOUCH_STATE.get(key)
+        if rec is None:
+            rec = {
+                "history": [],
+                "state": "",
+                "state_since_ms": now_ms,
+                "touched_at_ms": None,
+                "last_touch_dist_pts": None,
+            }
+            _LEVEL_TOUCH_STATE[key] = rec
+        prior_history = list(rec["history"])
+        prior_state = rec.get("state") or ""
+
+        state, state_reasons = _thesis_classify_touch_state(
+            side=side, curr_dist_pts=dist_pts,
+            prior_history=prior_history, prior_state=prior_state,
+        )
+
+        rec["history"].append({"ts_ms": now_ms, "dist_pts": dist_pts})
+        if len(rec["history"]) > _TOUCH_HISTORY_DEPTH:
+            rec["history"] = rec["history"][-_TOUCH_HISTORY_DEPTH:]
+
+        # Wall-clock anchors. touched_at_ms is sticky from the FIRST touch in
+        # the current cycle; reset only on INVALIDATED / RETEST_FAIL or when a
+        # new fresh touch happens after a long gap.
+        is_touch_now = state == "TOUCHED"
+        if is_touch_now:
+            if rec.get("touched_at_ms") is None or prior_state in (
+                    "INVALIDATED", "RETEST_FAIL"):
+                rec["touched_at_ms"] = now_ms
+            rec["last_touch_dist_pts"] = dist_pts
+        if state in ("INVALIDATED", "RETEST_FAIL"):
+            # Stale the touched_at_ms — the prior touch's clock no longer applies.
+            pass  # left intact so consumers can still see the original ms
+
+        if state != prior_state and state:
+            rec["state"] = state
+            # Strictly monotonic per transition — guards against same-ms polls
+            # (test loops, very fast successive ticks) producing identical
+            # state_since_ms values that would break dedup-by-state-change.
+            prior_since = rec.get("state_since_ms") or 0
+            rec["state_since_ms"] = max(now_ms, prior_since + 1)
+        elif state:
+            rec["state"] = state
+
+    me_obj = snap.get("micro_events")
+    ps_obj = snap.get("pull_stack")
+    lt_obj = snap.get("lt_liquidity")
+    tape_obj = snap.get("tape_flow")
+
+    liquidity, liq_reasons = _thesis_liquidity_quality(
+        side=side, price=price, me_obj=me_obj,
+        ps_obj=ps_obj, lt_obj=lt_obj, tape_obj=tape_obj,
+    )
+    aggressor, agg_reasons = _thesis_aggressor_flow(side=side, tape_obj=tape_obj)
+    book_st, book_reasons = _thesis_book_state(
+        side=side, price=price, ps_obj=ps_obj, me_obj=me_obj,
+    )
+    thesis, thesis_reasons = _thesis_select_thesis(
+        state=state, side=side, liquidity=liquidity, aggressor=aggressor,
+        me_obj=me_obj, price=price,
+    )
+    exec_read, exec_reasons = _thesis_execution_read(
+        state=state, thesis=thesis, liquidity=liquidity, aggressor=aggressor,
+    )
+    conf = _thesis_confidence(state, thesis, liquidity, aggressor, exec_read)
+    invs = _thesis_invalidations(state, thesis, side)
+
+    reasons: List[str] = []
+    for src in (state_reasons, liq_reasons, agg_reasons, book_reasons,
+                thesis_reasons, exec_reasons):
+        for r in src:
+            if r and r not in reasons:
+                reasons.append(r)
+
+    # Wall-clock observability fields.
+    touched_at = rec.get("touched_at_ms")
+    state_since = rec.get("state_since_ms") or now_ms
+    polls_since_touch = 0
+    if touched_at is not None:
+        # count polls in history with ts_ms > touched_at_ms
+        polls_since_touch = sum(
+            1 for h in rec["history"]
+            if h.get("ts_ms") is not None and h["ts_ms"] > touched_at
+        )
+    confirm_ms_since_touch = (now_ms - touched_at) if touched_at is not None else None
+
+    return {
+        "state":             state or "",
+        "thesis":            thesis,
+        "liquidity_quality": liquidity,
+        "aggressor_flow":    aggressor,
+        "book_state":        book_st,
+        "execution_read":    exec_read,
+        "confidence":        round(conf, 3),
+        "reasons":           reasons[:8],
+        "invalidations":     invs,
+        "touched_at_ms":         touched_at,
+        "last_state_change_ms":  state_since,
+        "polls_since_touch":     polls_since_touch,
+        "confirm_ms_since_touch": confirm_ms_since_touch,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Institutional signal composer — emits chart-ready signal events keyed by
+# per-level state transitions. The Java chart should plot from this array,
+# NOT from snap["trend_signal"] or pax_decision directly.
+#
+# Hard contracts (pinned by test_institutional_signals_composer.py):
+#   1. Only execution_read == PAY_FOR_TRADE yields direction in (LONG, SHORT).
+#   2. ACCEPTANCE requires aggressor_flow == WITH.
+#      REJECTION + STOP_SWEEP_FAILURE require aggressor_flow == AGAINST.
+#      MIXED / THIN / missing / malformed -> direction NONE, WAIT_FOR_CONFIRM.
+#   3. STOP_SWEEP_CONTINUATION label matches the BREAKOUT side (sweep above
+#      OR-H -> STOP_SWEEP_LONG, direction NONE). On FAILURE the label flips
+#      to the entry direction.
+#   4. Spoof / iceberg / scratch states emit non-entry signals only.
+#   5. Signals only emit for levels with proximity == True.
+#   6. id = "{alias}|{label}|{side}|{state_since_ms}" - dedup-by-state-change.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SIGNAL_TYPE_CODES = (
+    "ACCEPTANCE_LONG", "ACCEPTANCE_SHORT",
+    "REJECTION_LONG", "REJECTION_SHORT",
+    "STOP_SWEEP_LONG", "STOP_SWEEP_SHORT",
+    "ICEBERG_DEFENSE", "SPOOF_STAND_DOWN",
+    "SCRATCH",
+)
+_SIGNAL_DIRECTION_CODES = ("LONG", "SHORT", "NONE")
+
+
+def _signal_type_from_thesis(side: str, state: str, thesis: str,
+                             liquidity: str, execution_read: str
+                             ) -> Tuple[Optional[str], str]:
+    """Map (state, thesis, liquidity, execution_read) -> (signal_type, default_direction).
+
+    Returns (None, "NONE") when no signal should be emitted at this level.
+    Direction is the DEFAULT if no aggressor veto fires; the caller may still
+    downgrade to NONE.
+    """
+    if liquidity == "SPOOF_RISK":
+        return "SPOOF_STAND_DOWN", "NONE"
+    if thesis == "ICEBERG_DEFENSE":
+        return "ICEBERG_DEFENSE", "NONE"
+    if execution_read == "SCRATCH_READY" or state in ("RETEST_FAIL", "INVALIDATED"):
+        return "SCRATCH", "NONE"
+    if thesis == "STOP_SWEEP_CONTINUATION":
+        return (("STOP_SWEEP_LONG" if side == "above"
+                 else "STOP_SWEEP_SHORT"), "NONE")
+    if thesis == "STOP_SWEEP_FAILURE":
+        # Failure above OR-H -> SHORT entry; failure below OR-L -> LONG entry.
+        if side == "above":
+            return "STOP_SWEEP_SHORT", "SHORT"
+        return "STOP_SWEEP_LONG", "LONG"
+    if thesis == "ACCEPTANCE_LONG":
+        return "ACCEPTANCE_LONG", "LONG"
+    if thesis == "ACCEPTANCE_SHORT":
+        return "ACCEPTANCE_SHORT", "SHORT"
+    if thesis == "REJECTION_LONG":
+        return "REJECTION_LONG", "LONG"
+    if thesis == "REJECTION_SHORT":
+        return "REJECTION_SHORT", "SHORT"
+    return None, "NONE"
+
+
+def _signal_aggressor_align_required(signal_type: str) -> Optional[str]:
+    """Return the required aggressor_flow value for this signal_type, or None
+    if no alignment veto applies (non-entry signals)."""
+    if signal_type in ("ACCEPTANCE_LONG", "ACCEPTANCE_SHORT"):
+        return "WITH"
+    if signal_type in ("REJECTION_LONG", "REJECTION_SHORT"):
+        return "AGAINST"
+    if signal_type in ("STOP_SWEEP_LONG", "STOP_SWEEP_SHORT"):
+        # CONTINUATION uses None direction so the veto does not apply.
+        # FAILURE direction is opposite-of-sweep; aggressor must be AGAINST
+        # the original breakout side (i.e., counter-flow).
+        return "AGAINST"
+    return None
+
+
+def _signal_size_tier_from_confidence(confidence: float) -> str:
+    """FULL >= 0.50; HALF >= 0.35; else NONE.
+
+    Matches pax-ai/pax_ai/edge_calculus.size_tier() thresholds so the
+    institutional payload and edge-calc payload agree on sizing buckets.
+    """
+    try:
+        c = float(confidence)
+    except (TypeError, ValueError):
+        return "NONE"
+    if c >= 0.50:
+        return "FULL"
+    if c >= 0.35:
+        return "HALF"
+    return "NONE"
+
+
+def compute_institutional_signals(snap: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Build the institutional signal-event array from per-level thesis state.
+
+    Pure-ish: reads `snap`, returns a list. Empty list when:
+      - or_levels is missing or malformed
+      - no level is in proximity (price in middle of OR)
+      - every proximate level's thesis maps to None signal_type
+    """
+    out: List[Dict[str, Any]] = []
+    ol = snap.get("or_levels")
+    if not isinstance(ol, dict):
+        return out
+    levels = ol.get("levels") or []
+    if not isinstance(levels, list):
+        return out
+
+    or_high = ol.get("orHigh")
+    or_low = ol.get("orLow")
+    try:
+        or_high_f = float(or_high) if or_high is not None else None
+        or_low_f = float(or_low) if or_low is not None else None
+    except (TypeError, ValueError):
+        or_high_f = or_low_f = None
+    alias = snap.get("alias") or ""
+
+    for lvl in levels:
+        if not isinstance(lvl, dict):
+            continue
+        # No explicit proximity gate: the per-level thesis state itself encodes
+        # whether a recent touch / reaction occurred. For levels with no touch
+        # ever recorded, thesis stays "NONE" and the signal_type mapper returns
+        # None — so far-from-level levels emit nothing naturally. This also
+        # lets REJECTION signals emit after price has reversed away from the
+        # level (the rejection IS confirmed by that reversal).
+
+        ith = lvl.get("institutional_thesis") or {}
+        state = ith.get("state") or ""
+        thesis = ith.get("thesis") or "NONE"
+        liquidity = ith.get("liquidity_quality") or ""
+        aggressor = ith.get("aggressor_flow") or ""
+        book_st = ith.get("book_state") or ""
+        execution_read = ith.get("execution_read") or "WAIT_FOR_CONFIRM"
+        try:
+            confidence = float(ith.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        side = lvl.get("side") or "above"
+
+        signal_type, default_direction = _signal_type_from_thesis(
+            side=side, state=state, thesis=thesis,
+            liquidity=liquidity, execution_read=execution_read,
+        )
+        if signal_type is None:
+            continue
+
+        direction = default_direction
+        effective_exec = execution_read
+        reason_codes: List[str] = list(ith.get("reasons") or [])[:6]
+
+        # Aggressor-flow alignment veto. STRICT: only the exact required value
+        # passes. MIXED / THIN / missing / malformed all block.
+        required = _signal_aggressor_align_required(signal_type)
+        if required and direction != "NONE":
+            if aggressor != required:
+                direction = "NONE"
+                effective_exec = "WAIT_FOR_CONFIRM"
+                reason_codes.append(
+                    f"aggressor_flow={aggressor or 'missing'} != required {required}"
+                )
+
+        # Only PAY_FOR_TRADE may produce direction; everything else -> NONE.
+        if effective_exec != "PAY_FOR_TRADE":
+            direction = "NONE"
+
+        # Book pulling against the signal contradicts it (rule #15).
+        if direction in ("LONG", "SHORT") and book_st == "PULLING":
+            direction = "NONE"
+            effective_exec = "WAIT_FOR_CONFIRM"
+            reason_codes.append("book_state=PULLING contradicts signal")
+
+        size_tier = (_signal_size_tier_from_confidence(confidence)
+                     if direction != "NONE" else "NONE")
+
+        try:
+            price = float(lvl.get("price") or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+
+        invalidation_price: Optional[float] = None
+        payline_price: Optional[float] = None
+        if direction == "LONG":
+            if or_low_f is not None:
+                invalidation_price = round(or_low_f - NQ_TICK, 2)
+            payline_price = round(price + 10.0, 2)
+        elif direction == "SHORT":
+            if or_high_f is not None:
+                invalidation_price = round(or_high_f + NQ_TICK, 2)
+            payline_price = round(price - 10.0, 2)
+
+        try:
+            state_since_ms = int(ith.get("last_state_change_ms") or 0)
+        except (TypeError, ValueError):
+            state_since_ms = 0
+        touched_at_ms = ith.get("touched_at_ms")
+        timestamp_ms = touched_at_ms if touched_at_ms is not None else state_since_ms
+
+        signal_id = f"{alias}|{lvl.get('label')}|{side}|{state_since_ms}"
+
+        out.append({
+            "id":                  signal_id,
+            "alias":               alias,
+            "label":               lvl.get("label"),
+            "price":               round(price, 2),
+            "side":                side,
+            "direction":           direction,
+            "signal_type":         signal_type,
+            "execution_read":      effective_exec,
+            "confidence":          round(confidence, 3),
+            "size_tier":           size_tier,
+            "reason_codes":        reason_codes,
+            "invalidation_price":  invalidation_price,
+            "payline_price":       payline_price,
+            "timestamp_ms":        timestamp_ms,
+            "source_level_state":  state,
+            "liquidity_quality":   liquidity,
+            "aggressor_flow":      aggressor,
+            "book_state":          book_st,
+        })
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Institutional chart-events composer — the EVIDENCE TRAIL the trader reads
+# on the Bookmap chart.
+#
+# This payload is DISTINCT from snap["institutional_signals"]:
+#   - institutional_signals is the entry-only, trade-decision payload
+#     (only ACCEPTANCE / REJECTION / STOP_SWEEP_FAILURE may carry direction).
+#   - institutional_chart_events is the FULL evidence array: every sweep,
+#     iceberg defense, spoof, absorption, pull/stack, watch/touch event
+#     near an OR/extension level, plus the entry events themselves.
+#
+# Spec: docs/superpowers/specs/institutional-chart-markers.md
+#
+# Rules pinned by tests in test_institutional_chart_events.py:
+#   1. Only ACCEPTANCE / REJECTION (PAY_FOR_TRADE) carry direction LONG/SHORT.
+#   2. All other event types carry direction NONE.
+#   3. Dedup id = "{alias}|{label}|{event_type}|{state_or_event_ms}".
+#   4. trend_signal alone NEVER produces a chart event.
+#   5. pax.decision alone NEVER produces a chart event.
+#   6. Sweep/iceberg/spoof events anchor at the LEVEL (not at current mid)
+#      and emit even when mid is in the middle of the OR.
+#   7. PULL/STACK context emits only at proximate levels.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CHART_EVENT_TYPES = (
+    "WATCH_LEVEL", "TOUCHED_LEVEL",
+    "LIQUIDITY_SWEEP", "ABSORPTION",
+    "ICEBERG_DEFENSE", "SPOOF_RISK",
+    "PULLING", "STACKING",
+    "ACCEPTANCE", "REJECTION", "SCRATCH",
+)
+
+_CHART_SEVERITY_RANKS = {
+    "ENTRY":   0,
+    "EXIT":    1,
+    "WARNING": 2,
+    "WATCH":   3,
+    "INFO":    4,
+}
+
+# Color hints (hex, AARRGGBB-less; Java side prepends opacity).
+_CHART_COLORS = {
+    "WATCH_LEVEL":     "#E5C100",
+    "TOUCHED_LEVEL":   "#E5C100",
+    "LIQUIDITY_SWEEP": "#FF9900",
+    "ABSORPTION":      "#00BFFF",
+    "ICEBERG_DEFENSE": "#A86DEC",
+    "SPOOF_RISK":      "#FF6633",
+    "PULLING":         "#B0B0B0",
+    "STACKING":        "#B0B0B0",
+    "ACCEPTANCE_LONG": "#2BD25B",
+    "ACCEPTANCE_SHORT": "#FF4D4D",
+    "REJECTION_LONG":  "#2BD25B",
+    "REJECTION_SHORT": "#FF4D4D",
+    "SCRATCH":         "#B0B0B0",
+}
+
+# Per-event tuning knobs.
+_CHART_ABSORPTION_DELTA_FLOOR = 0.80    # |tape_delta| >= floor + counter-direction
+_CHART_MICRO_WINDOW_TICKS = 4.0         # match _micro_at_level window
+_CHART_PULL_STACK_MIN_AGG_Z = 0.50      # ignore micro pull/stack noise
+
+
+def _chart_event_id(alias: str, label: str, event_type: str, anchor_ms: int) -> str:
+    return f"{alias}|{label}|{event_type}|{int(anchor_ms)}"
+
+
+def _chart_micro_events_at_price(me_obj: Optional[Dict[str, Any]],
+                                  price: float
+                                  ) -> List[Dict[str, Any]]:
+    """Return microstructure events within _CHART_MICRO_WINDOW_TICKS of price."""
+    if not me_obj or not isinstance(me_obj, dict) or "_error" in me_obj:
+        return []
+    band = _CHART_MICRO_WINDOW_TICKS * NQ_TICK
+    out: List[Dict[str, Any]] = []
+    for ev in (me_obj.get("events") or [])[-30:]:
+        ep = ev.get("price")
+        try:
+            ep_f = float(ep) if ep is not None else None
+        except (TypeError, ValueError):
+            continue
+        if ep_f is None or abs(ep_f - price) > band:
+            continue
+        out.append(ev)
+    return out
+
+
+def _chart_emit_watch_touched(ith: Dict[str, Any], level: Dict[str, Any],
+                               alias: str, now_ms: int
+                               ) -> Optional[Dict[str, Any]]:
+    """WATCH_LEVEL when state=APPROACHING + proximity; TOUCHED_LEVEL when
+    state=TOUCHED. Returns None otherwise."""
+    state = ith.get("state") or ""
+    if state == "TOUCHED":
+        anchor_ms = int(ith.get("touched_at_ms") or ith.get("last_state_change_ms") or now_ms)
+        return {
+            "event_type": "TOUCHED_LEVEL",
+            "marker_text": "TCH",
+            "marker_color_hint": _CHART_COLORS["TOUCHED_LEVEL"],
+            "severity": "WATCH",
+            "direction": "NONE",
+            "execution_read": "WAIT_FOR_CONFIRM",
+            "anchor_ms": anchor_ms,
+            "source": "institutional_thesis",
+            "reasons": ["state=TOUCHED"],
+        }
+    if state == "APPROACHING" and level.get("proximity"):
+        anchor_ms = int(ith.get("last_state_change_ms") or now_ms)
+        return {
+            "event_type": "WATCH_LEVEL",
+            "marker_text": "WATCH",
+            "marker_color_hint": _CHART_COLORS["WATCH_LEVEL"],
+            "severity": "WATCH",
+            "direction": "NONE",
+            "execution_read": "WAIT_FOR_CONFIRM",
+            "anchor_ms": anchor_ms,
+            "source": "institutional_thesis",
+            "reasons": ["state=APPROACHING", "within proximity"],
+        }
+    return None
+
+
+def _chart_emit_micro(side: str, level_price: float,
+                       micro_events: List[Dict[str, Any]],
+                       now_ms: int) -> List[Dict[str, Any]]:
+    """Build LIQUIDITY_SWEEP, ICEBERG_DEFENSE, SPOOF_RISK events from the
+    microstructure events near `level_price`. Returns 0..N partial event
+    dicts; the caller fills label / alias / id / price."""
+    is_above = (side == "above")
+    defender_side_str = "ASK" if is_above else "BID"
+    out: List[Dict[str, Any]] = []
+    for ev in micro_events:
+        kind = (ev.get("kind") or "").upper()
+        is_bid = ev.get("isBid")
+        ev_side = "BID" if is_bid is True else "ASK" if is_bid is False else None
+        ev_ms = int(ev.get("timeMs") or now_ms)
+        if kind == "STOP_SWEEP":
+            out.append({
+                "event_type": "LIQUIDITY_SWEEP",
+                "marker_text": "SWP↑" if is_above else "SWP↓",
+                "marker_color_hint": _CHART_COLORS["LIQUIDITY_SWEEP"],
+                "severity": "WARNING",
+                "direction": "NONE",
+                "execution_read": "WAIT_FOR_CONFIRM",
+                "anchor_ms": ev_ms,
+                "source": "micro_events",
+                "reasons": [f"STOP_SWEEP@{ev.get('price')}/{ev_side or '?'}"],
+            })
+        elif kind == "ICEBERG" and ev_side == defender_side_str:
+            out.append({
+                "event_type": "ICEBERG_DEFENSE",
+                "marker_text": "ICE-A" if is_above else "ICE-B",
+                "marker_color_hint": _CHART_COLORS["ICEBERG_DEFENSE"],
+                "severity": "WARNING",
+                "direction": "NONE",
+                "execution_read": "STAND_DOWN",
+                "anchor_ms": ev_ms,
+                "source": "micro_events",
+                "reasons": [f"ICEBERG@{ev.get('price')}/{ev_side}"],
+            })
+        elif kind == "SPOOF":
+            out.append({
+                "event_type": "SPOOF_RISK",
+                "marker_text": "SPD",
+                "marker_color_hint": _CHART_COLORS["SPOOF_RISK"],
+                "severity": "WARNING",
+                "direction": "NONE",
+                "execution_read": "STAND_DOWN",
+                "anchor_ms": ev_ms,
+                "source": "micro_events",
+                "reasons": [f"SPOOF@{ev.get('price')}/{ev_side or '?'}"],
+            })
+    return out
+
+
+def _chart_emit_absorption(side: str, ith: Dict[str, Any],
+                            tape_obj: Optional[Dict[str, Any]],
+                            now_ms: int) -> Optional[Dict[str, Any]]:
+    """ABSORPTION = strong aggressor flow AGAINST the breakout direction at
+    a TOUCHED level. Grounded in Cont/Kukanov/Stoikov OFI: large signed
+    flow with ~zero realized displacement implies hidden passive absorbing."""
+    if ith.get("state") != "TOUCHED":
+        return None
+    if not tape_obj or not isinstance(tape_obj, dict):
+        return None
+    delta = tape_obj.get("deltaScore")
+    if not isinstance(delta, (int, float)):
+        return None
+    delta_f = float(delta)
+    if abs(delta_f) < _CHART_ABSORPTION_DELTA_FLOOR:
+        return None
+    # absorbed = aggressor flow AGAINST the breakout direction
+    is_above = (side == "above")
+    absorbed = (delta_f > 0 and not is_above) or (delta_f < 0 and is_above)
+    if not absorbed:
+        return None
+    # For an upper-level (OR-H) touched with strong SELL aggressor flow
+    # being absorbed → BID side is absorbing (defending the underside).
+    text = "ABS-B" if is_above else "ABS-A"
+    anchor_ms = int(ith.get("touched_at_ms") or ith.get("last_state_change_ms") or now_ms)
+    return {
+        "event_type": "ABSORPTION",
+        "marker_text": text,
+        "marker_color_hint": _CHART_COLORS["ABSORPTION"],
+        "severity": "WARNING",
+        "direction": "NONE",
+        "execution_read": "STAND_DOWN",
+        "anchor_ms": anchor_ms,
+        "source": "tape_flow",
+        "reasons": [f"tape delta={delta_f:+.2f} absorbed at {side}"],
+    }
+
+
+def _chart_emit_pull_stack(side: str, level: Dict[str, Any],
+                            ps_obj: Optional[Dict[str, Any]],
+                            now_ms: int) -> Optional[Dict[str, Any]]:
+    """PULL/STACK emit ONLY at proximate levels — otherwise the chart fills
+    with rotation markers at every rung."""
+    if not level.get("proximity"):
+        return None
+    rot = _ps_rotation_value(ps_obj)
+    if rot == "NONE":
+        return None
+    try:
+        agg_z = abs(float((ps_obj or {}).get("aggregateZ") or 0.0))
+    except (TypeError, ValueError):
+        agg_z = 0.0
+    if agg_z < _CHART_PULL_STACK_MIN_AGG_Z:
+        return None
+    is_above = (side == "above")
+    if rot == ("ROTATION_UP" if is_above else "ROTATION_DN"):
+        et = "STACKING"; text = "STACK"
+    elif rot == ("ROTATION_DN" if is_above else "ROTATION_UP"):
+        et = "PULLING"; text = "PULL"
+    else:
+        return None
+    return {
+        "event_type": et,
+        "marker_text": text,
+        "marker_color_hint": _CHART_COLORS[et],
+        "severity": "INFO",
+        "direction": "NONE",
+        "execution_read": "CONTEXT",
+        "anchor_ms": now_ms,
+        "source": "pull_stack",
+        "reasons": [f"rotation={rot} aggZ={agg_z:.2f}"],
+    }
+
+
+def _chart_emit_thesis_decision(ith: Dict[str, Any], side: str, now_ms: int
+                                 ) -> Optional[Dict[str, Any]]:
+    """ACCEPTANCE / REJECTION / SCRATCH composite events from the thesis
+    state machine. Only PAY_FOR_TRADE produces direction != NONE."""
+    state = ith.get("state") or ""
+    thesis = ith.get("thesis") or "NONE"
+    exec_read = ith.get("execution_read") or "WAIT_FOR_CONFIRM"
+    anchor_ms = int(ith.get("last_state_change_ms")
+                     or ith.get("touched_at_ms") or now_ms)
+    if state in ("ACCEPTED_ABOVE", "ACCEPTED_BELOW") and exec_read == "PAY_FOR_TRADE":
+        direction = "LONG" if state == "ACCEPTED_ABOVE" else "SHORT"
+        text = "ACC-L" if direction == "LONG" else "ACC-S"
+        color = _CHART_COLORS["ACCEPTANCE_LONG"] if direction == "LONG" \
+                else _CHART_COLORS["ACCEPTANCE_SHORT"]
+        return {
+            "event_type": "ACCEPTANCE",
+            "marker_text": text,
+            "marker_color_hint": color,
+            "severity": "ENTRY",
+            "direction": direction,
+            "execution_read": "PAY_FOR_TRADE",
+            "anchor_ms": anchor_ms,
+            "source": "composite",
+            "reasons": [f"state={state}", f"thesis={thesis}"],
+        }
+    if state == "REJECTED" and exec_read == "PAY_FOR_TRADE":
+        direction = "SHORT" if side == "above" else "LONG"
+        text = "REJ-L" if direction == "LONG" else "REJ-S"
+        color = _CHART_COLORS["REJECTION_LONG"] if direction == "LONG" \
+                else _CHART_COLORS["REJECTION_SHORT"]
+        return {
+            "event_type": "REJECTION",
+            "marker_text": text,
+            "marker_color_hint": color,
+            "severity": "ENTRY",
+            "direction": direction,
+            "execution_read": "PAY_FOR_TRADE",
+            "anchor_ms": anchor_ms,
+            "source": "composite",
+            "reasons": [f"state={state}", f"thesis={thesis}"],
+        }
+    if exec_read == "SCRATCH_READY":
+        return {
+            "event_type": "SCRATCH",
+            "marker_text": "SCR",
+            "marker_color_hint": _CHART_COLORS["SCRATCH"],
+            "severity": "EXIT",
+            "direction": "NONE",
+            "execution_read": "SCRATCH_READY",
+            "anchor_ms": anchor_ms,
+            "source": "composite",
+            "reasons": [f"state={state}"],
+        }
+    return None
+
+
+def compute_institutional_chart_events(snap: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Build the full evidence-trail array.
+
+    Per-level walk over snap["or_levels"]["levels"], emitting:
+      - WATCH_LEVEL when APPROACHING + proximity
+      - TOUCHED_LEVEL when state=TOUCHED
+      - LIQUIDITY_SWEEP from STOP_SWEEP microstructure events near the level
+      - ICEBERG_DEFENSE from defender-side ICEBERG events near the level
+      - SPOOF_RISK from SPOOF events near the level
+      - ABSORPTION from strong counter-flow at a TOUCHED level
+      - PULLING / STACKING from pull_stack rotation at proximate levels
+      - ACCEPTANCE / REJECTION / SCRATCH from the thesis decision layer
+
+    Events are dedup-keyed by (alias, label, event_type, anchor_ms) so
+    the Java history can append-only across polls.
+    """
+    out: List[Dict[str, Any]] = []
+    ol = snap.get("or_levels")
+    if not isinstance(ol, dict):
+        return out
+    levels = ol.get("levels") or []
+    if not isinstance(levels, list):
+        return out
+    alias = snap.get("alias") or ""
+    me_obj = snap.get("micro_events")
+    tape_obj = snap.get("tape_flow")
+    ps_obj = snap.get("pull_stack")
+    book = snap.get("book") or {}
+    try:
+        or_high_f = float(ol.get("orHigh") or 0.0)
+    except (TypeError, ValueError):
+        or_high_f = 0.0
+    try:
+        or_low_f = float(ol.get("orLow") or 0.0)
+    except (TypeError, ValueError):
+        or_low_f = 0.0
+    now_ms = int(time.time() * 1000)
+
+    for lvl in levels:
+        if not isinstance(lvl, dict):
+            continue
+        ith = lvl.get("institutional_thesis") or {}
+        label = lvl.get("label") or ""
+        side = lvl.get("side") or "above"
+        try:
+            price = float(lvl.get("price") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0.0:
+            continue
+
+        candidates: List[Dict[str, Any]] = []
+
+        # 1. WATCH / TOUCHED — only for proximate-or-touched levels.
+        wt = _chart_emit_watch_touched(ith, lvl, alias, now_ms)
+        if wt is not None:
+            candidates.append(wt)
+
+        # 2. Microstructure events near the level (sweep / iceberg / spoof).
+        #    These emit independent of proximity at mid — anchored at level.
+        micros = _chart_micro_events_at_price(me_obj, price)
+        candidates.extend(_chart_emit_micro(side, price, micros, now_ms))
+
+        # 3. ABSORPTION — only when level is TOUCHED in this poll.
+        ab = _chart_emit_absorption(side, ith, tape_obj, now_ms)
+        if ab is not None:
+            candidates.append(ab)
+
+        # 4. PULL / STACK — only at proximate levels.
+        ps = _chart_emit_pull_stack(side, lvl, ps_obj, now_ms)
+        if ps is not None:
+            candidates.append(ps)
+
+        # 5. ACCEPTANCE / REJECTION / SCRATCH from the thesis decision layer.
+        td = _chart_emit_thesis_decision(ith, side, now_ms)
+        if td is not None:
+            candidates.append(td)
+
+        # Compute invalidation/payline only for entry events.
+        for c in candidates:
+            direction = c["direction"]
+            invalidation_price = None
+            payline_price = None
+            if direction == "LONG":
+                invalidation_price = round(or_low_f - NQ_TICK, 2) if or_low_f > 0 else None
+                payline_price = round(price + 10.0, 2)
+            elif direction == "SHORT":
+                invalidation_price = round(or_high_f + NQ_TICK, 2) if or_high_f > 0 else None
+                payline_price = round(price - 10.0, 2)
+
+            try:
+                conf = float(ith.get("confidence") or 0.35)
+            except (TypeError, ValueError):
+                conf = 0.35
+
+            anchor_ms = c["anchor_ms"]
+            out.append({
+                "id":                 _chart_event_id(alias, label, c["event_type"], anchor_ms),
+                "alias":              alias,
+                "label":              label,
+                "price":              round(price, 2),
+                "side":               side,
+                "event_type":         c["event_type"],
+                "direction":          direction,
+                "execution_read":     c["execution_read"],
+                "marker_text":        c["marker_text"],
+                "marker_color_hint":  c["marker_color_hint"],
+                "severity":           c["severity"],
+                "timestamp_ms":       anchor_ms,
+                "source":             c["source"],
+                "confidence":         round(conf, 3),
+                "reason_codes":       c["reasons"],
+                "invalidation_price": invalidation_price,
+                "payline_price":      payline_price,
+            })
+    return out
+
+
+def compute_institutional_thesis(snap: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """Build the institutional thesis for every per-level row in or_levels.
+
+    Pure-ish: reads snap, mutates _LEVEL_TOUCH_STATE in place. Returns a list
+    of {"label", "thesis": {...}} — same per-level dict shape that
+    compute_or_levels embeds under each level's "institutional_thesis".
+    """
+    ol = snap.get("or_levels") or {}
+    levels = ol.get("levels") or []
+    alias = snap.get("alias") or ""
+    book = snap.get("book") or {}
+    mid = book.get("mid")
+    try:
+        mid_f = float(mid) if mid is not None else None
+    except (TypeError, ValueError):
+        mid_f = None
+    if mid_f is None:
+        return None
+    now_ms = int(time.time() * 1000)
+    out: List[Dict[str, Any]] = []
+    for lvl in levels:
+        try:
+            price = float(lvl.get("price") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        ith = _thesis_for_level(
+            level_label=lvl.get("label"), side=lvl.get("side"),
+            price=price, mid=mid_f, alias=alias, snap=snap, now_ms=now_ms,
+        )
+        out.append({"label": lvl.get("label"), "thesis": ith})
+    return out
+
+
 def compute_or_levels(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Build the OR + extension level grid with per-level reaction bias.
 
@@ -1008,12 +2196,18 @@ def compute_or_levels(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     prox_pts = PROX_TICKS * NQ_TICK  # 12.5 pts
 
     levels = []
+    now_ms = int(time.time() * 1000)
+    alias = snap.get("alias") or ""
     for lbl, price, side in raw_levels:
         dist_pts = price - mid
         proximity = abs(dist_pts) <= prox_pts
         reaction = _score_level(side, price, mid,
                                 ps_obj, lt_obj, tape_obj, me_obj, vwap_obj, vp_obj)
         composite = _level_composite(side, price, mid, snap)
+        ith = _thesis_for_level(
+            level_label=lbl, side=side, price=price, mid=mid,
+            alias=alias, snap=snap, now_ms=now_ms,
+        )
         levels.append({
             "label":     lbl,
             "price":     round(price, 2),
@@ -1022,6 +2216,7 @@ def compute_or_levels(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "proximity": proximity,
             **reaction,
             "composite": composite,
+            "institutional_thesis": ith,
         })
 
     # Pax discipline check: is price currently in the middle (i.e., not in proximity
@@ -3100,8 +4295,8 @@ def compute_session_conviction(snap: Dict[str, Any]) -> Optional[Dict[str, Any]]
 # ─────────────────────────────────────────────────────────────────────────────
 
 PAX_LOG_DIR = Path(os.environ.get("PAX_LOG_DIR", r"D:\BookmapLogs"))
-PAX_CONFIDENCE_FLOOR = 0.35
-PAX_CONFIDENCE_FULL  = 0.50
+PAX_CONFIDENCE_FLOOR = 0.55
+PAX_CONFIDENCE_FULL  = 0.70
 PAX_MIN_OR_WIDTH_PTS = 3.0
 PAX_MAX_OR_WIDTH_PTS = 25.0
 
@@ -3196,6 +4391,31 @@ def pax_decision(snap: Dict[str, Any]) -> Dict[str, Any]:
     components["level"] = {"label": level.get("label"), "price": level.get("price"),
                            "distance": level.get("distance")}
 
+    # Institutional-thesis gate. STAND_DOWN forces WAIT immediately;
+    # WAIT_FOR_CONFIRM / SCRATCH_READY force size 0 even if the legacy
+    # pipeline would otherwise enter. PAY_FOR_TRADE passes through.
+    ith = level.get("institutional_thesis") or {}
+    exec_read = ith.get("execution_read")
+    if ith:
+        components["thesis"] = {
+            "state": ith.get("state"),
+            "thesis": ith.get("thesis"),
+            "execution_read": exec_read,
+            "liquidity_quality": ith.get("liquidity_quality"),
+            "aggressor_flow": ith.get("aggressor_flow"),
+            "book_state": ith.get("book_state"),
+        }
+    if exec_read == "STAND_DOWN":
+        return {"decision": "WAIT", "size": 0,
+                "reason": f"thesis STAND_DOWN ({ith.get('thesis')})",
+                "reasons": reasons + [
+                    "execution_read=STAND_DOWN",
+                    f"thesis={ith.get('thesis')}",
+                    f"liquidity={ith.get('liquidity_quality')}",
+                ],
+                "components": components}
+    _thesis_force_zero = exec_read in ("WAIT_FOR_CONFIRM", "SCRATCH_READY")
+
     ldec  = level.get("decision") or "WAIT"
     lconf = float(level.get("confidence") or 0)
     reasons.append(f"{level.get('label')} @ {level.get('price')} → {ldec}")
@@ -3280,6 +4500,9 @@ def pax_decision(snap: Dict[str, Any]) -> Dict[str, Any]:
     if eff >= full:    size_tier = "FULL"; size = 3
     elif eff >= half:  size_tier = "HALF"; size = 1
     else: size_tier = "NONE"; size = 0
+    if _thesis_force_zero and size > 0:
+        reasons.append(f"thesis execution_read={exec_read} → size 0")
+        size_tier = "NONE"; size = 0
     if size == 0:
         return {"decision": "WAIT", "size": 0,
                 "reason": f"effective conf {eff:.2f} below floor",
@@ -3841,6 +5064,10 @@ def _compose_alias_snapshot(c, cfg, alias: str,
     snap["conviction"] = _safe_call(compute_session_conviction, "compute_session_conviction")
     snap["trend_signal"] = _safe_call(compute_trend_signal, "compute_trend_signal")
     snap["pax"]       = _safe_call(pax_decision,      "pax_decision")
+    snap["institutional_signals"] = _safe_call(
+        compute_institutional_signals, "compute_institutional_signals")
+    snap["institutional_chart_events"] = _safe_call(
+        compute_institutional_chart_events, "compute_institutional_chart_events")
     # SIM trades from local sim engine (read-only — agent process owns writes)
     try:
         from .sim_engine import SimEngine

@@ -9,7 +9,7 @@ public record PaxOpeningRangeSignalSettings(
         int minScore) {
 
     public static PaxOpeningRangeSignalSettings defaults() {
-        return new PaxOpeningRangeSignalSettings(1, 1, 10, 0, 0, 3);
+        return new PaxOpeningRangeSignalSettings(25, 25, 10, 2, 80, 4);
     }
 
     public PaxOpeningRangeSignalSettings {

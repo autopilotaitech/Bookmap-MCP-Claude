@@ -14,6 +14,8 @@ public class PaxOpeningRangeSignalEngineTest {
         blocksWhenMinimumScoreIsNotMet();
         blocksWhenBreakoutIsTooCloseToRange();
         blocksWhenBreakoutIsTooExtended();
+        defaultEngineBlocksTinyOrderFlowConfirmation();
+        defaultEngineAllowsStrongOrderFlowConfirmation();
     }
 
     private static void blocksSignalsBeforeOpeningRangeCompletes() {
@@ -58,7 +60,32 @@ public class PaxOpeningRangeSignalEngineTest {
 
         assertEquals(PaxOpeningRangeSignalAction.BLOCK_SIGNAL, signal.action(), "action");
         assertEquals(PaxOpeningRangeSignalBias.LONG, signal.bias(), "bias");
-        assertContains(signal.reason(), "needs 3/4", "reason");
+        assertContains(signal.reason(), "needs 4/4", "reason");
+    }
+
+    private static void defaultEngineBlocksTinyOrderFlowConfirmation() {
+        PaxOpeningRangeSignalEngine engine = new PaxOpeningRangeSignalEngine();
+        PaxOpeningRangeDayState day = completedDay(6400.00, 6390.00);
+
+        PaxOpeningRangeSignal signal = engine.evaluate(day, market(6401.00, 1, 1, -1, 2));
+
+        assertEquals(PaxOpeningRangeSignalAction.BLOCK_SIGNAL, signal.action(),
+                "default engine must not allow a breakout on tiny 1-lot CVD/depth confirmations");
+        assertEquals(PaxOpeningRangeSignalBias.LONG, signal.bias(), "bias");
+        assertContains(signal.reason(), "needs 4/4", "reason");
+    }
+
+    private static void defaultEngineAllowsStrongOrderFlowConfirmation() {
+        PaxOpeningRangeSignalEngine engine = new PaxOpeningRangeSignalEngine();
+        PaxOpeningRangeDayState day = completedDay(6400.00, 6390.00);
+
+        PaxOpeningRangeSignal signal = engine.evaluate(day, market(6401.00, 25, 550, -700, 1250));
+
+        assertEquals(PaxOpeningRangeSignalAction.ALLOW_SIGNAL, signal.action(),
+                "default engine must still allow strong (>=25) CVD/depth confirmations with full score");
+        assertEquals(PaxOpeningRangeSignalBias.LONG, signal.bias(), "bias");
+        assertEquals(4, signal.score(), "score");
+        assertEquals(PaxOpeningRangeSignalConfidence.HIGH, signal.confidence(), "confidence");
     }
 
     private static void allowsShortBreakoutWhenOrderFlowConfirms() {

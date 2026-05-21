@@ -3,241 +3,356 @@ package com.openrange;
 public class PaxTrendSignalSnapshotParserTest {
 
     public static void main(String[] args) {
-        parsesStrongBullHappyPath();
-        parsesWeakBearHappyPath();
-        missingTrendSignalReturnsNone();
-        unknownKindReturnsNone();
-        nullMidIsHandled();
+        // Institutional signal contract (authoritative)
+        payLongFullMapsToStrongBull();
+        payLongHalfMapsToWeakBull();
+        payLongHighConfidenceMapsToStrongBull();
+        payShortFullMapsToStrongBear();
+        payShortHalfMapsToWeakBear();
+        signalPriceBecomesModelMid();
+        signalTimestampMsBecomesEventMs();
+        signalIdDrivesBucketEnteredMs();
+        eventMsSourceIsInstitutionalSignal();
+
+        // Suppression rules
+        waitForConfirmProducesNone();
+        standDownProducesNone();
+        scratchReadyProducesNone();
+        directionNoneProducesNone();
+        emptyInstitutionalSignalsProducesNone();
+        missingInstitutionalSignalsProducesNone();
+
+        // Hard no-fallback rules
+        trendSignalStrongBullAloneProducesNone();
+        paxDecisionEnterLongAloneProducesNone();
+        bothTrendAndPaxWithoutInstitutionalProducesNone();
+
+        // Multi-signal selection
+        mostRecentPayForTradeWins();
+        nonPayEntriesAreSkipped();
+
+        // Misc safety
+        missingPriceProducesNone();
+        nonNumericPriceProducesNone();
+        healthOfflineSuppressesEverything();
         emptyJsonRaises();
         malformedJsonRaises();
         nonObjectRootRaises();
-        eventMsParsedAsLong();
-        bucketEnteredMsParsedAsLong();
-        changedFlagParsesTrueAndFalse();
-        healthOfflineSuppressesKind();
-        healthErrorSuppressesKind();
-        eligibleFlagParsesTrue();
-        eligibleFlagParsesFalseExplicit();
-        missingEligibleFieldDefaultsFalseForSafety();
-        blockedReasonAndEventMsSourceParse();
-        paxEnterDecisionOverridesTrendSignalForMarker();
-        paxWaitDoesNotOverrideTrendSignal();
+
         System.out.println("PaxTrendSignalSnapshotParserTest OK");
     }
 
-    private static void eligibleFlagParsesTrue() {
-        String body = ""
-                + "{\"health\":\"ok\",\"trend_signal\":{"
-                + "\"kind\":\"STRONG_BULL\",\"mid\":21800.0,\"eventMs\":1,"
-                + "\"eligible\":true,\"blockedReason\":\"\","
-                + "\"eventMsSource\":\"trend_analyzer\""
-                + "}}";
+    // ─── Institutional-signal happy paths ──────────────────────────────────
+
+    private static void payLongFullMapsToStrongBull() {
+        String body = baseSnap(insSignal(
+                "NQM6.CME@RITHMIC|OR-H|above|1779385351000",
+                "LONG", "ACCEPTANCE_LONG", "PAY_FOR_TRADE",
+                "FULL", 0.80, 20000.0, 1779385351000L));
+        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 9999L);
+        if (m.kind != PaxTrendSignalModel.Kind.STRONG_BULL) {
+            throw new AssertionError("PAY LONG FULL must map to STRONG_BULL; got " + m.kind);
+        }
+        if (!m.eligible) throw new AssertionError("institutional marker must be eligible");
+    }
+
+    private static void payLongHalfMapsToWeakBull() {
+        String body = baseSnap(insSignal(
+                "id1", "LONG", "ACCEPTANCE_LONG", "PAY_FOR_TRADE",
+                "HALF", 0.45, 20000.0, 1779385351000L));
         PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
-        if (!m.eligible) throw new AssertionError("eligible=true must parse as true");
-        if (!"trend_analyzer".equals(m.eventMsSource))
-            throw new AssertionError("eventMsSource must round-trip; got " + m.eventMsSource);
+        if (m.kind != PaxTrendSignalModel.Kind.WEAK_BULL) {
+            throw new AssertionError("PAY LONG HALF must map to WEAK_BULL; got " + m.kind);
+        }
     }
 
-    private static void eligibleFlagParsesFalseExplicit() {
-        String body = ""
-                + "{\"health\":\"ok\",\"trend_signal\":{"
-                + "\"kind\":\"STRONG_BULL\",\"mid\":21800.0,\"eventMs\":1,"
-                + "\"eligible\":false,\"blockedReason\":\"invalid_mid\""
-                + "}}";
+    private static void payLongHighConfidenceMapsToStrongBull() {
+        // HALF size_tier but confidence >= 0.70 still escalates to STRONG.
+        String body = baseSnap(insSignal(
+                "id1", "LONG", "ACCEPTANCE_LONG", "PAY_FOR_TRADE",
+                "HALF", 0.72, 20000.0, 1779385351000L));
         PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
-        if (m.eligible) throw new AssertionError("eligible=false must parse as false");
-        if (!"invalid_mid".equals(m.blockedReason))
-            throw new AssertionError("blockedReason must round-trip; got " + m.blockedReason);
+        if (m.kind != PaxTrendSignalModel.Kind.STRONG_BULL) {
+            throw new AssertionError("confidence>=0.70 must escalate to STRONG; got " + m.kind);
+        }
     }
 
-    private static void missingEligibleFieldDefaultsFalseForSafety() {
-        // Older / partial dashboard payloads omit `eligible` entirely. The
-        // safe default is FALSE — we must not accidentally render a
-        // triangle for a payload that hasn't been updated to the new
-        // contract.
-        String body = ""
-                + "{\"health\":\"ok\",\"trend_signal\":{"
-                + "\"kind\":\"STRONG_BULL\",\"mid\":21800.0,\"eventMs\":1"
-                + "}}";
+    private static void payShortFullMapsToStrongBear() {
+        String body = baseSnap(insSignal(
+                "id1", "SHORT", "ACCEPTANCE_SHORT", "PAY_FOR_TRADE",
+                "FULL", 0.80, 19950.0, 1779385351000L));
         PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
-        if (m.eligible)
-            throw new AssertionError("missing eligible field must default to FALSE for safety");
+        if (m.kind != PaxTrendSignalModel.Kind.STRONG_BEAR) {
+            throw new AssertionError("PAY SHORT FULL must map to STRONG_BEAR; got " + m.kind);
+        }
     }
 
-    private static void blockedReasonAndEventMsSourceParse() {
-        String body = ""
-                + "{\"health\":\"ok\",\"trend_signal\":{"
-                + "\"kind\":\"NONE\",\"mid\":null,"
-                + "\"blockedReason\":\"invalid_mid\","
-                + "\"eventMsSource\":\"wall_clock_fallback\""
-                + "}}";
+    private static void payShortHalfMapsToWeakBear() {
+        String body = baseSnap(insSignal(
+                "id1", "SHORT", "REJECTION_SHORT", "PAY_FOR_TRADE",
+                "HALF", 0.40, 20000.0, 1779385351000L));
         PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
-        if (!"invalid_mid".equals(m.blockedReason))
-            throw new AssertionError("blockedReason mismatch: " + m.blockedReason);
-        if (!"wall_clock_fallback".equals(m.eventMsSource))
-            throw new AssertionError("eventMsSource mismatch: " + m.eventMsSource);
+        if (m.kind != PaxTrendSignalModel.Kind.WEAK_BEAR) {
+            throw new AssertionError("PAY SHORT HALF must map to WEAK_BEAR; got " + m.kind);
+        }
     }
 
-    private static void paxEnterDecisionOverridesTrendSignalForMarker() {
-        String body = ""
-                + "{\"health\":\"ok\",\"alias\":\"NQM6.CME@RITHMIC\","
-                + "\"pax\":{\"decision\":\"ENTER_SHORT_FADE\",\"size_tier\":\"FULL\","
-                + "\"level_label\":\"+1\",\"entry\":28998.5},"
-                + "\"trend_signal\":{\"kind\":\"NONE\",\"mid\":28970.0,\"eligible\":false}"
-                + "}";
-        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1000L);
-        if (m.kind != PaxTrendSignalModel.Kind.STRONG_BEAR)
-            throw new AssertionError("Pax ENTER_SHORT/FULL must map to STRONG_BEAR, got " + m.kind);
-        if (!m.eligible)
-            throw new AssertionError("Pax ENTER marker must be eligible");
-        if (Math.abs(m.mid - 28998.5) > 1e-9)
-            throw new AssertionError("Pax marker must use entry price");
-        if (!"pax_decision".equals(m.eventMsSource))
-            throw new AssertionError("Pax marker source mismatch: " + m.eventMsSource);
-    }
-
-    private static void paxWaitDoesNotOverrideTrendSignal() {
-        String body = ""
-                + "{\"health\":\"ok\","
-                + "\"pax\":{\"decision\":\"WAIT\",\"size_tier\":\"NONE\",\"entry\":0},"
-                + "\"trend_signal\":{\"kind\":\"WEAK_BEAR\",\"mid\":28970.0,"
-                + "\"eventMs\":2,\"eligible\":true}"
-                + "}";
-        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1000L);
-        if (m.kind != PaxTrendSignalModel.Kind.WEAK_BEAR)
-            throw new AssertionError("Pax WAIT must not override trend signal");
-    }
-
-    private static void healthOfflineSuppressesKind() {
-        // Even if a trend_signal block somehow appears alongside an offline
-        // health, the parser must refuse to surface it.
-        String body = ""
-                + "{"
-                + "\"health\":\"offline\","
-                + "\"trend_signal\":{\"kind\":\"STRONG_BULL\",\"mid\":21800.0,\"eventMs\":1}"
-                + "}";
+    private static void signalPriceBecomesModelMid() {
+        String body = baseSnap(insSignal(
+                "id1", "LONG", "ACCEPTANCE_LONG", "PAY_FOR_TRADE",
+                "FULL", 0.80, 20007.25, 1779385351000L));
         PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
-        if (m.kind != PaxTrendSignalModel.Kind.NONE)
-            throw new AssertionError("health=offline must hard-gate kind to NONE, got " + m.kind);
+        if (Math.abs(m.mid - 20007.25) > 1e-9) {
+            throw new AssertionError("signal.price must become model.mid; got " + m.mid);
+        }
     }
 
-    private static void healthErrorSuppressesKind() {
-        String body = "{\"health\":\"error\",\"trend_signal\":{\"kind\":\"WEAK_BEAR\"}}";
+    private static void signalTimestampMsBecomesEventMs() {
+        String body = baseSnap(insSignal(
+                "id1", "LONG", "ACCEPTANCE_LONG", "PAY_FOR_TRADE",
+                "FULL", 0.80, 20000.0, 1779385351999L));
         PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
-        if (m.kind != PaxTrendSignalModel.Kind.NONE)
-            throw new AssertionError("health=error must produce NONE, got " + m.kind);
+        if (m.eventMs != 1779385351999L) {
+            throw new AssertionError("signal.timestamp_ms must become eventMs; got " + m.eventMs);
+        }
     }
 
-    private static void parsesStrongBullHappyPath() {
-        String body = ""
-                + "{"
-                + "\"trend_signal\":{"
-                + "\"kind\":\"STRONG_BULL\","
-                + "\"alias\":\"NQM6.CME@RITHMIC\","
-                + "\"asOfMs\":1747680123999,"
-                + "\"eventMs\":1747680123456,"
-                + "\"mid\":21800.25,"
-                + "\"bucketEnteredMs\":1747680113000,"
-                + "\"changedSinceLastTick\":true"
-                + "}"
-                + "}";
-        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 5000L);
-        if (m.kind != PaxTrendSignalModel.Kind.STRONG_BULL)
-            throw new AssertionError("expected STRONG_BULL, got " + m.kind);
-        if (!"NQM6.CME@RITHMIC".equals(m.alias))
-            throw new AssertionError("alias mismatch");
-        if (Math.abs(m.mid - 21800.25) > 1e-9)
-            throw new AssertionError("mid mismatch");
-        if (m.eventMs != 1747680123456L)
-            throw new AssertionError("eventMs mismatch");
-        if (m.bucketEnteredMs != 1747680113000L)
-            throw new AssertionError("bucketEnteredMs mismatch");
-        if (!m.changed)
-            throw new AssertionError("changed flag mismatch");
-        if (m.fetchedAtMs != 5000L)
-            throw new AssertionError("fetchedAtMs should be passed through");
+    private static void signalIdDrivesBucketEnteredMs() {
+        String idA = "NQM6.CME@RITHMIC|OR-H|above|111";
+        String idB = "NQM6.CME@RITHMIC|OR-H|above|222";
+        PaxTrendSignalModel a = PaxTrendSignalSnapshotParser.parse(baseSnap(insSignal(
+                idA, "LONG", "ACCEPTANCE_LONG", "PAY_FOR_TRADE",
+                "FULL", 0.80, 20000.0, 1000L)), 1L);
+        PaxTrendSignalModel b = PaxTrendSignalSnapshotParser.parse(baseSnap(insSignal(
+                idB, "LONG", "ACCEPTANCE_LONG", "PAY_FOR_TRADE",
+                "FULL", 0.80, 20000.0, 1000L)), 1L);
+        if (a.bucketEnteredMs == b.bucketEnteredMs) {
+            throw new AssertionError("distinct signal ids must yield distinct buckets");
+        }
+        // Same id -> same bucket.
+        PaxTrendSignalModel aRepeat = PaxTrendSignalSnapshotParser.parse(baseSnap(insSignal(
+                idA, "LONG", "ACCEPTANCE_LONG", "PAY_FOR_TRADE",
+                "FULL", 0.80, 20000.0, 2000L)), 1L);
+        if (aRepeat.bucketEnteredMs != a.bucketEnteredMs) {
+            throw new AssertionError("same id must yield same bucket across polls");
+        }
     }
 
-    private static void parsesWeakBearHappyPath() {
-        String body = "{\"trend_signal\":{\"kind\":\"WEAK_BEAR\",\"mid\":21800.0,\"eventMs\":1}}";
+    private static void eventMsSourceIsInstitutionalSignal() {
+        String body = baseSnap(insSignal(
+                "id1", "LONG", "ACCEPTANCE_LONG", "PAY_FOR_TRADE",
+                "FULL", 0.80, 20000.0, 1000L));
         PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
-        if (m.kind != PaxTrendSignalModel.Kind.WEAK_BEAR)
-            throw new AssertionError("expected WEAK_BEAR");
+        if (!"institutional_signal".equals(m.eventMsSource)) {
+            throw new AssertionError("eventMsSource must be 'institutional_signal'; got " + m.eventMsSource);
+        }
     }
 
-    private static void missingTrendSignalReturnsNone() {
-        // Real-world: dashboard ran but conviction failed → trend_signal is null/missing.
-        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse("{\"conviction\":null}", 1L);
-        if (m.kind != PaxTrendSignalModel.Kind.NONE)
-            throw new AssertionError("missing trend_signal must default to NONE");
-    }
+    // ─── Suppression rules ────────────────────────────────────────────────
 
-    private static void unknownKindReturnsNone() {
-        String body = "{\"trend_signal\":{\"kind\":\"WHATEVER\"}}";
+    private static void waitForConfirmProducesNone() {
+        String body = baseSnap(insSignal(
+                "id1", "NONE", "STOP_SWEEP_LONG", "WAIT_FOR_CONFIRM",
+                "NONE", 0.35, 20000.0, 1000L));
         PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
-        if (m.kind != PaxTrendSignalModel.Kind.NONE)
-            throw new AssertionError("unknown kind must default to NONE");
+        if (m.kind != PaxTrendSignalModel.Kind.NONE) {
+            throw new AssertionError("WAIT_FOR_CONFIRM must yield NONE; got " + m.kind);
+        }
     }
 
-    private static void nullMidIsHandled() {
-        String body = "{\"trend_signal\":{\"kind\":\"STRONG_BULL\",\"mid\":null}}";
+    private static void standDownProducesNone() {
+        String body = baseSnap(insSignal(
+                "id1", "NONE", "ICEBERG_DEFENSE", "STAND_DOWN",
+                "NONE", 0.80, 20000.0, 1000L));
         PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
-        if (!Double.isNaN(m.mid))
-            throw new AssertionError("null mid must surface as NaN");
-        if (m.kind != PaxTrendSignalModel.Kind.STRONG_BULL)
-            throw new AssertionError("kind preserved when mid is null");
+        if (m.kind != PaxTrendSignalModel.Kind.NONE) {
+            throw new AssertionError("STAND_DOWN must yield NONE");
+        }
+    }
+
+    private static void scratchReadyProducesNone() {
+        String body = baseSnap(insSignal(
+                "id1", "NONE", "SCRATCH", "SCRATCH_READY",
+                "NONE", 0.55, 20000.0, 1000L));
+        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
+        if (m.kind != PaxTrendSignalModel.Kind.NONE) {
+            throw new AssertionError("SCRATCH_READY must yield NONE");
+        }
+    }
+
+    private static void directionNoneProducesNone() {
+        String body = baseSnap(insSignal(
+                "id1", "NONE", "ACCEPTANCE_LONG", "PAY_FOR_TRADE",
+                "FULL", 0.80, 20000.0, 1000L));
+        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
+        // execution_read PAY_FOR_TRADE but direction=NONE must not produce a kind.
+        if (m.kind != PaxTrendSignalModel.Kind.NONE) {
+            throw new AssertionError("direction=NONE must yield NONE; got " + m.kind);
+        }
+    }
+
+    private static void emptyInstitutionalSignalsProducesNone() {
+        String body = "{\"health\":\"ok\",\"institutional_signals\":[]}";
+        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
+        if (m.kind != PaxTrendSignalModel.Kind.NONE) {
+            throw new AssertionError("empty institutional_signals must yield NONE");
+        }
+    }
+
+    private static void missingInstitutionalSignalsProducesNone() {
+        String body = "{\"health\":\"ok\"}";
+        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
+        if (m.kind != PaxTrendSignalModel.Kind.NONE) {
+            throw new AssertionError("missing institutional_signals must yield NONE");
+        }
+    }
+
+    // ─── Hard no-fallback rules ───────────────────────────────────────────
+
+    private static void trendSignalStrongBullAloneProducesNone() {
+        String body = "{\"health\":\"ok\",\"trend_signal\":"
+                + "{\"kind\":\"STRONG_BULL\",\"mid\":20000.0,\"eventMs\":1,\"eligible\":true}}";
+        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
+        if (m.kind != PaxTrendSignalModel.Kind.NONE) {
+            throw new AssertionError("trend_signal alone must NOT produce a kind; got " + m.kind);
+        }
+    }
+
+    private static void paxDecisionEnterLongAloneProducesNone() {
+        String body = "{\"health\":\"ok\",\"alias\":\"NQM6.CME@RITHMIC\","
+                + "\"pax\":{\"decision\":\"ENTER_LONG_FOLLOW\",\"size_tier\":\"FULL\","
+                + "\"level_label\":\"OR-H\",\"entry\":20000.0}}";
+        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
+        if (m.kind != PaxTrendSignalModel.Kind.NONE) {
+            throw new AssertionError("pax.decision alone must NOT produce a kind; got " + m.kind);
+        }
+    }
+
+    private static void bothTrendAndPaxWithoutInstitutionalProducesNone() {
+        String body = "{\"health\":\"ok\",\"alias\":\"NQM6.CME@RITHMIC\","
+                + "\"trend_signal\":{\"kind\":\"STRONG_BULL\",\"mid\":20000.0,\"eventMs\":1,\"eligible\":true},"
+                + "\"pax\":{\"decision\":\"ENTER_LONG_FOLLOW\",\"size_tier\":\"FULL\","
+                + "\"level_label\":\"OR-H\",\"entry\":20000.0}}";
+        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
+        if (m.kind != PaxTrendSignalModel.Kind.NONE) {
+            throw new AssertionError("trend+pax without institutional must yield NONE; got " + m.kind);
+        }
+    }
+
+    // ─── Multi-signal selection ───────────────────────────────────────────
+
+    private static void mostRecentPayForTradeWins() {
+        // Two PAY_FOR_TRADE entries: SHORT older, LONG newer. LONG should win.
+        String shortSig = insSignal("idShort", "SHORT", "REJECTION_SHORT",
+                "PAY_FOR_TRADE", "FULL", 0.80, 19950.0, 1000L);
+        String longSig = insSignal("idLong", "LONG", "ACCEPTANCE_LONG",
+                "PAY_FOR_TRADE", "FULL", 0.80, 20007.25, 2000L);
+        String body = "{\"health\":\"ok\",\"institutional_signals\":["
+                + shortSig + "," + longSig + "]}";
+        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
+        if (m.kind != PaxTrendSignalModel.Kind.STRONG_BULL) {
+            throw new AssertionError("most-recent PAY must win; got " + m.kind);
+        }
+        if (Math.abs(m.mid - 20007.25) > 1e-9) {
+            throw new AssertionError("winning signal's price must be model.mid; got " + m.mid);
+        }
+    }
+
+    private static void nonPayEntriesAreSkipped() {
+        String waiting = insSignal("idWait", "NONE", "STOP_SWEEP_LONG",
+                "WAIT_FOR_CONFIRM", "NONE", 0.35, 20000.0, 5000L);
+        String pay = insSignal("idPay", "LONG", "ACCEPTANCE_LONG",
+                "PAY_FOR_TRADE", "FULL", 0.80, 20007.25, 1000L);
+        String body = "{\"health\":\"ok\",\"institutional_signals\":["
+                + waiting + "," + pay + "]}";
+        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
+        if (m.kind != PaxTrendSignalModel.Kind.STRONG_BULL) {
+            throw new AssertionError("non-PAY entries must be skipped; got " + m.kind);
+        }
+        if (Math.abs(m.mid - 20007.25) > 1e-9) {
+            throw new AssertionError("PAY signal price must win, not WAIT signal price; got " + m.mid);
+        }
+    }
+
+    // ─── Safety ───────────────────────────────────────────────────────────
+
+    private static void missingPriceProducesNone() {
+        String body = "{\"health\":\"ok\",\"institutional_signals\":["
+                + "{\"id\":\"id1\",\"direction\":\"LONG\",\"signal_type\":\"ACCEPTANCE_LONG\","
+                + "\"execution_read\":\"PAY_FOR_TRADE\",\"size_tier\":\"FULL\","
+                + "\"confidence\":0.80,\"timestamp_ms\":1000}"
+                + "]}";
+        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
+        if (m.kind != PaxTrendSignalModel.Kind.NONE) {
+            throw new AssertionError("missing price must yield NONE; got " + m.kind);
+        }
+    }
+
+    private static void nonNumericPriceProducesNone() {
+        String body = "{\"health\":\"ok\",\"institutional_signals\":["
+                + "{\"id\":\"id1\",\"direction\":\"LONG\",\"signal_type\":\"ACCEPTANCE_LONG\","
+                + "\"execution_read\":\"PAY_FOR_TRADE\",\"size_tier\":\"FULL\","
+                + "\"confidence\":0.80,\"price\":null,\"timestamp_ms\":1000}"
+                + "]}";
+        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
+        if (m.kind != PaxTrendSignalModel.Kind.NONE) {
+            throw new AssertionError("null price must yield NONE; got " + m.kind);
+        }
+    }
+
+    private static void healthOfflineSuppressesEverything() {
+        String body = "{\"health\":\"offline\",\"institutional_signals\":["
+                + insSignal("id1", "LONG", "ACCEPTANCE_LONG", "PAY_FOR_TRADE",
+                        "FULL", 0.80, 20000.0, 1000L) + "]}";
+        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
+        if (m.kind != PaxTrendSignalModel.Kind.NONE) {
+            throw new AssertionError("health!=ok must yield NONE; got " + m.kind);
+        }
     }
 
     private static void emptyJsonRaises() {
         try {
             PaxTrendSignalSnapshotParser.parse("", 1L);
             throw new AssertionError("expected ParseException on empty input");
-        } catch (PaxTrendSignalSnapshotParser.ParseException expected) {
-            // ok
-        }
+        } catch (PaxTrendSignalSnapshotParser.ParseException expected) { /* ok */ }
     }
 
     private static void malformedJsonRaises() {
         try {
             PaxTrendSignalSnapshotParser.parse("{not valid", 1L);
             throw new AssertionError("expected ParseException on malformed");
-        } catch (PaxTrendSignalSnapshotParser.ParseException expected) {
-            // ok
-        }
+        } catch (PaxTrendSignalSnapshotParser.ParseException expected) { /* ok */ }
     }
 
     private static void nonObjectRootRaises() {
         try {
             PaxTrendSignalSnapshotParser.parse("[]", 1L);
             throw new AssertionError("expected ParseException on non-object root");
-        } catch (PaxTrendSignalSnapshotParser.ParseException expected) {
-            // ok
-        }
+        } catch (PaxTrendSignalSnapshotParser.ParseException expected) { /* ok */ }
     }
 
-    private static void eventMsParsedAsLong() {
-        String body = "{\"trend_signal\":{\"kind\":\"STRONG_BULL\",\"eventMs\":1747680123456}}";
-        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
-        if (m.eventMs != 1747680123456L)
-            throw new AssertionError("eventMs must be parsed as long, got " + m.eventMs);
+    // ─── Builders ─────────────────────────────────────────────────────────
+
+    private static String insSignal(String id, String direction, String signalType,
+                                     String executionRead, String sizeTier,
+                                     double confidence, double price, long timestampMs) {
+        return "{"
+                + "\"id\":\"" + id + "\","
+                + "\"alias\":\"NQM6.CME@RITHMIC\","
+                + "\"label\":\"OR-H\","
+                + "\"price\":" + price + ","
+                + "\"side\":\"above\","
+                + "\"direction\":\"" + direction + "\","
+                + "\"signal_type\":\"" + signalType + "\","
+                + "\"execution_read\":\"" + executionRead + "\","
+                + "\"confidence\":" + confidence + ","
+                + "\"size_tier\":\"" + sizeTier + "\","
+                + "\"timestamp_ms\":" + timestampMs
+                + "}";
     }
 
-    private static void bucketEnteredMsParsedAsLong() {
-        String body = "{\"trend_signal\":{\"kind\":\"STRONG_BULL\",\"bucketEnteredMs\":1747680113000}}";
-        PaxTrendSignalModel m = PaxTrendSignalSnapshotParser.parse(body, 1L);
-        if (m.bucketEnteredMs != 1747680113000L)
-            throw new AssertionError("bucketEnteredMs mismatch, got " + m.bucketEnteredMs);
-    }
-
-    private static void changedFlagParsesTrueAndFalse() {
-        PaxTrendSignalModel a = PaxTrendSignalSnapshotParser.parse(
-                "{\"trend_signal\":{\"kind\":\"WEAK_BULL\",\"changedSinceLastTick\":true}}", 1L);
-        if (!a.changed) throw new AssertionError("changed=true mismatch");
-        PaxTrendSignalModel b = PaxTrendSignalSnapshotParser.parse(
-                "{\"trend_signal\":{\"kind\":\"WEAK_BULL\",\"changedSinceLastTick\":false}}", 1L);
-        if (b.changed) throw new AssertionError("changed=false mismatch");
-        PaxTrendSignalModel c = PaxTrendSignalSnapshotParser.parse(
-                "{\"trend_signal\":{\"kind\":\"WEAK_BULL\"}}", 1L);
-        if (c.changed) throw new AssertionError("missing changed must default to false");
+    private static String baseSnap(String singleSignal) {
+        return "{\"health\":\"ok\",\"alias\":\"NQM6.CME@RITHMIC\","
+                + "\"institutional_signals\":[" + singleSignal + "]}";
     }
 }

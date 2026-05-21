@@ -13,18 +13,26 @@ import com.sun.net.httpserver.HttpServer;
 
 public class PaxTrendSignalFetcherTest {
 
+    // The parser's authoritative source is now snap["institutional_signals"].
+    // This fixture mirrors a PAY_FOR_TRADE LONG entry at OR-H so the fetcher
+    // path round-trips a STRONG_BULL kind.
     private static final String VALID_BODY = ""
             + "{"
-            + "\"trend_signal\":{"
-            + "\"kind\":\"STRONG_BULL\","
+            + "\"health\":\"ok\","
             + "\"alias\":\"NQM6.CME@RITHMIC\","
-            + "\"asOfMs\":1747680123999,"
-            + "\"eventMs\":1747680123456,"
-            + "\"mid\":21800.25,"
-            + "\"bucketEnteredMs\":1747680113000,"
-            + "\"changedSinceLastTick\":true"
-            + "}"
-            + "}";
+            + "\"institutional_signals\":[{"
+            + "\"id\":\"NQM6.CME@RITHMIC|OR-H|above|1747680123456\","
+            + "\"alias\":\"NQM6.CME@RITHMIC\","
+            + "\"label\":\"OR-H\","
+            + "\"price\":21800.25,"
+            + "\"side\":\"above\","
+            + "\"direction\":\"LONG\","
+            + "\"signal_type\":\"ACCEPTANCE_LONG\","
+            + "\"execution_read\":\"PAY_FOR_TRADE\","
+            + "\"confidence\":0.80,"
+            + "\"size_tier\":\"FULL\","
+            + "\"timestamp_ms\":1747680123456"
+            + "}]}";
 
     public static void main(String[] args) throws Exception {
         successSwapsLatestAndFiresCallback();

@@ -43,8 +43,8 @@ SETTINGS_DEFAULTS: Dict[str, Any] = {
     "eod_close_hour_ct":                15,
 
     # Pax decision / risk gates
-    "pax_confidence_floor":             0.35,
-    "pax_confidence_full":              0.50,
+    "pax_confidence_floor":             0.55,
+    "pax_confidence_full":              0.70,
     "pax_min_or_width_pts":             3.0,
     "pax_max_or_width_pts":             25.0,
     "pax_bias_agreement_boost":         0.10,

@@ -30,14 +30,14 @@ public class PaxOpeningRangeUiSettings {
     public int mainLineWidth = 3;
     public int levelLineWidth = 2;
     public int fontSize = 16;
-    public int signalCvdThreshold = 1;
-    public int signalDepthThreshold = 1;
+    public int signalCvdThreshold = 25;
+    public int signalDepthThreshold = 25;
     public int signalDepthLevels = 10;
-    public int signalMinBreakoutTicks = 0;
-    public int signalMaxBreakoutTicks = 0;
-    public int signalMinScore = 3;
-    public int signalMinCvdPercentile = 70;
-    public int signalMinPullingStackingPercentile = 70;
+    public int signalMinBreakoutTicks = 2;
+    public int signalMaxBreakoutTicks = 80;
+    public int signalMinScore = 4;
+    public int signalMinCvdPercentile = 80;
+    public int signalMinPullingStackingPercentile = 80;
     public boolean signalBlockCrossMarketDivergence = true;
     public int normalizationWindowSeconds = 120;
     public String logDirectory = "build\\logs";
@@ -50,11 +50,27 @@ public class PaxOpeningRangeUiSettings {
     public int heatwavePollMs = 1000;
     public String heatwaveUrl = "http://127.0.0.1:18888/api/snapshot";
 
-    /** Show conviction-driven trend triangles on the chart. Triangles are
-     * derived from snap["trend_signal"] (a projection of the composite
-     * conviction), so they reflect the dashboard's full weighted ensemble,
-     * not TrendAnalyzer alone. */
+    /** Show institutional-signal triangles on the chart. Triangles are now
+     * driven by snap["institutional_signals"] PAY_FOR_TRADE entries
+     * (level-anchored at OR-H/OR-L/extensions). Legacy trend_signal and
+     * pax.decision sources are no longer consulted for entry markers — the
+     * parser returns NONE when no institutional PAY_FOR_TRADE signal exists.
+     * Set false to disable the institutional triangle layer entirely. */
     public boolean showTrendTriangles = true;
+
+    /** Suppress the native OR breakout marker publisher (CVD/depth-driven
+     * LONG/SHORT engine markers). Default ON — native markers are the
+     * "buy in the middle of the OR" source the institutional pipeline
+     * replaces. Set false to restore legacy behavior for debugging. */
+    public boolean gateNativeMarkersOnInstitutional = true;
+
+    /** Show the full institutional chart-events evidence trail on the
+     * Bookmap chart: sweeps (SWP), absorption (ABS), iceberg defense
+     * (ICE), spoof risk (SPD), pull/stack context (PULL/STACK),
+     * watch/touch (WATCH/TCH), and confirmed acceptance/rejection
+     * entries (ACC/REJ). Driven by snap["institutional_chart_events"];
+     * spec: docs/superpowers/specs/institutional-chart-markers.md. */
+    public boolean showInstitutionalChartEvents = true;
 
     public PaxOpeningRangeSettings toCalculatorSettings() {
         return new PaxOpeningRangeSettings(

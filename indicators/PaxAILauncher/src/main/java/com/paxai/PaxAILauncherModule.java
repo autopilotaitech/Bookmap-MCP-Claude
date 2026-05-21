@@ -4,10 +4,13 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 import velox.api.layer1.Layer1ApiAdminAdapter;
 import velox.api.layer1.Layer1ApiFinishable;
+import velox.api.layer1.Layer1ApiInstrumentSpecificEnabledStateProvider;
 import velox.api.layer1.Layer1ApiProvider;
 import velox.api.layer1.annotations.Layer1ApiVersion;
 import velox.api.layer1.annotations.Layer1ApiVersionValue;
@@ -41,10 +44,12 @@ import velox.api.layer1.common.Log;
 @Layer1ApiVersion(Layer1ApiVersionValue.VERSION2)
 public class PaxAILauncherModule implements
         Layer1ApiAdminAdapter,
-        Layer1ApiFinishable {
+        Layer1ApiFinishable,
+        Layer1ApiInstrumentSpecificEnabledStateProvider {
 
     private static final Object LIFECYCLE_LOCK = new Object();
     private static volatile Process PAX_AI_PROCESS = null;
+    private static final Set<String> ENABLED_ALIASES = ConcurrentHashMap.newKeySet();
 
     static final String DEFAULT_PYTHON =
         "C:\\Bookmap\\addons\\MCP\\Bookmap\\mcp-server\\.venv\\Scripts\\python.exe";
@@ -56,12 +61,35 @@ public class PaxAILauncherModule implements
     public PaxAILauncherModule(Layer1ApiProvider provider) {
         this.provider = provider;
         ListenableHelper.addListeners(provider, this);
-        startPaxAi();
     }
 
     @Override
     public void finish() {
+        ENABLED_ALIASES.clear();
         stopPaxAi();
+    }
+
+    @Override
+    public void onStrategyCheckboxEnabled(String alias, boolean isEnabled) {
+        if (alias == null) {
+            return;
+        }
+        if (isEnabled) {
+            ENABLED_ALIASES.add(alias);
+            startPaxAi();
+        } else {
+            ENABLED_ALIASES.remove(alias);
+            if (ENABLED_ALIASES.isEmpty()) {
+                stopPaxAi();
+            } else {
+                logInfo("Pax AI remains running for enabled aliases=" + ENABLED_ALIASES);
+            }
+        }
+    }
+
+    @Override
+    public boolean isStrategyEnabled(String alias) {
+        return alias != null && ENABLED_ALIASES.contains(alias);
     }
 
     // --------------------------------------------------------------------

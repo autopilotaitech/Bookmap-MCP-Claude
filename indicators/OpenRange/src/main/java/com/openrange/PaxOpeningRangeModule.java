@@ -39,6 +39,7 @@ import velox.api.layer1.Layer1ApiAdminAdapter;
 import velox.api.layer1.Layer1ApiDataAdapter;
 import velox.api.layer1.Layer1ApiFinishable;
 import velox.api.layer1.Layer1ApiInstrumentAdapter;
+import velox.api.layer1.Layer1ApiInstrumentSpecificEnabledStateProvider;
 import velox.api.layer1.Layer1ApiProvider;
 import velox.api.layer1.Layer1CustomPanelsGetter;
 import velox.api.layer1.annotations.Layer1ApiVersion;
@@ -92,6 +93,7 @@ public class PaxOpeningRangeModule implements
         Layer1ApiAdminAdapter,
         Layer1ApiDataAdapter,
         Layer1ApiInstrumentAdapter,
+        Layer1ApiInstrumentSpecificEnabledStateProvider,
         ScreenSpacePainterFactory,
         Layer1CustomPanelsGetter,
         Layer1ConfigSettingsInterface {
@@ -186,6 +188,33 @@ public class PaxOpeningRangeModule implements
     }
 
     static final int MAX_LIVE_TRIANGLES = 8;
+    /** Max institutional markers held in the durable history. The history is
+     *  append-only across polls — empty institutional_signals on a later
+     *  poll does NOT remove plotted markers, so this cap is what eventually
+     *  rolls the oldest off the chart. */
+    static final int MAX_LIVE_INSTITUTIONAL_MARKERS = 30;
+    /** Max chart-events markers (the broader evidence-trail layer) held in
+     *  durable per-instrument history. Bigger cap than entry markers since
+     *  WATCH / TCH / SWP / ABS / ICE / SPD / PULL / STACK accumulate
+     *  faster than confirmed entries. */
+    static final int MAX_LIVE_CHART_EVENT_MARKERS = 50;
+
+    /** Decide whether the /api/snapshot fetcher worker should be running.
+     *
+     *  <p>Historically the fetcher was gated on {@code showTrendTriangles}
+     *  alone. That broke the institutional-chart-events pipeline: if the
+     *  operator toggled trend triangles off, the fetcher stopped polling
+     *  and the new chart-events layer received no data either. Both UI
+     *  layers consume the same /api/snapshot; either being on means the
+     *  fetcher must run.</p>
+     *
+     *  Pure static so the OR logic is unit-testable without spinning up
+     *  the full module / HttpClient.
+     */
+    static boolean trendFetcherShouldRun(boolean showTrendTriangles,
+                                          boolean showInstitutionalChartEvents) {
+        return showTrendTriangles || showInstitutionalChartEvents;
+    }
     /** Stale-cliff for incoming trend_signal: keep existing triangles drawn,
      * but do not emit new ones if the fetcher's last successful HTTP receive
      * is older than this. */
@@ -194,6 +223,11 @@ public class PaxOpeningRangeModule implements
      * sizes are distinguishable at the same price. */
     static final int TRIANGLE_OFFSET_TICKS_STRONG = 4;
     static final int TRIANGLE_OFFSET_TICKS_WEAK = 2;
+    /** Chart-event labels collide visually when their prices are within a few
+     *  ticks and their timestamps land on the same rendered chart column.
+     *  Bucket by this many ticks so different marker texts at the same level
+     *  stack instead of painting on top of each other. */
+    static final int CHART_EVENT_COLLISION_PRICE_TICKS = 8;
 
     /** Immutable in-flight triangle event held by PaxPainter for redraw. */
     static final class TrendTriangleEvent {
@@ -243,7 +277,9 @@ public class PaxOpeningRangeModule implements
 
     private final Layer1ApiProvider provider;
     private final Map<String, InstrumentState> instruments = new ConcurrentHashMap<>();
+    private final Map<String, InstrumentInfo> knownInstruments = new ConcurrentHashMap<>();
     private final Map<String, PaxPainter> painters = new ConcurrentHashMap<>();
+    private final Set<String> enabledAliases = ConcurrentHashMap.newKeySet();
     private final Map<String, String> indicatorsFullNameToUserName = new HashMap<>();
     private final Map<String, String> markerIndicatorFullNameToUserName = new HashMap<>();
     private final PaxOpeningRangeCrossMarketState crossMarketState = new PaxOpeningRangeCrossMarketState();
@@ -288,6 +324,30 @@ public class PaxOpeningRangeModule implements
         painters.clear();
         instruments.values().forEach(InstrumentState::dispose);
         instruments.clear();
+        knownInstruments.clear();
+        enabledAliases.clear();
+    }
+
+    @Override
+    public void onStrategyCheckboxEnabled(String alias, boolean isEnabled) {
+        if (alias == null) {
+            return;
+        }
+        if (isEnabled) {
+            enabledAliases.add(alias);
+            InstrumentInfo info = knownInstruments.get(alias);
+            if (info != null) {
+                attachInstrumentIfEnabled(alias, info);
+            }
+        } else {
+            enabledAliases.remove(alias);
+            detachInstrument(alias);
+        }
+    }
+
+    @Override
+    public boolean isStrategyEnabled(String alias) {
+        return alias != null && enabledAliases.contains(alias);
     }
 
     boolean consumeHeatwaveDirty() {
@@ -315,6 +375,14 @@ public class PaxOpeningRangeModule implements
 
     @Override
     public void onInstrumentAdded(String alias, InstrumentInfo instrumentInfo) {
+        knownInstruments.put(alias, instrumentInfo);
+        attachInstrumentIfEnabled(alias, instrumentInfo);
+    }
+
+    private void attachInstrumentIfEnabled(String alias, InstrumentInfo instrumentInfo) {
+        if (!isStrategyEnabled(alias) || instrumentInfo == null || instruments.containsKey(alias)) {
+            return;
+        }
         double pips = instrumentInfo.pips <= 0 ? 1 : instrumentInfo.pips;
         InstrumentState state = new InstrumentState(alias, instrumentInfo, pips, getCalculatorSettings());
         instruments.put(alias, state);
@@ -327,6 +395,11 @@ public class PaxOpeningRangeModule implements
 
     @Override
     public void onInstrumentRemoved(String alias) {
+        knownInstruments.remove(alias);
+        detachInstrument(alias);
+    }
+
+    private void detachInstrument(String alias) {
         InstrumentState state = instruments.remove(alias);
         if (state != null) {
             crossMarketState.remove(state.info.symbol);
@@ -632,8 +705,14 @@ public class PaxOpeningRangeModule implements
                 }
                 return false;
             }
-            String source = signal.eventMsSource != null && signal.eventMsSource.startsWith("pax_decision")
-                    ? "PAX" : "TRD";
+            String source;
+            if (signal.eventMsSource != null && signal.eventMsSource.startsWith("institutional_signal")) {
+                source = "INS";
+            } else if (signal.eventMsSource != null && signal.eventMsSource.startsWith("pax_decision")) {
+                source = "PAX";
+            } else {
+                source = "TRD";
+            }
             BufferedImage icon = signalMarkerIcon(signal.kind, signal.mid, source);
             int xOffset = -icon.getWidth() / 2;
             int yOffset = signal.kind.isBull() ? 12 : -icon.getHeight() - 12;
@@ -670,9 +749,12 @@ public class PaxOpeningRangeModule implements
         // bridge) immediately see the effective anchor.
         PaxOpeningRangeSessionConfigWriter.publish(uiSettings);
         heatwave.applySettings(uiSettings);
-        // Trend triangles share the dashboard URL with the heatwave box —
-        // single source for the polled /api/snapshot endpoint.
-        trendSignals.applySettings(uiSettings.showTrendTriangles,
+        // The trend-signal fetcher feeds BOTH the legacy trend triangles
+        // AND the new institutional chart events. Run it whenever EITHER
+        // layer is enabled.
+        trendSignals.applySettings(
+                trendFetcherShouldRun(uiSettings.showTrendTriangles,
+                                       uiSettings.showInstitutionalChartEvents),
                 uiSettings.safeHeatwaveUrl(), uiSettings.clampedHeatwavePollMs());
     }
 
@@ -822,7 +904,18 @@ public class PaxOpeningRangeModule implements
         panel.add(showHeatwaveBox, c);
         c.gridwidth = 1;
 
-        JCheckBox showTrendTriangles = new JCheckBox("Show Trend Triangles (conviction)", settings.showTrendTriangles);
+        JCheckBox showInstitutionalChartEvents = new JCheckBox(
+                "Show Institutional Chart Events",
+                settings.showInstitutionalChartEvents);
+        c.gridx = 0;
+        c.gridy = row++;
+        c.gridwidth = 4;
+        panel.add(showInstitutionalChartEvents, c);
+        c.gridwidth = 1;
+
+        JCheckBox showTrendTriangles = new JCheckBox(
+                "Show Legacy Trend Triangles (conviction)",
+                settings.showTrendTriangles);
         c.gridx = 0;
         c.gridy = row++;
         c.gridwidth = 4;
@@ -877,6 +970,7 @@ public class PaxOpeningRangeModule implements
             settings.heatwavePollMs = (Integer) heatwavePollMs.getValue();
             settings.heatwaveUrl = heatwaveUrl.getText();
             settings.showTrendTriangles = showTrendTriangles.isSelected();
+            settings.showInstitutionalChartEvents = showInstitutionalChartEvents.isSelected();
             saveSettings(null, settings);
             rebuildCalculators();
         };
@@ -906,6 +1000,7 @@ public class PaxOpeningRangeModule implements
         showMid.addActionListener(e -> apply.run());
         showHeatwaveBox.addActionListener(e -> apply.run());
         showTrendTriangles.addActionListener(e -> apply.run());
+        showInstitutionalChartEvents.addActionListener(e -> apply.run());
         heatwaveUrl.addActionListener(e -> apply.run());
 
         return new StrategyPanel[] {panel};
@@ -936,18 +1031,48 @@ public class PaxOpeningRangeModule implements
         // within the next poll cycle.
         PaxOpeningRangeSessionConfigWriter.publish(settings);
         heatwave.applySettings(settings);
-        trendSignals.applySettings(settings.showTrendTriangles,
+        trendSignals.applySettings(
+                trendFetcherShouldRun(settings.showTrendTriangles,
+                                       settings.showInstitutionalChartEvents),
                 settings.safeHeatwaveUrl(), settings.clampedHeatwavePollMs());
     }
 
     private String diagnosticsText(String alias) {
         long nowNanos = safeCurrentTime();
         InstrumentState state = instruments.get(alias);
-        if (state == null) {
-            return PaxOpeningRangeDiagnostics.format(null, nowNanos, loadSettings().logDirectory);
-        }
-        return PaxOpeningRangeDiagnostics.format(state.featureCache, nowNanos,
-                state.signalLogger.file().toString());
+        String base = state == null
+                ? PaxOpeningRangeDiagnostics.format(null, nowNanos, loadSettings().logDirectory)
+                : PaxOpeningRangeDiagnostics.format(state.featureCache, nowNanos,
+                        state.signalLogger.file().toString());
+        return base + "\n\n" + chartEventsDiagnostics(state);
+    }
+
+    /** Operator-visible chart-events plumbing diagnostics. Surfaced inside
+     *  the strategy panel so the operator can see whether the fetcher is
+     *  running, what URL it points at, and how many events have flowed
+     *  into the durable history. */
+    private String chartEventsDiagnostics(InstrumentState state) {
+        PaxOpeningRangeUiSettings ui = loadSettings();
+        int latestChart = trendSignals.latestInstitutionalChartEvents().size();
+        int latestInst = trendSignals.latestInstitutionalEvents().size();
+        int historyChart = (state == null) ? 0 : state.chartEventMarkers.size();
+        int historyInst = (state == null) ? 0 : state.institutionalMarkers.size();
+        boolean fetcherWanted = trendFetcherShouldRun(
+                ui.showTrendTriangles, ui.showInstitutionalChartEvents);
+        StringBuilder sb = new StringBuilder(384);
+        sb.append("Chart events plumbing\n");
+        sb.append("  snapshot URL:                ").append(trendSignals.currentUrl()).append('\n');
+        sb.append("  fetcher running:             ").append(trendSignals.isRunning()).append('\n');
+        sb.append("  fetcher should run (OR):     ").append(fetcherWanted).append('\n');
+        sb.append("  showInstitutionalChartEvents:").append(ui.showInstitutionalChartEvents).append('\n');
+        sb.append("  showTrendTriangles (legacy): ").append(ui.showTrendTriangles).append('\n');
+        sb.append("  latest chart_events count:   ").append(latestChart).append('\n');
+        sb.append("  durable chart history count: ").append(historyChart).append('\n');
+        sb.append("  latest signals count:        ").append(latestInst).append('\n');
+        sb.append("  durable signals history:     ").append(historyInst).append('\n');
+        sb.append("  consecutive fetch failures:  ").append(trendSignals.consecutiveFailures()).append('\n');
+        sb.append("  last failure reason:         ").append(trendSignals.lastFailureReason());
+        return sb.toString();
     }
 
     private long safeCurrentTime() {
@@ -1034,6 +1159,16 @@ public class PaxOpeningRangeModule implements
         // so a full `clear()` + redraw on every repaint preserves the chart
         // across pans/zooms. Cap at 8 keeps the chart readable.
         final Deque<TrendTriangleEvent> liveTriangles = new ArrayDeque<>(MAX_LIVE_TRIANGLES + 1);
+        /** Durable institutional-signal marker history. Append-only across
+         *  polls; empty institutional_signals on a later poll does NOT
+         *  remove already-plotted markers. Cleared only on instrument
+         *  dispose / module restart. */
+        final PaxInstitutionalSignalsHistory institutionalMarkers =
+                new PaxInstitutionalSignalsHistory(MAX_LIVE_INSTITUTIONAL_MARKERS);
+        /** Durable chart-events history (the full evidence trail). Same
+         *  persistence contract as institutionalMarkers. */
+        final PaxInstitutionalChartEventsHistory chartEventMarkers =
+                new PaxInstitutionalChartEventsHistory(MAX_LIVE_CHART_EVENT_MARKERS);
         String lastEmittedKind = "";
         long lastEmittedBucketEnteredMs = 0L;
         String lastNativeSignalMarkerKey = "";
@@ -1121,6 +1256,14 @@ public class PaxOpeningRangeModule implements
         }
 
         private void publishNativeSignalMarkerIfNeeded(PaxOpeningRangeFeatureSnapshot snapshot) {
+            // Gate the legacy CVD/depth-driven native LONG/SHORT marker
+            // publisher. Default ON — institutional_signals is the
+            // authoritative buy/sell source on the chart. The UI flag is
+            // reversible for diagnostics.
+            PaxOpeningRangeUiSettings ui = uiSettings;
+            if (ui != null && PaxNativeMarkerGate.shouldSuppress(ui.gateNativeMarkersOnInstitutional)) {
+                return;
+            }
             String key = openingRangeMarkerKey(alias, snapshot);
             if (key.isEmpty() || key.equals(lastNativeSignalMarkerKey)) {
                 return;
@@ -1473,17 +1616,41 @@ public class PaxOpeningRangeModule implements
         private void updateTriangles(boolean force) {
             InstrumentState state = instruments.get(alias);
             if (state == null) return;
-            boolean show = loadSettings().showTrendTriangles;
+            PaxOpeningRangeUiSettings ui = loadSettings();
+            boolean showLegacy = ui.showTrendTriangles;
+            boolean showChartEvents = ui.showInstitutionalChartEvents;
             PaxTrendSignalModel signal = trendSignals.snapshot();
-            String renderKey = triangleRenderKey(show, signal,
+            // Merge unconditionally so new institutional ids land in history
+            // even when the renderKey would otherwise short-circuit. New ids
+            // bump sizes -> renderKey differs -> we fall through to
+            // clearTriangles + redraw. Empty polls add nothing -> key stable
+            // -> canvas preserved.
+            int newInst = state.institutionalMarkers.merge(trendSignals.latestInstitutionalEvents());
+            int newChart = state.chartEventMarkers.merge(trendSignals.latestInstitutionalChartEvents());
+            int instSize = state.institutionalMarkers.size();
+            int chartSize = state.chartEventMarkers.size();
+            String renderKey = triangleRenderKey(showLegacy, signal,
                     state.lastEmittedKind, state.lastEmittedBucketEnteredMs,
-                    state.liveTriangles.size());
+                    state.liveTriangles.size())
+                    + "|CE=" + showChartEvents
+                    + "|INS=" + instSize
+                    + (newInst > 0 ? "|+" + newInst : "")
+                    + "|CHE=" + chartSize
+                    + (newChart > 0 ? "|+" + newChart : "");
             if (!force && renderKey.equals(lastTriangleRenderKey)) {
                 return;
             }
             clearTriangles();
-            if (show) {
+            // Legacy trend triangles + institutional entry markers draw only
+            // when the legacy layer is on. Institutional chart events draw
+            // independently of the legacy layer — both gated by their own
+            // UI flag.
+            if (showLegacy) {
                 addTrendTriangles(state);
+                addInstitutionalMarkers(state);
+            }
+            if (showChartEvents) {
+                addInstitutionalChartEvents(state);
             }
             lastTriangleRenderKey = renderKey;
         }
@@ -1618,7 +1785,11 @@ public class PaxOpeningRangeModule implements
                 state.lastEmittedKind = signal.kind.name();
                 state.lastEmittedBucketEnteredMs = signal.bucketEnteredMs;
                 emitted = true;
-                nativeSignalMarkers.publishTrend(alias, state.pips, signal);
+                // No native consumer.accept here — Bookmap's native Marker
+                // path is one-shot and gets cleared by the chart layer on
+                // subsequent polls. Persistence comes from the painter
+                // redrawing state.liveTriangles + state.institutionalMarkers
+                // every cycle from durable in-memory history.
             }
             // Redraw every live triangle. update() called clear() at top,
             // so each refresh re-adds the deque contents.
@@ -1676,6 +1847,176 @@ public class PaxOpeningRangeModule implements
 
         private static String safeString(String s) {
             return s == null || s.isEmpty() ? "?" : s;
+        }
+
+        /** Merge the latest fetched institutional_signals into the durable
+         *  per-instrument history and redraw EVERY event currently in history.
+         *
+         *  <p>Persistence contract: the latest fetched array adds new markers
+         *  by id; it never defines the whole render state. Empty
+         *  institutional_signals on a poll adds nothing and removes nothing.
+         *  The full history is redrawn every cycle so clearTriangles() at
+         *  the top of updateTriangles() doesn't lose previously-plotted
+         *  markers.</p>
+         */
+        private void addInstitutionalMarkers(InstrumentState state) {
+            // History merge already happened in updateTriangles() before the
+            // renderKey check; here we just redraw every event in the durable
+            // deque. Empty institutional_signals on the latest poll added
+            // nothing — prior history survives untouched.
+            for (PaxInstitutionalSignalEvent evt : state.institutionalMarkers.snapshot()) {
+                drawInstitutionalMarker(state, evt);
+            }
+        }
+
+        /** Render one institutional signal event as a labelImage marker
+         *  anchored at the event's level price + event's timestamp.
+         *
+         *  <p>Distinct glyphs per execution_read class so PAY entries don't
+         *  look the same as WAIT / STAND_DOWN / SCRATCH non-entry markers.
+         *  Uses the labelImage primitive (known reliable on Bookmap 7.4) and
+         *  the triangleShapes clear list — meaning the shape is removed and
+         *  re-added on every refresh from the durable history deque.</p>
+         */
+        /** Redraw the full evidence-trail history of institutional chart
+         *  events. Stagger y-offset by severity rank so overlapping events
+         *  at the same level/time don't cover each other. */
+        private void addInstitutionalChartEvents(InstrumentState state) {
+            java.util.List<PaxInstitutionalChartEvent> history = state.chartEventMarkers.snapshot();
+            // Group by rendered chart-time + side + nearby price to apply a
+            // per-group stagger. Do not include label/marker text: WATCH,
+            // TCH, SWP, ACC, etc. can share one visual spot and must stack.
+            // Drawing in insertion order; the per-event stagger is computed
+            // from severityRank + a small per-event ordinal within the same
+            // collision bucket.
+            java.util.HashMap<String, Integer> bucketOrdinal = new java.util.HashMap<>();
+            for (PaxInstitutionalChartEvent evt : history) {
+                String bucketKey = chartEventCollisionKey(evt, state.pips);
+                int ord = bucketOrdinal.getOrDefault(bucketKey, 0);
+                bucketOrdinal.put(bucketKey, ord + 1);
+                drawInstitutionalChartEvent(state, evt, ord);
+            }
+        }
+
+        /** Render one chart event as a labelImage marker anchored at
+         *  event.price + event.timestamp_ms.
+         *
+         *  Stagger semantics: the {@code bucketOrdinal} positions the label
+         *  N rows away from the level so multiple events at the same
+         *  (label, timestamp) don't overlap. The severity rank biases
+         *  ENTRY/EXIT to sit closer to the level; INFO further away. */
+        private void drawInstitutionalChartEvent(InstrumentState state,
+                                                  PaxInstitutionalChartEvent evt,
+                                                  int bucketOrdinal) {
+            if (evt == null || !evt.isRenderable()) return;
+            double tickSize = state.pips;
+            if (!Double.isFinite(tickSize) || tickSize <= 0.0) return;
+
+            java.awt.Color color = evt.colorFromHint();
+            PreparedImage image = labelImage(evt.markerText, color, TRIANGLE_FONT_WEAK);
+            int w = image.getReadOnlyImage().getWidth();
+            int h = image.getReadOnlyImage().getHeight();
+            long xNanos = PaxChartTimeCoords.epochMsToChartNanos(evt.timestampMs);
+
+            // Offset in ticks: ENTRY/EXIT closer to the level, WATCH/INFO
+            // further out. Stagger ordinal adds h-pixels of separation
+            // within the same (label, ts) bucket.
+            int baseTicks = TRIANGLE_OFFSET_TICKS_WEAK;
+            int severityShift = evt.severityRank();  // 0..5
+            int offsetTicks = baseTicks + severityShift;
+
+            boolean placeBelow = isPlaceBelow(evt);
+            double anchorPrice;
+            int yPxTop, yPxBottom;
+            int stagger = bucketOrdinal * h;
+            if (placeBelow) {
+                anchorPrice = (evt.price - offsetTicks * tickSize) / tickSize;
+                yPxTop = stagger;
+                yPxBottom = h + stagger;
+            } else {
+                anchorPrice = (evt.price + offsetTicks * tickSize) / tickSize;
+                yPxTop = -h - stagger;
+                yPxBottom = -stagger;
+            }
+            addTriangleShape(image,
+                    new CompositeHorizontalCoordinate(CompositeCoordinateBase.DATA_ZERO, -w / 2, xNanos),
+                    new CompositeVerticalCoordinate(CompositeCoordinateBase.DATA_ZERO, yPxTop, anchorPrice),
+                    new CompositeHorizontalCoordinate(CompositeCoordinateBase.DATA_ZERO, w / 2, xNanos),
+                    new CompositeVerticalCoordinate(CompositeCoordinateBase.DATA_ZERO, yPxBottom, anchorPrice));
+        }
+
+        /** Bull-side levels (above mid) get markers below the level by
+         *  default; bear-side levels get markers above. Bearish-direction
+         *  entries (ACC-S, REJ-S) flip to ABOVE so they read like sells. */
+        private static boolean isPlaceBelow(PaxInstitutionalChartEvent evt) {
+            return PaxOpeningRangeModule.chartEventPlaceBelow(evt);
+        }
+
+        private static String chartEventCollisionKey(PaxInstitutionalChartEvent evt, double tickSize) {
+            return PaxOpeningRangeModule.chartEventCollisionKey(evt, tickSize);
+        }
+
+        private void drawInstitutionalMarker(InstrumentState state, PaxInstitutionalSignalEvent evt) {
+            if (evt == null || !evt.isRenderable()) return;
+            double tickSize = state.pips;
+            if (!Double.isFinite(tickSize) || tickSize <= 0.0) return;
+            String text;
+            Color color;
+            boolean bullish;
+            switch (evt.executionRead) {
+                case "PAY_FOR_TRADE":
+                    if ("LONG".equals(evt.direction)) {
+                        text = "INS-L"; color = PaxHeatwaveColors.BULL; bullish = true;
+                    } else if ("SHORT".equals(evt.direction)) {
+                        text = "INS-S"; color = PaxHeatwaveColors.BEAR; bullish = false;
+                    } else {
+                        // PAY_FOR_TRADE with direction NONE shouldn't happen
+                        // per the Python contract; render as WATCH for safety.
+                        text = "WATCH"; color = new Color(220, 200, 80); bullish = true;
+                    }
+                    break;
+                case "STAND_DOWN":
+                    if ("ICEBERG_DEFENSE".equals(evt.signalType)) {
+                        text = "ICE";
+                    } else if ("SPOOF_STAND_DOWN".equals(evt.signalType)) {
+                        text = "SPD";
+                    } else {
+                        text = "STND";
+                    }
+                    color = new Color(255, 153, 0); bullish = true;
+                    break;
+                case "SCRATCH_READY":
+                    text = "SCR"; color = new Color(176, 176, 176); bullish = true;
+                    break;
+                case "WAIT_FOR_CONFIRM":
+                default:
+                    text = "WATCH"; color = new Color(220, 200, 80); bullish = true;
+                    break;
+            }
+            PreparedImage image = labelImage(text, color, TRIANGLE_FONT_WEAK);
+            int w = image.getReadOnlyImage().getWidth();
+            int h = image.getReadOnlyImage().getHeight();
+            long xNanos = PaxChartTimeCoords.epochMsToChartNanos(evt.timestampMs);
+            // Anchor at event.price. PAY-LONG and WATCH sit BELOW the level
+            // (label drops down so the level line is visible); PAY-SHORT sits
+            // ABOVE. STAND_DOWN/SCRATCH overlay the level itself.
+            double anchorPrice;
+            int yPxTop, yPxBottom;
+            int offsetTicks = TRIANGLE_OFFSET_TICKS_WEAK;
+            if (bullish) {
+                anchorPrice = (evt.price - offsetTicks * tickSize) / tickSize;
+                yPxTop = 0;
+                yPxBottom = h;
+            } else {
+                anchorPrice = (evt.price + offsetTicks * tickSize) / tickSize;
+                yPxTop = -h;
+                yPxBottom = 0;
+            }
+            addTriangleShape(image,
+                    new CompositeHorizontalCoordinate(CompositeCoordinateBase.DATA_ZERO, -w / 2, xNanos),
+                    new CompositeVerticalCoordinate(CompositeCoordinateBase.DATA_ZERO, yPxTop, anchorPrice),
+                    new CompositeHorizontalCoordinate(CompositeCoordinateBase.DATA_ZERO, w / 2, xNanos),
+                    new CompositeVerticalCoordinate(CompositeCoordinateBase.DATA_ZERO, yPxBottom, anchorPrice));
         }
 
         private void drawTrendTriangle(InstrumentState state, TrendTriangleEvent evt) {
@@ -1965,6 +2306,30 @@ public class PaxOpeningRangeModule implements
           .append(lastEmittedBucketEnteredMs).append('|')
           .append(liveTriangleCount);
         return sb.toString();
+    }
+
+    static String chartEventCollisionKey(PaxInstitutionalChartEvent evt, double tickSize) {
+        if (evt == null) return "NULL";
+        long timeBucket = evt.timestampMs / 1000L;
+        boolean placeBelow = chartEventPlaceBelow(evt);
+        long priceTicks;
+        if (Double.isFinite(evt.price) && evt.price > 0.0
+                && Double.isFinite(tickSize) && tickSize > 0.0) {
+            priceTicks = Math.round(evt.price / tickSize);
+        } else {
+            priceTicks = Long.MIN_VALUE;
+        }
+        long priceBucket = priceTicks == Long.MIN_VALUE
+                ? Long.MIN_VALUE
+                : Math.floorDiv(priceTicks, CHART_EVENT_COLLISION_PRICE_TICKS);
+        return timeBucket + "|" + (placeBelow ? "B" : "A") + "|" + priceBucket;
+    }
+
+    static boolean chartEventPlaceBelow(PaxInstitutionalChartEvent evt) {
+        if (evt == null) return true;
+        if ("SHORT".equals(evt.direction)) return false;
+        if ("LONG".equals(evt.direction)) return true;
+        return "above".equals(evt.side);
     }
 
     /** Stable cache key for the heatwave model semantic content. Used by
