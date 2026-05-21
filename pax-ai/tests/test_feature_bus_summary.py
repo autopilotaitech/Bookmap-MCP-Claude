@@ -272,6 +272,42 @@ def test_summary_today_lastEventMs_is_max_across_event_tables(tmp_path, monkeypa
     assert s["lastEventAgeMs"] >= 0
 
 
+def test_summary_today_lastEventAgeMs_clamped_to_zero_for_future_ts(
+        tmp_path, monkeypatch):
+    """Pins the clamp: a future-stamped event must NOT produce a negative
+    age. Regression for the pre-fix flake where summary_today() returned
+    lastEventAgeMs < 0 when run before the event's wall-clock time."""
+    import time
+    db = _enable_bus_at(tmp_path, monkeypatch)
+    from datetime import datetime, timezone
+    now_ms = int(time.time() * 1000)
+    # Stamp the event 1 hour in the future of wall-clock now, but still
+    # inside today's UTC window so summary_today() picks it up.
+    future_ts = now_ms + 3_600_000
+    today_start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start.replace(hour=23, minute=59, second=59,
+                                     microsecond=999_000)
+    if future_ts > int(today_end.timestamp() * 1000):
+        # Edge case: test running in the last hour of the UTC day; clamp
+        # the future stamp into the window so the test stays deterministic.
+        future_ts = int(today_end.timestamp() * 1000) - 1
+    with feature_bus._open_db(db) as conn:
+        feature_bus._ensure_schema(conn)
+        conn.execute("""
+            INSERT INTO level_events
+              (schema_version, ts_ms, alias, level_label, level_price,
+               prev_decision, new_decision, prev_confidence, new_confidence,
+               prev_proximity, new_proximity, trigger_reason)
+            VALUES (1, ?, 'NQM6', 'OR-H', 0, 'WAIT', 'FOLLOW_LONG',
+                    0.3, 0.7, 0, 1, 'composite_flip')
+        """, (future_ts,))
+    s = feature_bus.summary_today()
+    assert s["lastEventMs"] == future_ts, "lastEventMs must be preserved exactly"
+    assert s["lastEventAgeMs"] == 0, (
+        f"future-stamped event must clamp to 0, got {s['lastEventAgeMs']}")
+
+
 def test_summary_today_explicit_date_param(tmp_path, monkeypatch):
     db = _enable_bus_at(tmp_path, monkeypatch)
     # Insert at a specific UTC date.

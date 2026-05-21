@@ -1062,7 +1062,7 @@ def summary_today(date_str: Optional[str] = None) -> Dict[str, Any]:
                     pass
             if last_ts:
                 out["lastEventMs"] = last_ts
-                out["lastEventAgeMs"] = int(time.time() * 1000) - last_ts
+                out["lastEventAgeMs"] = max(0, int(time.time() * 1000) - last_ts)
     finally:
         conn.close()
     return out
