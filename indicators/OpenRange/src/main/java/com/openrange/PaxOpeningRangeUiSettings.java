@@ -56,7 +56,7 @@ public class PaxOpeningRangeUiSettings {
      * pax.decision sources are no longer consulted for entry markers — the
      * parser returns NONE when no institutional PAY_FOR_TRADE signal exists.
      * Set false to disable the institutional triangle layer entirely. */
-    public boolean showTrendTriangles = true;
+    public boolean showTrendTriangles = false;
 
     /** Suppress the native OR breakout marker publisher (CVD/depth-driven
      * LONG/SHORT engine markers). Default ON — native markers are the

@@ -43,7 +43,9 @@ public class PaxOpeningRangeSignalCsvLogger implements AutoCloseable {
             return;
         }
 
-        String key = symbol + "|" + signal.bias() + "|" + signal.action() + "|" + signal.confidence()
+        String sessionDate = time == null ? "" : time.toLocalDate().toString();
+        String key = symbol + "|" + sessionDate + "|" + orHigh + "|" + orLow
+                + "|" + signal.bias() + "|" + signal.action() + "|" + signal.confidence()
                 + "|" + signal.score() + "|" + signal.evidence();
         synchronized (dedupLock) {
             if (key.equals(lastKey)) {

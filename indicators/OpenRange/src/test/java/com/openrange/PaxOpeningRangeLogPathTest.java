@@ -7,6 +7,7 @@ public class PaxOpeningRangeLogPathTest {
         usesDefaultLogDirectoryWhenBlank();
         sanitizesSymbolInConfiguredDirectory();
         createsStateCachePath();
+        sessionConfigPublishesLogDirectory();
     }
 
     private static void usesDefaultLogDirectoryWhenBlank() {
@@ -25,6 +26,19 @@ public class PaxOpeningRangeLogPathTest {
         Path path = PaxOpeningRangeLogPath.stateCachePath("D:\\OpenRange Logs", "MNQM6.CME@RITHMIC");
 
         assertEquals(Path.of("D:\\OpenRange Logs", "openrange-state-MNQM6.CME_RITHMIC.csv"), path, "path");
+    }
+
+    private static void sessionConfigPublishesLogDirectory() {
+        PaxOpeningRangeUiSettings ui = new PaxOpeningRangeUiSettings();
+        ui.logDirectory = "D:\\OpenRange Logs";
+        String json = PaxOpeningRangeSessionConfigWriter.renderJson(ui, 123L);
+
+        if (!json.contains("\"logDirectory\": \"D:\\\\OpenRange Logs\"")) {
+            throw new AssertionError("session config must publish operator CSV logDirectory: " + json);
+        }
+        if (!json.contains("\"logDirectoryAbsolute\"")) {
+            throw new AssertionError("session config must publish resolved logDirectoryAbsolute: " + json);
+        }
     }
 
     private static void assertEquals(Object expected, Object actual, String message) {

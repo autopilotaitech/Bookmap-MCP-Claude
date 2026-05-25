@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -99,6 +100,28 @@ def test_effective_session_anchor_shape(isolated_config):
     assert a["timezone"] == "America/Chicago"
 
 
+def test_dashboard_or_signal_globs_follow_published_log_directory(isolated_config):
+    from bookmap_mcp import dashboard
+
+    _write(isolated_config,
+           logDirectory="D:\\ConfiguredOR",
+           logDirectoryAbsolute="D:\\ConfiguredOR")
+    globs = dashboard._or_signal_globs()
+    assert globs == [str(Path("D:\\ConfiguredOR") / "openrange-signals-*.csv")]
+
+
+def test_dashboard_or_signal_globs_use_bookmap_config_for_old_schema(isolated_config, monkeypatch):
+    from bookmap_mcp import dashboard
+
+    monkeypatch.setenv("BOOKMAP_CONFIG_DIR", "E:\\BookmapConfig")
+    _write(isolated_config)
+
+    globs = dashboard._or_signal_globs()
+    assert globs == [
+        str(Path("E:\\BookmapConfig") / "build" / "logs" / "openrange-signals-*.csv")
+    ]
+
+
 def test_session_state_uses_or_config(isolated_config):
     """session_state honors the operator-published OR anchor, not a
     hard-coded canonical time."""
@@ -139,6 +162,62 @@ def test_session_state_uses_fallback_when_no_config(isolated_config):
     assert code == "OR_FORMING"
     # Label carries source marker so operators see they're on fallback.
     assert "fallback" in label or "OR" in label
+
+
+def test_or_row_rejects_yesterday_after_current_or_open(monkeypatch):
+    """Dashboard must not keep serving yesterday's OR row after today's
+    OR anchor has advanced."""
+    from bookmap_mcp import dashboard
+    from zoneinfo import ZoneInfo
+
+    anchor = {
+        "hour": 8, "minute": 30, "second": 0, "rangeSeconds": 30,
+        "timezone": "America/Chicago", "source": "or_config",
+        "anchorMode": "LIVE", "available": True, "reason": None,
+        "ageMs": 1000, "updatedAtMs": 1, "path": "test",
+    }
+    monkeypatch.setattr(or_session, "effective_session_anchor", lambda: anchor)
+    now = dt.datetime(2026, 5, 22, 8, 31, 0,
+                      tzinfo=ZoneInfo("America/Chicago"))
+    stale = {"time": "2026-05-21T15:00:00", "symbol": "NQM6",
+             "orHigh": "100", "orLow": "90"}
+    assert dashboard._or_row_is_current_session(stale, now) is False
+
+
+def test_or_row_accepts_current_row_after_or_complete(monkeypatch):
+    from bookmap_mcp import dashboard
+    from zoneinfo import ZoneInfo
+
+    anchor = {
+        "hour": 8, "minute": 30, "second": 0, "rangeSeconds": 30,
+        "timezone": "America/Chicago", "source": "or_config",
+        "anchorMode": "LIVE", "available": True, "reason": None,
+        "ageMs": 1000, "updatedAtMs": 1, "path": "test",
+    }
+    monkeypatch.setattr(or_session, "effective_session_anchor", lambda: anchor)
+    now = dt.datetime(2026, 5, 22, 8, 31, 0,
+                      tzinfo=ZoneInfo("America/Chicago"))
+    current = {"time": "2026-05-22T08:30:30", "symbol": "NQM6",
+               "orHigh": "100", "orLow": "90"}
+    assert dashboard._or_row_is_current_session(current, now) is True
+
+
+def test_or_row_rejects_before_current_or_complete(monkeypatch):
+    from bookmap_mcp import dashboard
+    from zoneinfo import ZoneInfo
+
+    anchor = {
+        "hour": 8, "minute": 30, "second": 0, "rangeSeconds": 30,
+        "timezone": "America/Chicago", "source": "or_config",
+        "anchorMode": "LIVE", "available": True, "reason": None,
+        "ageMs": 1000, "updatedAtMs": 1, "path": "test",
+    }
+    monkeypatch.setattr(or_session, "effective_session_anchor", lambda: anchor)
+    now = dt.datetime(2026, 5, 22, 8, 30, 15,
+                      tzinfo=ZoneInfo("America/Chicago"))
+    row = {"time": "2026-05-21T15:00:00", "symbol": "NQM6",
+           "orHigh": "100", "orLow": "90"}
+    assert dashboard._or_row_is_current_session(row, now) is False
 
 
 def test_freshest_config_wins_across_candidates(tmp_path, monkeypatch):

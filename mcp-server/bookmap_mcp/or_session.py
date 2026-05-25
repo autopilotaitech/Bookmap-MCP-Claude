@@ -23,6 +23,8 @@ JSON schema (v1):
     "rangeSeconds": 30,
     "endHour":      8,
     "endMinute":    30,
+    "logDirectory": "build\\logs",
+    "logDirectoryAbsolute": None,
     "labelPrefix":  "OpenRange",
     "daysToDisplay": 8,
     "source":       "openrange-indicator"

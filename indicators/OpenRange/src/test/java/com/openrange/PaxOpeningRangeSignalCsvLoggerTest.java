@@ -8,6 +8,7 @@ public class PaxOpeningRangeSignalCsvLoggerTest {
     public static void main(String[] args) throws Exception {
         writesHeaderAndSignalRows();
         skipsDuplicateSignals();
+        writesNewSessionEvenWhenSignalClassUnchanged();
     }
 
     private static void writesHeaderAndSignalRows() throws Exception {
@@ -39,6 +40,22 @@ public class PaxOpeningRangeSignalCsvLoggerTest {
 
         long lineCount = Files.readAllLines(file).size();
         assertEquals(2, lineCount, "line count");
+    }
+
+    private static void writesNewSessionEvenWhenSignalClassUnchanged() throws Exception {
+        Path file = Files.createTempFile("paxor-signals", ".csv");
+        PaxOpeningRangeSignalCsvLogger logger = new PaxOpeningRangeSignalCsvLogger(file);
+        PaxOpeningRangeSignal signal = signal("CVD+ BID+ ASK PULL NET+");
+        PaxOpeningRangeMarketState market = new PaxOpeningRangeMarketState(6401.25, 12, 500, -250, 750);
+
+        logger.logIfChanged("ESM6", LocalDateTime.of(2026, 4, 28, 9, 31, 5),
+                6400.00, 6390.00, market, signal);
+        logger.logIfChanged("ESM6", LocalDateTime.of(2026, 4, 29, 9, 31, 5),
+                6410.00, 6400.00, market, signal);
+        logger.close();
+
+        long lineCount = Files.readAllLines(file).size();
+        assertEquals(3, lineCount, "new session row must not be deduped");
     }
 
     private static PaxOpeningRangeSignal signal(String evidence) {

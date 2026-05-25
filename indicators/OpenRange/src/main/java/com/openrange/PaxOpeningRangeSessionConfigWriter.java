@@ -28,6 +28,8 @@ import velox.api.layer1.common.Log;
  *   "rangeSeconds":  30,
  *   "endHour":       8,
  *   "endMinute":     30,
+ *   "logDirectory":  "D:\\BookmapLogs",
+ *   "logDirectoryAbsolute": "D:\\BookmapLogs",
  *   "labelPrefix":   "OpenRange",
  *   "daysToDisplay": 8,
  *   "source":        "openrange-indicator"
@@ -94,6 +96,12 @@ public final class PaxOpeningRangeSessionConfigWriter {
         sb.append("  \"rangeSeconds\": ").append(ui.rangeSeconds).append(",\n");
         sb.append("  \"endHour\": ").append(ui.endHour).append(",\n");
         sb.append("  \"endMinute\": ").append(ui.endMinute).append(",\n");
+        String logDir = ui.logDirectory == null || ui.logDirectory.isBlank()
+                ? "build\\logs" : ui.logDirectory;
+        sb.append("  \"logDirectory\": ").append(jsonString(logDir)).append(",\n");
+        sb.append("  \"logDirectoryAbsolute\": ")
+                .append(jsonString(Path.of(logDir).toAbsolutePath().normalize().toString()))
+                .append(",\n");
         sb.append("  \"labelPrefix\": ").append(jsonString(ui.labelPrefix == null ? "OpenRange" : ui.labelPrefix)).append(",\n");
         sb.append("  \"daysToDisplay\": ").append(ui.daysToDisplay).append(",\n");
         sb.append("  \"source\": \"openrange-indicator\"\n");
