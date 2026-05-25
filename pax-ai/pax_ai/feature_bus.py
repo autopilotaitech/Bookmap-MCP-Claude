@@ -730,6 +730,7 @@ def _project_snapshot_features(snap: Dict[str, Any], now_ms: int) -> Dict[str, A
     conv  = snap.get("conviction") or {}
     trend = snap.get("trend_signal") or {}
     pax   = snap.get("pax") or {}
+    raw_json = _canonical_snapshot_json(snap)
     return {
         "schema_version":          SCHEMA_VERSION,
         "ts_ms":                   now_ms,
@@ -768,6 +769,7 @@ def _project_snapshot_features(snap: Dict[str, Any], now_ms: int) -> Dict[str, A
         "decision_verdict":        (snap.get("decision") or {}).get("verdict"),
         "news_blocked":            1 if news.get("blocked") else 0,
         "news_label":              news.get("label"),
+        "raw_json_sha256":         hashlib.sha256(raw_json.encode("utf-8")).hexdigest(),
     }
 
 
@@ -810,6 +812,7 @@ _SNAPSHOT_FEATURES_COLUMNS = (
     "pax_decision", "pax_size", "pax_size_tier", "pax_confidence",
     "decision_verdict",
     "news_blocked", "news_label",
+    "raw_json_sha256",
 )
 
 

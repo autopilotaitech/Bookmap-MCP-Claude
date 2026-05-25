@@ -292,6 +292,10 @@ def test_writer_thread_persists_full_snapshot_feature_columns(bus_enabled, monke
     assert row["news_blocked"]       == 1
     assert row["news_label"]         == "FOMC"
     assert row["session_anchor_mode"] == "LIVE"
+    expected_raw_sha = hashlib.sha256(
+        feature_bus._canonical_snapshot_json(snap).encode("utf-8")
+    ).hexdigest()
+    assert row["raw_json_sha256"] == expected_raw_sha
 
 
 def test_writer_thread_tolerates_none_snapshot(bus_enabled, monkeypatch):
