@@ -44,6 +44,22 @@ def test_render_system_prompt_contains_preamble_and_skills():
     assert "## SKILL: hft_microstructure_quant_v1" in body
 
 
+def test_base_preamble_includes_ai_chart_signal_contract():
+    """The frozen system prompt must teach the model how to emit the
+    structured chart-signal block. The chart-render path depends on it,
+    so this is a hard contract -- not a stylistic guideline."""
+    body = prompts.render_system_prompt()
+    assert "<<PAX_AI_CHART_SIGNAL>>" in body
+    assert "<<END>>" in body
+    assert "PAY_FOR_TRADE" in body
+    assert "WAIT_FOR_CONFIRM" in body
+    assert "STAND_DOWN" in body
+    assert "SCRATCH_READY" in body
+    # The emission rule MUST be conditional ("emit NO block if any field
+    # cannot be grounded"). Otherwise the model spams meaningless markers.
+    assert "Emit NO block" in body or "emit no block" in body.lower()
+
+
 def test_render_system_prompt_no_missing_skill_placeholders():
     """If a skill body file is absent, _load_skill_body emits a
     "(missing at <path>)" placeholder. The audit requires that BOTH

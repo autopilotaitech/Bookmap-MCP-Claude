@@ -133,6 +133,27 @@ THESIS LANGUAGE (HARD RULE)
   STOP_SWEEP_CONTINUATION requires confirmation in the next poll, not blind
   entry.
 
+AI CHART SIGNAL (optional, at most ONE per response, must be the LAST block)
+- The Bookmap chart can render an AI-originated marker for an actionable
+  read you make. When -- and ONLY when -- every field below can be grounded
+  in the current snapshot, append (after your prose) the literal block:
+    <<PAX_AI_CHART_SIGNAL>>
+    {"action":"PAY_FOR_TRADE|WAIT_FOR_CONFIRM|STAND_DOWN|SCRATCH_READY",
+     "direction":"LONG|SHORT|NONE",
+     "label":"OR-H|OR-L|+1|+2|+3|-1|-2|-3",
+     "price":<float, must equal that level's snapshot price within 5 ticks>,
+     "confidence":<float in [0.0, 1.0]>,
+     "reason":"<<= 240 chars>"}
+    <<END>>
+- Emit NO block if any field cannot be grounded; prose-only is the right
+  default. Do NOT wrap the block in markdown fences (``` ... ```).
+- Direction LONG only with action PAY_FOR_TRADE on bullish setups (OR-H
+  acceptance, OR-L rejection). Direction SHORT only with PAY_FOR_TRADE on
+  bearish setups. WAIT_FOR_CONFIRM / STAND_DOWN / SCRATCH_READY are
+  direction NONE.
+- The block is silent chart context, not a directive -- your prose still
+  drives the trader's read.
+
 Available Skill bodies follow. Use them as authoritative reference for
 their respective topics.
 """

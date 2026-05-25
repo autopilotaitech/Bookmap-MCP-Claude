@@ -27,6 +27,7 @@ from . import settings as _settings
 from . import or_session as _or_session
 from .bridge_client import BridgeClient, BridgeError
 from .config import BridgeConfig, MissingTokenError, _config_path as _bridge_config_path
+from .pax_ai_chart_events import compute_pax_ai_chart_events
 
 # Set by main() at startup so /api/snapshot offline payloads can report
 # which port the operator hit. None until the HTTP server has bound.
@@ -64,6 +65,7 @@ NEWS_CALENDAR_PATH = Path(os.environ.get(
     "BOOKMAP_NEWS_CALENDAR",
     r"C:\Bookmap\addons\MCP\Bookmap\news-calendar.json"))
 OR_SIGNAL_GLOBS = [
+    r"C:\Bookmap\Config\build\logs\openrange-signals-*.csv",
     r"D:\BookmapLogs\openrange-signals-*.csv",
     r"C:\Bookmap\addons\OR-Strategy\Reference-Indicators\OpenRange\build\logs\openrange-signals-*.csv",
     r"C:\Bookmap\build\logs\openrange-signals-*.csv",
@@ -192,15 +194,31 @@ def momentum_flag(i10, i50, i200) -> str:
     return "neutral"
 
 
+def _or_signal_globs() -> List[str]:
+    """Return OpenRange signal globs from the published indicator setting."""
+    try:
+        eff = _or_session.load_effective()
+        cfg = eff.get("config") if isinstance(eff, dict) else {}
+        if isinstance(cfg, dict) and eff.get("source") != "fallback":
+            raw = cfg.get("logDirectoryAbsolute") or cfg.get("logDirectory")
+            if isinstance(raw, str) and raw.strip():
+                return [str(Path(raw.strip()) / "openrange-signals-*.csv")]
+            bookmap_config = Path(os.environ.get("BOOKMAP_CONFIG_DIR", r"C:\Bookmap\Config"))
+            return [str(bookmap_config / "build" / "logs" / "openrange-signals-*.csv")]
+    except Exception:
+        pass
+    return list(OR_SIGNAL_GLOBS)
+
+
 def _or_rows_by_symbol() -> Dict[str, Dict[str, Any]]:
-    """Index every OpenRange CSV under OR_SIGNAL_GLOBS by its `symbol` column.
+    """Index every OpenRange CSV under the configured log directory by its `symbol` column.
     Returns {symbol: latest_row}. The OpenRange addon writes one CSV per
     symbol; the `symbol` column inside the row is the authoritative key —
     filename safeSymbol normalization is more aggressive than the row's
     safeSymbol (filename strips [^A-Za-z0-9._-]; row only strips commas),
     so matching on the column avoids drift."""
     candidates: List[str] = []
-    for pat in OR_SIGNAL_GLOBS:
+    for pat in _or_signal_globs():
         candidates.extend(glob.glob(pat))
     out: Dict[str, Dict[str, Any]] = {}
     for path in candidates:
@@ -211,7 +229,13 @@ def _or_rows_by_symbol() -> Dict[str, Dict[str, Any]]:
             continue
         if not rows:
             continue
-        last = rows[-1]
+        last = None
+        for row in reversed(rows):
+            if _or_row_is_current_session(row):
+                last = row
+                break
+        if last is None:
+            continue
         sym = (last.get("symbol") or "").strip()
         if not sym:
             continue
@@ -231,6 +255,54 @@ def _or_rows_by_symbol() -> Dict[str, Dict[str, Any]]:
             except OSError:
                 pass
     return out
+
+
+def _current_or_session_window(now: Optional[dt.datetime] = None
+                               ) -> Tuple[dt.datetime, dt.datetime]:
+    """Return current OR session anchor and range-end in the OR timezone."""
+    anchor = _or_session.effective_session_anchor()
+    try:
+        tz = ZoneInfo(anchor["timezone"])
+    except Exception:
+        tz = DISPLAY_TZ
+    now_local = now.astimezone(tz) if now and now.tzinfo else (
+        now.replace(tzinfo=tz) if now else dt.datetime.now(tz))
+    anchor_time = dt.time(int(anchor["hour"]), int(anchor["minute"]),
+                          int(anchor.get("second", 0)))
+    start = _most_recent_session_anchor(now_local, anchor_time)
+    end = start + dt.timedelta(seconds=int(anchor["rangeSeconds"]))
+    return start, end
+
+
+def _parse_or_row_time(row: Dict[str, Any]) -> Optional[dt.datetime]:
+    raw = row.get("time")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(raw.strip())
+    except ValueError:
+        return None
+    try:
+        tz = ZoneInfo(_or_session.effective_session_anchor()["timezone"])
+    except Exception:
+        tz = DISPLAY_TZ
+    return parsed.replace(tzinfo=tz) if parsed.tzinfo is None else parsed.astimezone(tz)
+
+
+def _or_row_is_current_session(row: Dict[str, Any],
+                               now: Optional[dt.datetime] = None) -> bool:
+    """Accept only OR CSV rows written after the current OR completed.
+
+    This prevents yesterday's final OpenRange row from feeding today's
+    dashboard during/after the new market open before the indicator has
+    published the current session row.
+    """
+    row_time = _parse_or_row_time(row)
+    if row_time is None:
+        return False
+    start, range_end = _current_or_session_window(now)
+    next_start = start + dt.timedelta(days=1)
+    return range_end <= row_time < next_start
 
 
 def _resolve_alias_symbol(alias: Optional[str],
@@ -5068,6 +5140,10 @@ def _compose_alias_snapshot(c, cfg, alias: str,
         compute_institutional_signals, "compute_institutional_signals")
     snap["institutional_chart_events"] = _safe_call(
         compute_institutional_chart_events, "compute_institutional_chart_events")
+    # Pax AI -> chart bridge. Reads the cross-process JSONL store; never
+    # raises into snapshot composition.
+    snap["pax_ai_chart_events"] = _safe_call(
+        compute_pax_ai_chart_events, "compute_pax_ai_chart_events") or []
     # SIM trades from local sim engine (read-only — agent process owns writes)
     try:
         from .sim_engine import SimEngine
@@ -7004,8 +7080,9 @@ button:hover { filter:brightness(1.2); }
       <li>Edit <b>OR start hour</b>, <b>OR start minute</b>, <b>OR seconds</b>, or <b>Line end hour/minute</b>.</li>
       <li>Click <b>Apply and reload</b> — Bookmap persists via @StrategySettingsVersion.</li>
     </ol>
-    The dashboard reads the resulting CSV at
-    <code style="color:#9ece6a;">D:\BookmapLogs\openrange-signals-*.csv</code>.
+    The dashboard reads the resulting CSV from the OR-Strategy
+    <b>CSV log directory</b> setting published in
+    <code>or-session-config.json</code>.
     No restart of the dashboard or daemon is needed; the next poll picks up
     whatever the OR-Strategy emits.
   </div>

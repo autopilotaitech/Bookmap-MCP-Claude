@@ -44,6 +44,8 @@ final class PaxTrendSignalFetcher {
             new AtomicReference<>(Collections.emptyList());
     private final AtomicReference<List<PaxInstitutionalChartEvent>> latestChartEvents =
             new AtomicReference<>(Collections.emptyList());
+    private final AtomicReference<List<PaxInstitutionalChartEvent>> latestPaxAiChartEvents =
+            new AtomicReference<>(Collections.emptyList());
     private final AtomicInteger consecutiveFailures = new AtomicInteger(0);
     private final AtomicLong lastWarnLogMs = new AtomicLong(0L);
     /** Last failure reason (short, never contains the token) and timestamp.
@@ -99,6 +101,14 @@ final class PaxTrendSignalFetcher {
      *  into its durable history; empty polls do not clear prior markers. */
     List<PaxInstitutionalChartEvent> latestInstitutionalChartEvents() {
         return latestChartEvents.get();
+    }
+
+    /** Latest Pax AI chart events. Same persistence semantics as
+     *  {@link #latestInstitutionalChartEvents()}: never null, empty until
+     *  a successful poll or empty payload. The painter merges this into
+     *  its durable AI-history; empty polls do NOT clear prior markers. */
+    List<PaxInstitutionalChartEvent> latestPaxAiChartEvents() {
+        return latestPaxAiChartEvents.get();
     }
 
     String lastFailureReason() { return lastFailureReason; }
@@ -183,11 +193,14 @@ final class PaxTrendSignalFetcher {
                     PaxTrendSignalSnapshotParser.parseInstitutionalEvents(resp.body());
             List<PaxInstitutionalChartEvent> chartEvents =
                     PaxTrendSignalSnapshotParser.parseChartEvents(resp.body());
+            List<PaxInstitutionalChartEvent> paxAiEvents =
+                    PaxTrendSignalSnapshotParser.parsePaxAiChartEvents(resp.body());
             latest = parsed;
             latestEvents.set(events);
             latestChartEvents.set(chartEvents);
+            latestPaxAiChartEvents.set(paxAiEvents);
             consecutiveFailures.set(0);
-            fireRepaintIfNeeded(parsed, nowMs);
+            fireRepaintIfNeeded(parsed, chartEvents, paxAiEvents, nowMs);
             return true;
         } catch (PaxTrendSignalSnapshotParser.ParseException pe) {
             handleFailure(nowMs, "parse: " + pe.getMessage());
@@ -227,14 +240,54 @@ final class PaxTrendSignalFetcher {
         }
     }
 
-    private void fireRepaintIfNeeded(PaxTrendSignalModel parsed, long nowMs) {
-        String key = semanticKey(parsed);
+    private void fireRepaintIfNeeded(PaxTrendSignalModel parsed,
+                                       List<PaxInstitutionalChartEvent> chartEvents,
+                                       List<PaxInstitutionalChartEvent> paxAiEvents,
+                                       long nowMs) {
+        String key = combinedSemanticKey(parsed, chartEvents, paxAiEvents);
         boolean changed = !key.equals(lastRepaintKey);
         if (changed || nowMs - lastRepaintAtMs >= UNCHANGED_REPAINT_MIN_MS) {
             lastRepaintKey = key;
             lastRepaintAtMs = nowMs;
             fireRepaint();
         }
+    }
+
+    /** Combined semantic key for repaint dedup. Includes the
+     *  trend-signal kernel (legacy semanticKey) plus the local +
+     *  Pax AI chart-event arrays as sorted-id signatures. Any of the
+     *  following changes triggers a repaint within one poll:
+     *  <ul>
+     *    <li>A new AI event id appears.</li>
+     *    <li>An AI event id disappears (TTL drop on the dashboard side).</li>
+     *    <li>A new local institutional chart event id appears.</li>
+     *    <li>The legacy trend_signal renderable tuple changes.</li>
+     *  </ul>
+     *  Package-private for testability. */
+    static String combinedSemanticKey(PaxTrendSignalModel parsed,
+                                       List<PaxInstitutionalChartEvent> chartEvents,
+                                       List<PaxInstitutionalChartEvent> paxAiEvents) {
+        return semanticKey(parsed)
+                + "|CE=" + eventsKey(chartEvents)
+                + "|AI=" + eventsKey(paxAiEvents);
+    }
+
+    /** Stable signature of a chart-event list: size + sorted ids.
+     *  Two lists with the same set of ids (in any order) produce the
+     *  same key, so a re-poll that returns the same events does NOT
+     *  retrigger a repaint. */
+    static String eventsKey(List<PaxInstitutionalChartEvent> events) {
+        if (events == null || events.isEmpty()) return "0";
+        java.util.ArrayList<String> ids = new java.util.ArrayList<>(events.size());
+        for (PaxInstitutionalChartEvent e : events) {
+            if (e == null) continue;
+            ids.add(e.id == null ? "" : e.id);
+        }
+        java.util.Collections.sort(ids);
+        StringBuilder sb = new StringBuilder(16 + ids.size() * 24);
+        sb.append(ids.size()).append(';');
+        for (String id : ids) sb.append(id).append(',');
+        return sb.toString();
     }
 
     private static String semanticKey(PaxTrendSignalModel model) {

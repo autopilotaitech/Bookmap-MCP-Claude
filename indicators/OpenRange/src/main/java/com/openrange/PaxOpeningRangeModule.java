@@ -201,19 +201,16 @@ public class PaxOpeningRangeModule implements
 
     /** Decide whether the /api/snapshot fetcher worker should be running.
      *
-     *  <p>Historically the fetcher was gated on {@code showTrendTriangles}
-     *  alone. That broke the institutional-chart-events pipeline: if the
-     *  operator toggled trend triangles off, the fetcher stopped polling
-     *  and the new chart-events layer received no data either. Both UI
-     *  layers consume the same /api/snapshot; either being on means the
-     *  fetcher must run.</p>
+     *  <p>The legacy trend-triangle layer is deliberately not a fetcher
+     *  driver anymore. Chart plotting is anchored to institutional
+     *  chart-events; broad trend/conviction pulses stay off the chart.</p>
      *
      *  Pure static so the OR logic is unit-testable without spinning up
      *  the full module / HttpClient.
      */
     static boolean trendFetcherShouldRun(boolean showTrendTriangles,
                                           boolean showInstitutionalChartEvents) {
-        return showTrendTriangles || showInstitutionalChartEvents;
+        return showInstitutionalChartEvents;
     }
     /** Stale-cliff for incoming trend_signal: keep existing triangles drawn,
      * but do not emit new ones if the fetcher's last successful HTTP receive
@@ -223,6 +220,9 @@ public class PaxOpeningRangeModule implements
      * sizes are distinguishable at the same price. */
     static final int TRIANGLE_OFFSET_TICKS_STRONG = 4;
     static final int TRIANGLE_OFFSET_TICKS_WEAK = 2;
+    static final int CHART_EVENT_ICON_FONT = 9;
+    static final int MAX_CHART_EVENTS_PER_COLLISION_BUCKET = 1;
+    static final long CHART_EVENT_COLLISION_TIME_MS = 5_000L;
     /** Chart-event labels collide visually when their prices are within a few
      *  ticks and their timestamps land on the same rendered chart column.
      *  Bucket by this many ticks so different marker texts at the same level
@@ -914,8 +914,9 @@ public class PaxOpeningRangeModule implements
         c.gridwidth = 1;
 
         JCheckBox showTrendTriangles = new JCheckBox(
-                "Show Legacy Trend Triangles (conviction)",
-                settings.showTrendTriangles);
+                "Legacy Trend Triangles disabled (anchored chart only)",
+                false);
+        showTrendTriangles.setEnabled(false);
         c.gridx = 0;
         c.gridy = row++;
         c.gridwidth = 4;
@@ -969,7 +970,7 @@ public class PaxOpeningRangeModule implements
             settings.heatwaveFontSize = (Integer) heatwaveFontSize.getValue();
             settings.heatwavePollMs = (Integer) heatwavePollMs.getValue();
             settings.heatwaveUrl = heatwaveUrl.getText();
-            settings.showTrendTriangles = showTrendTriangles.isSelected();
+            settings.showTrendTriangles = false;
             settings.showInstitutionalChartEvents = showInstitutionalChartEvents.isSelected();
             saveSettings(null, settings);
             rebuildCalculators();
@@ -1055,11 +1056,13 @@ public class PaxOpeningRangeModule implements
         PaxOpeningRangeUiSettings ui = loadSettings();
         int latestChart = trendSignals.latestInstitutionalChartEvents().size();
         int latestInst = trendSignals.latestInstitutionalEvents().size();
+        int latestPaxAi = trendSignals.latestPaxAiChartEvents().size();
         int historyChart = (state == null) ? 0 : state.chartEventMarkers.size();
         int historyInst = (state == null) ? 0 : state.institutionalMarkers.size();
+        int historyPaxAi = (state == null) ? 0 : state.paxAiChartEventMarkers.size();
         boolean fetcherWanted = trendFetcherShouldRun(
                 ui.showTrendTriangles, ui.showInstitutionalChartEvents);
-        StringBuilder sb = new StringBuilder(384);
+        StringBuilder sb = new StringBuilder(512);
         sb.append("Chart events plumbing\n");
         sb.append("  snapshot URL:                ").append(trendSignals.currentUrl()).append('\n');
         sb.append("  fetcher running:             ").append(trendSignals.isRunning()).append('\n');
@@ -1070,6 +1073,8 @@ public class PaxOpeningRangeModule implements
         sb.append("  durable chart history count: ").append(historyChart).append('\n');
         sb.append("  latest signals count:        ").append(latestInst).append('\n');
         sb.append("  durable signals history:     ").append(historyInst).append('\n');
+        sb.append("  latest pax_ai_chart count:   ").append(latestPaxAi).append('\n');
+        sb.append("  durable pax_ai history:      ").append(historyPaxAi).append('\n');
         sb.append("  consecutive fetch failures:  ").append(trendSignals.consecutiveFailures()).append('\n');
         sb.append("  last failure reason:         ").append(trendSignals.lastFailureReason());
         return sb.toString();
@@ -1169,6 +1174,14 @@ public class PaxOpeningRangeModule implements
          *  persistence contract as institutionalMarkers. */
         final PaxInstitutionalChartEventsHistory chartEventMarkers =
                 new PaxInstitutionalChartEventsHistory(MAX_LIVE_CHART_EVENT_MARKERS);
+        /** Active-set history for Pax AI chart events. REPLACE semantics
+         *  (not append-only) so an expired AI marker disappears from the
+         *  chart the moment the dashboard drops it from snap[
+         *  "pax_ai_chart_events"]. Local institutional events stay
+         *  append-only because they're observed evidence that doesn't
+         *  expire. */
+        final PaxAiChartEventsActiveHistory paxAiChartEventMarkers =
+                new PaxAiChartEventsActiveHistory(MAX_LIVE_CHART_EVENT_MARKERS);
         String lastEmittedKind = "";
         long lastEmittedBucketEnteredMs = 0L;
         String lastNativeSignalMarkerKey = "";
@@ -1617,7 +1630,7 @@ public class PaxOpeningRangeModule implements
             InstrumentState state = instruments.get(alias);
             if (state == null) return;
             PaxOpeningRangeUiSettings ui = loadSettings();
-            boolean showLegacy = ui.showTrendTriangles;
+            boolean showLegacy = false;
             boolean showChartEvents = ui.showInstitutionalChartEvents;
             PaxTrendSignalModel signal = trendSignals.snapshot();
             // Merge unconditionally so new institutional ids land in history
@@ -1627,8 +1640,24 @@ public class PaxOpeningRangeModule implements
             // -> canvas preserved.
             int newInst = state.institutionalMarkers.merge(trendSignals.latestInstitutionalEvents());
             int newChart = state.chartEventMarkers.merge(trendSignals.latestInstitutionalChartEvents());
+            // Active-set semantics for AI: replace history with the
+            // current TTL-active set so an expired marker drops on the
+            // next repaint. Alias-filtered defensively against
+            // state.alias because the fetcher is module-scoped and the
+            // dashboard might briefly serve cross-instrument rows in a
+            // multi-symbol session.
+            java.util.List<PaxInstitutionalChartEvent> paxAiFromFetch =
+                    filterByAlias(trendSignals.latestPaxAiChartEvents(), state.alias);
+            state.paxAiChartEventMarkers.replaceActiveSet(paxAiFromFetch);
             int instSize = state.institutionalMarkers.size();
             int chartSize = state.chartEventMarkers.size();
+            // AI active set uses a sorted-id signature so a one-for-one
+            // replacement (a1 -> a2, count stays 1) still changes the
+            // render key. Count alone is insufficient because replace-
+            // active-set semantics keep the size constant across
+            // legitimate marker transitions.
+            String paxAiSig = paxAiRenderSignature(
+                    state.paxAiChartEventMarkers.snapshot());
             String renderKey = triangleRenderKey(showLegacy, signal,
                     state.lastEmittedKind, state.lastEmittedBucketEnteredMs,
                     state.liveTriangles.size())
@@ -1636,7 +1665,8 @@ public class PaxOpeningRangeModule implements
                     + "|INS=" + instSize
                     + (newInst > 0 ? "|+" + newInst : "")
                     + "|CHE=" + chartSize
-                    + (newChart > 0 ? "|+" + newChart : "");
+                    + (newChart > 0 ? "|+" + newChart : "")
+                    + "|AI=" + paxAiSig;
             if (!force && renderKey.equals(lastTriangleRenderKey)) {
                 return;
             }
@@ -1650,7 +1680,7 @@ public class PaxOpeningRangeModule implements
                 addInstitutionalMarkers(state);
             }
             if (showChartEvents) {
-                addInstitutionalChartEvents(state);
+                addAllChartEvents(state);
             }
             lastTriangleRenderKey = renderKey;
         }
@@ -1878,23 +1908,30 @@ public class PaxOpeningRangeModule implements
          *  the triangleShapes clear list — meaning the shape is removed and
          *  re-added on every refresh from the durable history deque.</p>
          */
-        /** Redraw the full evidence-trail history of institutional chart
-         *  events. Stagger y-offset by severity rank so overlapping events
-         *  at the same level/time don't cover each other. */
-        private void addInstitutionalChartEvents(InstrumentState state) {
-            java.util.List<PaxInstitutionalChartEvent> history = state.chartEventMarkers.snapshot();
-            // Group by rendered chart-time + side + nearby price to apply a
-            // per-group stagger. Do not include label/marker text: WATCH,
-            // TCH, SWP, ACC, etc. can share one visual spot and must stack.
-            // Drawing in insertion order; the per-event stagger is computed
-            // from severityRank + a small per-event ordinal within the same
-            // collision bucket.
-            java.util.HashMap<String, Integer> bucketOrdinal = new java.util.HashMap<>();
-            for (PaxInstitutionalChartEvent evt : history) {
-                String bucketKey = chartEventCollisionKey(evt, state.pips);
-                int ord = bucketOrdinal.getOrDefault(bucketKey, 0);
-                bucketOrdinal.put(bucketKey, ord + 1);
-                drawInstitutionalChartEvent(state, evt, ord);
+        /** Redraw the combined evidence-trail history (local + Pax AI)
+         *  for chart events.
+         *
+         *  <p>Both AI and LOC markers normalize to the same
+         *  {@link PaxInstitutionalChartEvent} model and feed into ONE
+         *  ordered list. The collision allocator then runs over the
+         *  union so AI + LOC at the same level/time share a lane and
+         *  stack via the per-bucket ordinal — no overlap. Dense clusters
+         *  (more events than the cap) collapse to ENTRY/EXIT first via
+         *  {@link #collapseDenseCluster}.</p>
+         */
+        private void addAllChartEvents(InstrumentState state) {
+            java.util.List<PaxInstitutionalChartEvent> all =
+                    new java.util.ArrayList<>(state.chartEventMarkers.size()
+                            + state.paxAiChartEventMarkers.size());
+            all.addAll(state.chartEventMarkers.snapshot());
+            all.addAll(state.paxAiChartEventMarkers.snapshot());
+            java.util.List<ChartEventDisplay> display =
+                    collapseChartEventsForDisplay(all, state.pips, MAX_LIVE_CHART_EVENT_MARKERS);
+            // Sort by timestamp ascending so newer events draw on top of
+            // older ones in nearby regions.
+            display.sort((a, b) -> Long.compare(a.event.timestampMs, b.event.timestampMs));
+            for (ChartEventDisplay evt : display) {
+                drawInstitutionalChartEvent(state, evt.event, 0, evt.clusterSize);
             }
         }
 
@@ -1908,22 +1945,27 @@ public class PaxOpeningRangeModule implements
         private void drawInstitutionalChartEvent(InstrumentState state,
                                                   PaxInstitutionalChartEvent evt,
                                                   int bucketOrdinal) {
+            drawInstitutionalChartEvent(state, evt, bucketOrdinal, 1);
+        }
+
+        private void drawInstitutionalChartEvent(InstrumentState state,
+                                                  PaxInstitutionalChartEvent evt,
+                                                  int bucketOrdinal,
+                                                  int clusterSize) {
             if (evt == null || !evt.isRenderable()) return;
             double tickSize = state.pips;
             if (!Double.isFinite(tickSize) || tickSize <= 0.0) return;
 
             java.awt.Color color = evt.colorFromHint();
-            PreparedImage image = labelImage(evt.markerText, color, TRIANGLE_FONT_WEAK);
+            PreparedImage image = chartEventIconImage(evt, color, clusterSize);
             int w = image.getReadOnlyImage().getWidth();
             int h = image.getReadOnlyImage().getHeight();
             long xNanos = PaxChartTimeCoords.epochMsToChartNanos(evt.timestampMs);
 
-            // Offset in ticks: ENTRY/EXIT closer to the level, WATCH/INFO
-            // further out. Stagger ordinal adds h-pixels of separation
-            // within the same (label, ts) bucket.
-            int baseTicks = TRIANGLE_OFFSET_TICKS_WEAK;
-            int severityShift = evt.severityRank();  // 0..5
-            int offsetTicks = baseTicks + severityShift;
+            // Keep badges out of the trade-bubble stack. The old 2-5 tick
+            // offset landed labels inside NQ bubbles; these sit 3.5-6 pts
+            // away and collapsed clusters do not stack on the same level.
+            int offsetTicks = chartEventOffsetTicks(evt);
 
             boolean placeBelow = isPlaceBelow(evt);
             double anchorPrice;
@@ -1939,9 +1981,9 @@ public class PaxOpeningRangeModule implements
                 yPxBottom = -stagger;
             }
             addTriangleShape(image,
-                    new CompositeHorizontalCoordinate(CompositeCoordinateBase.DATA_ZERO, -w / 2, xNanos),
+                    new CompositeHorizontalCoordinate(CompositeCoordinateBase.DATA_ZERO, 10, xNanos),
                     new CompositeVerticalCoordinate(CompositeCoordinateBase.DATA_ZERO, yPxTop, anchorPrice),
-                    new CompositeHorizontalCoordinate(CompositeCoordinateBase.DATA_ZERO, w / 2, xNanos),
+                    new CompositeHorizontalCoordinate(CompositeCoordinateBase.DATA_ZERO, 10 + w, xNanos),
                     new CompositeVerticalCoordinate(CompositeCoordinateBase.DATA_ZERO, yPxBottom, anchorPrice));
         }
 
@@ -2310,7 +2352,7 @@ public class PaxOpeningRangeModule implements
 
     static String chartEventCollisionKey(PaxInstitutionalChartEvent evt, double tickSize) {
         if (evt == null) return "NULL";
-        long timeBucket = evt.timestampMs / 1000L;
+        long timeBucket = evt.timestampMs / CHART_EVENT_COLLISION_TIME_MS;
         boolean placeBelow = chartEventPlaceBelow(evt);
         long priceTicks;
         if (Double.isFinite(evt.price) && evt.price > 0.0
@@ -2323,6 +2365,244 @@ public class PaxOpeningRangeModule implements
                 ? Long.MIN_VALUE
                 : Math.floorDiv(priceTicks, CHART_EVENT_COLLISION_PRICE_TICKS);
         return timeBucket + "|" + (placeBelow ? "B" : "A") + "|" + priceBucket;
+    }
+
+    /** Stable sorted-id signature of the current Pax AI active set. Used
+     *  by the painter's renderKey so a one-for-one ID swap (count stays
+     *  the same but the active marker changed) still triggers a redraw.
+     *  Delegates to {@link PaxTrendSignalFetcher#eventsKey} so painter
+     *  and fetcher use the same signature shape (no drift). Pure +
+     *  package-private for testability. */
+    static String paxAiRenderSignature(java.util.List<PaxInstitutionalChartEvent> events) {
+        return PaxTrendSignalFetcher.eventsKey(events);
+    }
+
+    /** Defensive alias filter for chart events. Used by the AI render
+     *  path because the fetcher is module-scoped (one fetcher feeds every
+     *  painter), so without filtering an NQ AI signal could draw on an
+     *  ES chart in a multi-symbol session. Accepts events with empty /
+     *  null alias as a safety hedge against malformed payloads (rather
+     *  than dropping silently). */
+    static java.util.List<PaxInstitutionalChartEvent> filterByAlias(
+            java.util.List<PaxInstitutionalChartEvent> events, String alias) {
+        if (events == null || events.isEmpty()) {
+            return java.util.Collections.emptyList();
+        }
+        if (alias == null || alias.isEmpty()) {
+            return new java.util.ArrayList<>(events);
+        }
+        java.util.ArrayList<PaxInstitutionalChartEvent> out =
+                new java.util.ArrayList<>(events.size());
+        for (PaxInstitutionalChartEvent e : events) {
+            if (e == null) continue;
+            String eAlias = e.alias;
+            if (eAlias == null || eAlias.isEmpty() || alias.equals(eAlias)) {
+                out.add(e);
+            }
+        }
+        return out;
+    }
+
+    /** Source bucket for badge prefix purposes. Pure function of
+     *  {@link PaxInstitutionalChartEvent#source}; package-private so the
+     *  render-style tests can exercise it directly. */
+    static String chartEventSourceBucket(PaxInstitutionalChartEvent evt) {
+        if (evt == null) return "CTX";
+        String src = evt.source == null ? "" : evt.source;
+        if ("pax_ai".equals(src)) return "AI";
+        if (src.startsWith("institutional")) return "LOC";
+        return "CTX";
+    }
+
+    /** Source-aware badge text. AI markers keep the Python-side prefix
+     *  verbatim (Python composes "AI <arrow> <label> <conf>"); LOC and
+     *  CTX markers get a Java-side prefix + direction arrow + confidence
+     *  appended so the trader can read source + direction + confidence
+     *  at a glance.
+     *
+     *  <p>Examples (from the spec):
+     *  <pre>
+     *      AI ▲ OR-H 72
+     *      LOC ▲ ACC-L 68
+     *      CTX ◆ STACK 44
+     *  </pre>
+     */
+    static String chartEventRenderText(PaxInstitutionalChartEvent evt) {
+        return compactChartEventRenderText(evt);
+    }
+    static String compactChartEventRenderText(PaxInstitutionalChartEvent evt) {
+        if (evt == null) return "";
+        String bucket = chartEventSourceBucket(evt);
+        String source = "AI".equals(bucket) ? "AI" : ("LOC".equals(bucket) ? "L" : "C");
+        String dir;
+        if ("LONG".equals(evt.direction))       dir = "^";
+        else if ("SHORT".equals(evt.direction)) dir = "v";
+        else                                     dir = ".";
+        int conf = Double.isFinite(evt.confidence)
+                ? Math.max(0, Math.min(100, (int) Math.round(evt.confidence * 100.0)))
+                : 0;
+        return source + dir + compactChartEventCode(evt) + conf;
+    }
+
+    static String compactChartEventCode(PaxInstitutionalChartEvent evt) {
+        if (evt == null) return "?";
+        String text = evt.markerText == null ? "" : evt.markerText;
+        String label = evt.label == null ? "" : evt.label;
+        String raw = text.isEmpty() ? label : text;
+        String upper = asciiOnly(raw).toUpperCase(java.util.Locale.US)
+                .replace("AI", "")
+                .replace("LOC", "")
+                .replace("CTX", "")
+                .replace("^", "")
+                .replace("V", "")
+                .replace(".", "")
+                .replace(" ", "")
+                .replace("-", "");
+        if (upper.contains("STACK")) return "STK";
+        if (upper.contains("WATCH")) return "WCH";
+        if (upper.contains("PULL"))  return "PUL";
+        if (upper.contains("SWP"))   return "SWP";
+        if (upper.contains("ACC"))   return "ACC";
+        if (upper.contains("REJ"))   return "REJ";
+        if (upper.contains("TCH"))   return "TCH";
+        if (upper.contains("ICE"))   return "ICE";
+        if (upper.contains("ABS"))   return "ABS";
+        if (upper.contains("SPD"))   return "SPD";
+        if (upper.contains("SCR"))   return "SCR";
+        String cleaned = upper.isEmpty()
+                ? asciiOnly(label).toUpperCase(java.util.Locale.US).replace("-", "")
+                : upper;
+        cleaned = cleaned.replaceAll("[^A-Z0-9+]", "");
+        if (cleaned.isEmpty()) return "?";
+        return cleaned.length() > 3 ? cleaned.substring(0, 3) : cleaned;
+    }
+
+    private static String asciiOnly(String text) {
+        if (text == null || text.isEmpty()) return "";
+        StringBuilder out = new StringBuilder(text.length());
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c >= 32 && c <= 126) out.append(c);
+        }
+        return out.toString();
+    }
+
+    /** Collapse a dense cluster to at most {@code maxVisible} markers,
+     *  preserving the most important ones. Ordering: ENTRY (rank 0) /
+     *  EXIT (1) before WARNING (2) / WATCH (3) / INFO (4). Ties are
+     *  broken by confidence descending, then by timestamp descending so
+     *  the newer signal wins.
+     *
+     *  <p>Pure function; visible for unit tests.</p>
+     */
+    static java.util.List<PaxInstitutionalChartEvent> collapseDenseCluster(
+            java.util.List<PaxInstitutionalChartEvent> events, int maxVisible) {
+        if (events == null) return java.util.Collections.emptyList();
+        if (events.size() <= maxVisible) return new java.util.ArrayList<>(events);
+        java.util.List<PaxInstitutionalChartEvent> copy = new java.util.ArrayList<>(events);
+        copy.sort((a, b) -> {
+            int r = Integer.compare(a.severityRank(), b.severityRank());
+            if (r != 0) return r;
+            int c = Double.compare(b.confidence, a.confidence);
+            if (c != 0) return c;
+            return Long.compare(b.timestampMs, a.timestampMs);
+        });
+        return new java.util.ArrayList<>(copy.subList(0, maxVisible));
+    }
+
+    static java.util.List<PaxInstitutionalChartEvent> capChartEventsPerCollisionBucket(
+            java.util.List<PaxInstitutionalChartEvent> events,
+            double tickSize,
+            int maxPerBucket) {
+        if (events == null || events.isEmpty()) {
+            return java.util.Collections.emptyList();
+        }
+        if (maxPerBucket <= 0) {
+            return java.util.Collections.emptyList();
+        }
+        java.util.List<PaxInstitutionalChartEvent> ranked = new java.util.ArrayList<>(events);
+        ranked.sort((a, b) -> {
+            int r = Integer.compare(a.severityRank(), b.severityRank());
+            if (r != 0) return r;
+            int s = Integer.compare(chartEventSourcePriority(a), chartEventSourcePriority(b));
+            if (s != 0) return s;
+            int c = Double.compare(b.confidence, a.confidence);
+            if (c != 0) return c;
+            return Long.compare(b.timestampMs, a.timestampMs);
+        });
+        java.util.HashMap<String, Integer> counts = new java.util.HashMap<>();
+        java.util.ArrayList<PaxInstitutionalChartEvent> out = new java.util.ArrayList<>();
+        for (PaxInstitutionalChartEvent evt : ranked) {
+            String key = chartEventCollisionKey(evt, tickSize);
+            int count = counts.getOrDefault(key, 0);
+            if (count >= maxPerBucket) continue;
+            counts.put(key, count + 1);
+            out.add(evt);
+        }
+        return out;
+    }
+
+    static java.util.List<ChartEventDisplay> collapseChartEventsForDisplay(
+            java.util.List<PaxInstitutionalChartEvent> events,
+            double tickSize,
+            int maxVisible) {
+        if (events == null || events.isEmpty() || maxVisible <= 0) {
+            return java.util.Collections.emptyList();
+        }
+        java.util.HashMap<String, java.util.List<PaxInstitutionalChartEvent>> byBucket =
+                new java.util.HashMap<>();
+        for (PaxInstitutionalChartEvent evt : events) {
+            if (evt == null || !evt.isRenderable()) continue;
+            String key = chartEventCollisionKey(evt, tickSize);
+            byBucket.computeIfAbsent(key, k -> new java.util.ArrayList<>()).add(evt);
+        }
+        java.util.ArrayList<ChartEventDisplay> out = new java.util.ArrayList<>(byBucket.size());
+        for (java.util.List<PaxInstitutionalChartEvent> bucket : byBucket.values()) {
+            bucket.sort(PaxOpeningRangeModule::compareChartEventPriority);
+            out.add(new ChartEventDisplay(bucket.get(0), bucket.size()));
+        }
+        out.sort((a, b) -> {
+            int r = compareChartEventPriority(a.event, b.event);
+            if (r != 0) return r;
+            return Long.compare(b.event.timestampMs, a.event.timestampMs);
+        });
+        if (out.size() > maxVisible) {
+            return new java.util.ArrayList<>(out.subList(0, maxVisible));
+        }
+        return out;
+    }
+
+    static int chartEventOffsetTicks(PaxInstitutionalChartEvent evt) {
+        int rank = evt == null ? 4 : Math.max(0, Math.min(4, evt.severityRank()));
+        return 14 + rank * 3;
+    }
+
+    private static int compareChartEventPriority(PaxInstitutionalChartEvent a,
+                                                 PaxInstitutionalChartEvent b) {
+        int r = Integer.compare(a.severityRank(), b.severityRank());
+        if (r != 0) return r;
+        int s = Integer.compare(chartEventSourcePriority(a), chartEventSourcePriority(b));
+        if (s != 0) return s;
+        int c = Double.compare(b.confidence, a.confidence);
+        if (c != 0) return c;
+        return Long.compare(b.timestampMs, a.timestampMs);
+    }
+
+    static final class ChartEventDisplay {
+        final PaxInstitutionalChartEvent event;
+        final int clusterSize;
+
+        ChartEventDisplay(PaxInstitutionalChartEvent event, int clusterSize) {
+            this.event = event;
+            this.clusterSize = Math.max(1, clusterSize);
+        }
+    }
+
+    private static int chartEventSourcePriority(PaxInstitutionalChartEvent evt) {
+        String bucket = chartEventSourceBucket(evt);
+        if ("AI".equals(bucket)) return 0;
+        if ("LOC".equals(bucket)) return 1;
+        return 2;
     }
 
     static boolean chartEventPlaceBelow(PaxInstitutionalChartEvent evt) {
@@ -2509,6 +2789,66 @@ public class PaxOpeningRangeModule implements
             return String.format(java.util.Locale.US, "%.2f", price);
         }
         return String.format(java.util.Locale.US, "%.4f", price);
+    }
+
+    static PreparedImage chartEventIconImage(PaxInstitutionalChartEvent evt, Color accent) {
+        return chartEventIconImage(evt, accent, 1);
+    }
+
+    static PreparedImage chartEventIconImage(PaxInstitutionalChartEvent evt, Color accent,
+                                             int clusterSize) {
+        String bucket = chartEventSourceBucket(evt);
+        String text = chartEventRenderText(evt);
+        if (clusterSize > 1) {
+            text = text + "+" + Math.min(clusterSize - 1, 9);
+        }
+        Font font = new Font(Font.SANS_SERIF, Font.BOLD, CHART_EVENT_ICON_FONT);
+        BufferedImage scratch = new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D sg = scratch.createGraphics();
+        sg.setFont(font);
+        FontMetrics metrics = sg.getFontMetrics();
+        int textWidth = text.isEmpty() ? 0 : metrics.stringWidth(text);
+        sg.dispose();
+
+        int icon = 13;
+        int gap = text.isEmpty() ? 0 : 3;
+        int pad = text.isEmpty() ? 2 : 4;
+        int width = Math.max(17, pad * 2 + icon + gap + textWidth);
+        int height = 17;
+        BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = image.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+
+        Color safeAccent = accent == null ? new Color(176, 176, 176) : accent;
+        Color bg = new Color(4, 8, 12, 220);
+        Color border = new Color(safeAccent.getRed(), safeAccent.getGreen(), safeAccent.getBlue(),
+                "AI".equals(bucket) ? 245 : 228);
+        g.setColor(bg);
+        g.fillRoundRect(0, 0, width - 1, height - 1, 4, 4);
+        g.setColor(border);
+        g.setStroke(new BasicStroke("AI".equals(bucket) ? 1.6f : 1.1f));
+        g.drawRoundRect(0, 0, width - 1, height - 1, 4, 4);
+
+        int cx = pad + icon / 2;
+        int cy = height / 2;
+        g.setColor(new Color(safeAccent.getRed(), safeAccent.getGreen(), safeAccent.getBlue(), 238));
+        if (evt != null && "LONG".equals(evt.direction)) {
+            g.fillPolygon(new int[] {cx, cx - 5, cx + 5}, new int[] {cy - 5, cy + 5, cy + 5}, 3);
+        } else if (evt != null && "SHORT".equals(evt.direction)) {
+            g.fillPolygon(new int[] {cx - 5, cx + 5, cx}, new int[] {cy - 5, cy - 5, cy + 5}, 3);
+        } else {
+            g.fillOval(cx - 4, cy - 4, 8, 8);
+        }
+
+        if (!text.isEmpty()) {
+            int textX = pad + icon + gap;
+            g.setFont(font);
+            g.setColor(new Color(235, 242, 246, 242));
+            g.drawString(text, textX, metrics.getAscent() + 1);
+        }
+        g.dispose();
+        return new PreparedImage(image);
     }
 
     private static PreparedImage labelImage(String text, Color color, int fontSize) {

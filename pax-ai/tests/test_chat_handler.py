@@ -730,3 +730,94 @@ def test_router_hint_does_not_leak_into_sse_done_payload(monkeypatch):
     assert distinct_hint not in sse_bytes, (
         "router_hint must NOT appear in any SSE event payload "
         "(start/token/done/error)")
+
+
+# ---------------------------------------------------------------------------
+# _capture_ai_chart_signal — post-stream AI chart-marker bridge
+# ---------------------------------------------------------------------------
+
+
+def test_capture_ai_chart_signal_appends_when_block_valid(tmp_path, monkeypatch):
+    """A Pax AI response with a well-formed block + valid snapshot lands
+    one row in the AI-chart-signal store."""
+    from pax_ai import ai_chart_signal_store as store_mod
+    p = tmp_path / "ai-store.jsonl"
+    monkeypatch.setattr(store_mod, "DEFAULT_STORE_PATH", p)
+    snap = {
+        "alias": "NQM6.CME@RITHMIC", "health": "ok",
+        "or_levels": {"orHigh": 20000.0, "orLow": 19950.0,
+                       "levels": [{"label": "OR-H", "price": 20000.0,
+                                    "side": "above"}]},
+    }
+    pax_text = (
+        "OR-H accepted with WITH flow.\n"
+        "<<PAX_AI_CHART_SIGNAL>>\n"
+        '{"action":"PAY_FOR_TRADE","direction":"LONG","label":"OR-H",'
+        '"price":20000.0,"confidence":0.72,"reason":"acceptance"}\n'
+        "<<END>>"
+    )
+    chat._capture_ai_chart_signal(pax_text=pax_text, snap=snap)
+    import time as _t
+    out = store_mod.read_active(store_path=p,
+                                 now_ms=int(_t.time() * 1000) + 1)
+    assert len(out) == 1
+    assert out[0]["action"] == "PAY_FOR_TRADE"
+    assert out[0]["label"] == "OR-H"
+    assert out[0]["source"] == "pax_ai"
+
+
+def test_capture_ai_chart_signal_no_block_no_write(tmp_path, monkeypatch):
+    """Prose-only response writes nothing."""
+    from pax_ai import ai_chart_signal_store as store_mod
+    p = tmp_path / "ai-store.jsonl"
+    monkeypatch.setattr(store_mod, "DEFAULT_STORE_PATH", p)
+    snap = {"alias": "X", "health": "ok",
+             "or_levels": {"levels": [{"label": "OR-H", "price": 1.0,
+                                        "side": "above"}]}}
+    chat._capture_ai_chart_signal(pax_text="plain prose only", snap=snap)
+    import time as _t
+    out = (store_mod.read_active(store_path=p,
+                                  now_ms=int(_t.time() * 1000) + 1)
+            if p.exists() else [])
+    assert out == []
+
+
+def test_capture_ai_chart_signal_invalid_block_no_write(tmp_path, monkeypatch):
+    """A block whose label can't be grounded in the snapshot is silently
+    dropped."""
+    from pax_ai import ai_chart_signal_store as store_mod
+    p = tmp_path / "ai-store.jsonl"
+    monkeypatch.setattr(store_mod, "DEFAULT_STORE_PATH", p)
+    snap = {"alias": "X", "health": "ok",
+             "or_levels": {"levels": [{"label": "OR-H", "price": 20000.0,
+                                        "side": "above"}]}}
+    pax_text = (
+        "<<PAX_AI_CHART_SIGNAL>>\n"
+        '{"action":"PAY_FOR_TRADE","direction":"LONG","label":"+9",'
+        '"price":20450.0,"confidence":0.72,"reason":"hallucinated"}\n'
+        "<<END>>"
+    )
+    chat._capture_ai_chart_signal(pax_text=pax_text, snap=snap)
+    import time as _t
+    out = (store_mod.read_active(store_path=p,
+                                  now_ms=int(_t.time() * 1000) + 1)
+            if p.exists() else [])
+    assert out == []
+
+
+def test_capture_ai_chart_signal_swallows_exceptions(monkeypatch):
+    """If the validator raises, the chat path must NOT propagate. Pax AI
+    chart plumbing is never allowed to break the chat itself."""
+    from pax_ai import ai_chart_signal
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated validator crash")
+    monkeypatch.setattr(ai_chart_signal, "validate_against_snapshot", _boom)
+    # Must not raise.
+    chat._capture_ai_chart_signal(pax_text=(
+        "<<PAX_AI_CHART_SIGNAL>>\n"
+        '{"action":"PAY_FOR_TRADE","direction":"LONG","label":"OR-H",'
+        '"price":20000.0,"confidence":0.72,"reason":"r"}\n'
+        "<<END>>"
+    ), snap={"alias": "X", "health": "ok",
+              "or_levels": {"levels": [{"label": "OR-H", "price": 20000.0,
+                                          "side": "above"}]}})

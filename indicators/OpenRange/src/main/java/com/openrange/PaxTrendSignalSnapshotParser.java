@@ -113,6 +113,66 @@ final class PaxTrendSignalSnapshotParser {
         return out;
     }
 
+    /** Parse the Pax AI chart-events array from
+     *  {@code snap["pax_ai_chart_events"]}.
+     *
+     *  <p>Mirrors {@link #parseChartEvents(String)} but reads a different
+     *  key. Always stamps {@code source = "pax_ai"} on every emitted
+     *  event regardless of the payload's source field — defense in depth
+     *  so a future payload-spoofing bug cannot make AI events look local.
+     *  Returns empty list on missing key / malformed JSON / non-ok
+     *  health. Never throws.</p>
+     */
+    static List<PaxInstitutionalChartEvent> parsePaxAiChartEvents(String json) {
+        if (json == null || json.isEmpty()) {
+            return java.util.Collections.emptyList();
+        }
+        Object root;
+        try {
+            root = new Tokenizer(json).parseValue(true);
+        } catch (RuntimeException e) {
+            return java.util.Collections.emptyList();
+        }
+        if (!(root instanceof Map)) {
+            return java.util.Collections.emptyList();
+        }
+        Map<?, ?> rootMap = (Map<?, ?>) root;
+        Object healthObj = rootMap.get("health");
+        if (healthObj instanceof String && !"ok".equalsIgnoreCase((String) healthObj)) {
+            return java.util.Collections.emptyList();
+        }
+        Object evsObj = rootMap.get("pax_ai_chart_events");
+        if (!(evsObj instanceof List)) {
+            return java.util.Collections.emptyList();
+        }
+        List<?> evs = (List<?>) evsObj;
+        ArrayList<PaxInstitutionalChartEvent> out = new ArrayList<>(evs.size());
+        for (Object o : evs) {
+            if (!(o instanceof Map)) continue;
+            Map<?, ?> e = (Map<?, ?>) o;
+            String id = asString(e.get("id"));
+            String alias = asString(e.get("alias"));
+            String label = asString(e.get("label"));
+            Double priceObj = asDouble(e.get("price"));
+            String side = asString(e.get("side"));
+            String eventType = asString(e.get("event_type"));
+            String direction = asString(e.get("direction"));
+            String executionRead = asString(e.get("execution_read"));
+            String markerText = asString(e.get("marker_text"));
+            String markerColorHint = asString(e.get("marker_color_hint"));
+            String severity = asString(e.get("severity"));
+            long timestampMs = asLong(e.get("timestamp_ms"), 0L);
+            Double confObj = asDouble(e.get("confidence"));
+            double price = priceObj == null ? Double.NaN : priceObj.doubleValue();
+            double confidence = confObj == null ? Double.NaN : confObj.doubleValue();
+            out.add(new PaxInstitutionalChartEvent(
+                    id, alias, label, price, side, eventType, direction,
+                    executionRead, markerText, markerColorHint, severity,
+                    timestampMs, "pax_ai", confidence));
+        }
+        return out;
+    }
+
     /** Parse ALL institutional signal events from {@code snap["institutional_signals"]}.
      *
      * <p>Returns an empty list when {@code institutional_signals} is missing,

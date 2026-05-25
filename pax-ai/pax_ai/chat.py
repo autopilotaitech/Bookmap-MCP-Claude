@@ -182,6 +182,28 @@ def _sse_event(name: str, data: Dict[str, Any]) -> bytes:
     return f"event: {name}\ndata: {payload}\n\n".encode("utf-8")
 
 
+def _capture_ai_chart_signal(pax_text: Optional[str],
+                              snap: Optional[Dict[str, Any]]) -> None:
+    """Best-effort: extract a structured chart-signal block from the Pax
+    AI response, validate against the snapshot the chat was grounded on
+    (NOT a fresh poll, to avoid a race against the 1Hz poller), and
+    atomically append to the cross-process JSONL store.
+
+    Failure paths are silent. Chart plumbing must never break the chat.
+    """
+    try:
+        from . import ai_chart_signal, ai_chart_signal_store
+        blk = ai_chart_signal.extract_block(pax_text or "")
+        if blk is None:
+            return
+        validated = ai_chart_signal.validate_against_snapshot(blk, snap or {})
+        if validated is None:
+            return
+        ai_chart_signal_store.append_signal(validated)
+    except Exception as exc:
+        sys.stderr.write(f"[chat] ai_chart_signal capture failed: {exc}\n")
+
+
 def _clear_abort_if_owned(abort: threading.Event) -> None:
     """Clear _CURRENT_ABORT only if it still points at our event.
 
@@ -413,5 +435,10 @@ def handle_chat_stream(wfile, user_text: str, deep: bool = False) -> None:
             feature_bus.record_ai_turn(rec)
         except Exception as exc:
             sys.stderr.write(f"[chat] feature_bus capture failed: {exc}\n")
+
+        # Pax AI -> chart marker bridge. Validates against the snapshot
+        # the digest was built from (NOT a fresh poll). Any failure is
+        # silent — chart plumbing is not allowed to break the chat path.
+        _capture_ai_chart_signal(pax_text, meta.get("_snapshot_for_capture"))
     finally:
         _clear_abort_if_owned(abort)

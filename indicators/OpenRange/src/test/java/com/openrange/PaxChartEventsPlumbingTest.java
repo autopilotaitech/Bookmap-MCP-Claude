@@ -15,9 +15,8 @@ import com.sun.net.httpserver.HttpServer;
  *  preserve, mirroring the audit findings.
  *
  *  <ul>
- *    <li>Fetcher must run when EITHER legacy trend triangles OR
- *        institutional chart events are enabled.</li>
- *    <li>Fetcher must stop only when BOTH layers are off.</li>
+ *    <li>Fetcher must run when institutional chart events are enabled.</li>
+ *    <li>Legacy trend triangles alone must not run the fetcher.</li>
  *    <li>Settings persistence: showInstitutionalChartEvents round-trips.</li>
  *    <li>Empty later payload must not clear the durable chart-events history.</li>
  *  </ul>
@@ -26,7 +25,7 @@ public class PaxChartEventsPlumbingTest {
 
     public static void main(String[] args) throws Exception {
         fetcherEnabledWhenOnlyChartEventsOn();
-        fetcherEnabledWhenOnlyTrendTrianglesOn();
+        fetcherDisabledWhenOnlyTrendTrianglesOn();
         fetcherDisabledWhenBothOff();
         fetcherEnabledWhenBothOn();
 
@@ -49,9 +48,9 @@ public class PaxChartEventsPlumbingTest {
         }
     }
 
-    private static void fetcherEnabledWhenOnlyTrendTrianglesOn() {
-        if (!PaxOpeningRangeModule.trendFetcherShouldRun(true, false)) {
-            throw new AssertionError("legacy triangles alone must enable fetcher");
+    private static void fetcherDisabledWhenOnlyTrendTrianglesOn() {
+        if (PaxOpeningRangeModule.trendFetcherShouldRun(true, false)) {
+            throw new AssertionError("legacy triangles alone must not enable fetcher");
         }
     }
 

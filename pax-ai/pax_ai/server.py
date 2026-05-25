@@ -32,6 +32,7 @@ from urllib.parse import urlparse, unquote, parse_qs
 from . import DASHBOARD_URL, DEFAULT_PORT
 from . import poller, context as ctx_mod, edge_calculus, playbook, config
 from . import chat as chat_mod, claude_stream, triggers, journal, feature_bus
+from . import trigger_chart_signal
 
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -177,6 +178,7 @@ def _api_pax_playbook() -> Tuple[int, Dict[str, Any]]:
 def _api_pax_whynow() -> Tuple[int, Dict[str, Any]]:
     snap, as_of_ms, age_ms, _fails, _err = poller.latest()
     trigs = triggers.compute_triggers(snap, age_ms if snap is not None else 10**9)
+    trigger_chart_signal.record_trigger_chart_events(trigs, snap)
     return 200, {
         "triggers": trigs,
         "asOfMs":   as_of_ms,

@@ -186,6 +186,16 @@ from .dashboard import (
     _CHART_COLORS,
 )
 
+# Pax AI chart events reader -------------------------------------------------
+from .pax_ai_chart_events import (
+    compute_pax_ai_chart_events,
+    read_pax_ai_chart_events,
+    pax_ai_row_to_chart_event,
+    AI_BULL_COLOR,
+    AI_BEAR_COLOR,
+    AI_NEUTRAL_COLOR,
+)
+
 # Conviction sources (17) ----------------------------------------------------
 from .dashboard import (
     _source_flow_ofi,
@@ -281,6 +291,10 @@ __all__ = [
     # Institutional chart events
     "compute_institutional_chart_events",
     "_CHART_EVENT_TYPES", "_CHART_SEVERITY_RANKS", "_CHART_COLORS",
+    # Pax AI chart events
+    "compute_pax_ai_chart_events", "read_pax_ai_chart_events",
+    "pax_ai_row_to_chart_event",
+    "AI_BULL_COLOR", "AI_BEAR_COLOR", "AI_NEUTRAL_COLOR",
     # Sources
     "_source_flow_ofi", "_source_flow_cvd", "_source_flow_vpt_absorption",
     "_source_regime", "_source_bias_score", "_source_vwap_dislocation",
