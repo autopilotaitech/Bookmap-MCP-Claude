@@ -687,3 +687,65 @@ below are now part of the production invariants — do not regress.
   textarea recalls the last user prompt and re-prepends `/deep ` when
   the prior request was deep. `Ctrl/Cmd+L` scrolls the transcript to
   the bottom.
+
+### Pax AI self-training research loop (next steps, 2026-05-22)
+
+User objective: make Claude/Pax AI "train itself" in the research sense:
+closed-loop self-improvement from captured Bookmap/Pax outcomes. This does
+**not** mean live execution, live order placement, or letting Claude trade.
+It means Claude researches its prior reads, compares them to forward
+outcomes, writes candidate lessons/config/playbook patches, and those
+candidates are replay-tested before any human-approved promotion.
+
+Do not answer this topic abstractly. Start by reading the existing code:
+
+- `pax-ai/pax_ai/feature_bus.py` captures ai_turns, snapshots, digests,
+  trigger events, and blob hashes. Currently disabled by default.
+- `pax-ai/pax_ai/bus_digest.py` builds deterministic structured Claude
+  input blocks: `[STATE] [ANCHOR] [GATES] [LEVELS] [MICROSTRUCTURE]
+  [RECENT_EVENTS] [POSITION] [SESSION_MEMORY] [USER]`.
+- `pax-ai/pax_ai/outcomes.py` labels ai_turn outcomes at 0/60/180/300/900s
+  from `snapshot_features`.
+- `mcp-server/bookmap_mcp/journal.py` and `journal_outcomes.py` store
+  daemon signals and forward-return outcomes.
+- `mcp-server/bookmap_mcp/pax_bus_replay.py` verifies byte-exact replay of
+  the digest Claude saw.
+- `mcp-server/bookmap_mcp/pax_bus_tune.py` produces read-only advisory
+  tuning reports and must not mutate settings.
+- `pax-ai/pax_ai/edge_calculus.py`, `playbook.py`, and `prompts.py` define
+  deterministic edge math, scenario tree, and Claude prompt contracts.
+
+Jane-Street-style public principles to preserve: probabilistic forecasts,
+expected value, deterministic state/replay, time-split validation,
+calibration, defense in depth, and exact "what did the system know then?"
+auditability. Do not claim inside Jane Street knowledge.
+
+Missing pieces to plan/build:
+
+1. `pax_forecast_schema.py`: structured forecast schema emitted by Pax AI
+   turns. Include level, thesis, execution_read, direction, horizon,
+   prob_success, expected_R, invalidation, and feature provenance.
+2. `pax_calibration.py`: reliability/calibration reports by setup bucket
+   and probability bucket. Compare stated probability vs realized payline /
+   realized R at horizons.
+3. `pax_research_claude.py`: offline/nightly research pass. Reads bus DB,
+   snapshot/digest blobs, outcomes, tune reports, and asks Claude to write
+   candidate lessons. This path may use file/tool access but must never talk
+   to broker/live-order tools.
+4. `pax_policy_replay.py`: deterministic replay of current policy vs
+   candidate lessons/config on saved snapshots/outcomes. Use time-ordered
+   train/validation/test splits; no random row shuffle.
+5. Candidate artifacts only: write to `reports/policy-candidates-YYYY-MM-DD.json`,
+   `reports/prompt-lessons-YYYY-MM-DD.md`, or
+   `pax-ai/learned_playbook.candidate.json`. Never auto-edit active
+   `pax_ai_config.json`, `pax_weights.json`, or production prompts without
+   explicit user approval.
+
+Promotion gate:
+
+`research_only -> replay_passed -> paper_candidate -> paper_passed ->
+human_approved -> active`
+
+Any proposed self-training update must include setup bucket, sample count,
+before/after metrics, time split used, calibration impact, replay result,
+and promotion status.
