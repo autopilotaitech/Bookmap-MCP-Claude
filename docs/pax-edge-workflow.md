@@ -87,27 +87,29 @@ $REP  = ".\reports"
 # 1. bus replay (digest byte-equivalence check)
 python -m bookmap_mcp.pax_bus_replay --date $DATE
 
-# 2. outcomes backfill (journal-side, off the pax-bus DB)
-python -m bookmap_mcp.journal_outcomes
-
-# 3. calibration: probability buckets, setup buckets, horizon stats
+# 2. calibration: probability buckets, setup buckets, horizon stats
+#    Reads outcomes from the feature-bus DB trade_outcomes table.
 python -m bookmap_mcp.pax_calibration `
     --date $DATE --forecasts $FCST --bus-db $BUS `
     --report "$REP\calibration-$DATE.json" --min-samples 5
 
-# 4. candidate lessons (dry-run by default; never invokes Claude)
+# 3. candidate lessons (dry-run by default; never invokes Claude)
 python -m bookmap_mcp.pax_research_claude `
     --date $DATE `
     --calibration "$REP\calibration-$DATE.json" `
     --out-dir $REP --min-samples 5 --dry-run
 
-# 5. policy replay (deterministic 60/20/20 time split)
+# 4. policy replay (deterministic 60/20/20 time split)
 python -m bookmap_mcp.pax_policy_replay `
     --forecasts $FCST `
     --candidates "$REP\policy-candidates-$DATE.json" `
     --bus-db $BUS `
     --report "$REP\replay-$DATE.json" --min-samples 30 --date $DATE
 ```
+
+`journal_outcomes` is intentionally not part of this helper. It writes
+daemon-journal outcomes, while `pax_calibration` consumes feature-bus
+`trade_outcomes` through `--bus-db`.
 
 ## Artifacts
 

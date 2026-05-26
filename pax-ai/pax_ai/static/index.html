@@ -803,7 +803,8 @@ function appendTurn(kind, who, text, isStreaming, opts) {
   div.appendChild(whoEl);
   const msgEl = document.createElement('div');
   msgEl.className = 'msg';
-  msgEl.textContent = text || '';
+  msgEl.dataset.rawText = text || '';
+  msgEl.textContent = kind === 'pax' ? stripMachineBlocks(text || '') : (text || '');
   div.appendChild(msgEl);
   // Phase 3 regenerate: each Pax bubble gets a ↻ button that surfaces
   // only when `.last-completed` is set (via CSS), wired up in the
@@ -1016,7 +1017,8 @@ async function loadHistory() {
       div.appendChild(whoEl);
       const msgEl = document.createElement('div');
       msgEl.className = 'msg';
-      msgEl.textContent = row.text || '';
+      msgEl.dataset.rawText = row.text || '';
+      msgEl.textContent = kind === 'pax' ? stripMachineBlocks(row.text || '') : (row.text || '');
       div.appendChild(msgEl);
       transcript.appendChild(div);
     }
@@ -1049,6 +1051,16 @@ function askAboutTrigger(kind, label, headline) {
   _streamChatMessage(msg);
 }
 
+function stripMachineBlocks(text) {
+  if (!text) return '';
+  return String(text)
+    .replace(/<<PAX_AI_CHART_SIGNAL>>[\s\S]*?<<END>>/g, '')
+    .replace(/<<PAX_FORECAST>>[\s\S]*?<<END_FORECAST>>/g, '')
+    .replace(/<<PAX_AI_CHART_SIGNAL>>[\s\S]*$/g, '')
+    .replace(/<<PAX_FORECAST>>[\s\S]*$/g, '')
+    .replace(/\n{3,}/g, '\n\n');
+}
+
 function handleSseEvent(raw, msgEl) {
   // parse "event: name\ndata: {...}"
   let event = 'message', data = '';
@@ -1059,7 +1071,9 @@ function handleSseEvent(raw, msgEl) {
   let obj = {};
   try { obj = JSON.parse(data); } catch (e) { return; }
   if (event === 'token') {
-    msgEl.textContent += obj.text || '';
+    const rawText = (msgEl.dataset.rawText || '') + (obj.text || '');
+    msgEl.dataset.rawText = rawText;
+    msgEl.textContent = stripMachineBlocks(rawText);
     msgEl.parentElement.scrollIntoView({block: 'end', behavior: 'instant'});
   } else if (event === 'start') {
     appendMeta(_streamingPaxBubble,

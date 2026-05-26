@@ -188,6 +188,25 @@ def test_deep_empty_message_after_strip_is_noop(html_body):
         "empty-after-strip must return without POSTing")
 
 
+def test_machine_blocks_are_hidden_from_pax_chat_transcript(html_body):
+    """Forecast/chart machine blocks are for offline capture, not the UI."""
+    assert "function stripMachineBlocks(text)" in html_body
+    assert "<<PAX_AI_CHART_SIGNAL>>" in html_body
+    assert "<<PAX_FORECAST>>" in html_body
+    assert "msgEl.dataset.rawText" in html_body
+    assert "msgEl.textContent = stripMachineBlocks(rawText);" in html_body
+    assert "kind === 'pax' ? stripMachineBlocks(row.text || '')" in html_body
+    assert "kind === 'pax' ? stripMachineBlocks(text || '')" in html_body
+    assert re.search(
+        r"replace\(/<<PAX_FORECAST>>\[\\s\\S\]\*\?\s*<<END_FORECAST>>/g",
+        html_body,
+    ) is not None
+    assert re.search(
+        r"replace\(/<<PAX_FORECAST>>\[\\s\\S\]\*\$/g",
+        html_body,
+    ) is not None
+
+
 def test_deep_tag_dom_node_built_via_textcontent(html_body):
     """The DEEP marker on the YOU bubble must be a span built via DOM
     nodes + textContent, never innerHTML (so a future user-shaped flag

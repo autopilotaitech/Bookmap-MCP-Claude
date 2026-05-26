@@ -1,8 +1,8 @@
 # Pax AI self-training edge workflow.
 #
 # Runs the offline research chain end-to-end:
-#   bus replay  ->  outcomes backfill  ->  calibration
-#               ->  candidate lessons  ->  policy replay
+#   optional bus replay  ->  calibration  ->  candidate lessons
+#                        ->  policy replay
 #
 # Every step is read-only relative to pax_ai_config.json / pax_weights.json /
 # production prompts. Candidate artifacts land under .\reports\.
@@ -13,8 +13,9 @@
 #                                   -BusDb D:\BookmapLogs\pax-bus.db
 #
 # Set -SkipBusReplay if the bus replay step is not relevant (no chat
-# history for the date). Set -SkipJournalOutcomes when running off a
-# pre-populated bus DB.
+# history for the date). Outcomes must already be present in the feature-bus
+# DB's trade_outcomes table; journal_outcomes writes to the daemon journal
+# and does not feed this calibration path.
 
 param(
     [Parameter(Mandatory=$true)] [string] $Date,
@@ -23,8 +24,7 @@ param(
     [string] $ReportsDir = ".\reports",
     [int]    $MinSamples = 5,
     [int]    $ReplayMinSamples = 30,
-    [switch] $SkipBusReplay,
-    [switch] $SkipJournalOutcomes
+    [switch] $SkipBusReplay
 )
 
 $ErrorActionPreference = "Stop"
@@ -62,15 +62,8 @@ if (-not $SkipBusReplay) {
         @("-m", "bookmap_mcp.pax_bus_replay", "--date", $Date)
 }
 
-# 2. Outcomes backfill -- only meaningful if a journal exists at the
-# default path; the script delegates the read of the configured path to
-# the module itself.
-if (-not $SkipJournalOutcomes) {
-    Invoke-Step "journal outcomes backfill" `
-        @("-m", "bookmap_mcp.journal_outcomes")
-}
-
-# 3. Calibration.
+# 2. Calibration. This reads outcomes from the feature-bus DB
+# trade_outcomes table via --bus-db. It does not read the daemon journal.
 $calibrationPath = Join-Path $ReportsDir "calibration-$Date.json"
 Invoke-Step "calibration" @(
     "-m", "bookmap_mcp.pax_calibration",
@@ -81,7 +74,7 @@ Invoke-Step "calibration" @(
     "--min-samples", $MinSamples
 )
 
-# 4. Candidate lessons (dry-run; never invokes Claude).
+# 3. Candidate lessons (dry-run; never invokes Claude).
 Invoke-Step "candidate lessons" @(
     "-m", "bookmap_mcp.pax_research_claude",
     "--date", $Date,
@@ -91,7 +84,7 @@ Invoke-Step "candidate lessons" @(
     "--dry-run"
 )
 
-# 5. Policy replay against the candidate lessons.
+# 4. Policy replay against the candidate lessons.
 $candidatesPath = Join-Path $ReportsDir "policy-candidates-$Date.json"
 $replayReportPath = Join-Path $ReportsDir "replay-$Date.json"
 Invoke-Step "policy replay" @(
