@@ -679,6 +679,260 @@ def test_audit_missing_forecasts_table_returns_missing_not_crash(tmp_path):
     assert report["summary"]["n_forecast_missing"] == 1
 
 
+# --------------------------------------------------- Phase 8: summary render
+
+def _build_real_report(tmp_path) -> dict:
+    """Build a mixed-shape report via the real public API. Reused across
+    the summary-render tests so the rendered text is exercised against
+    realistic, audit-shaped inputs (no hand-curated dicts)."""
+    bus = tmp_path / "bus-for-summary.db"
+    fc  = tmp_path / "fc-for-summary.db"
+    rows = [
+        _ai_turn(id_=1, ts_ms=10, chat_run_id="A", digest_sha256="d1" * 32,
+                  pax_text="clean turn"),
+        _ai_turn(id_=2, ts_ms=20, chat_run_id="B", digest_sha256="d2" * 32,
+                  pax_text="forecast missing here"),
+        _ai_turn(id_=3, ts_ms=30, chat_run_id="C", digest_sha256="d3" * 32,
+                  pax_text="ambiguous"),
+        _ai_turn(id_=4, ts_ms=40, chat_run_id="D", digest_sha256="d4" * 32,
+                  pax_text="invalidated outcome"),
+    ]
+    outcomes = [
+        _outcome(ai_turn_id=1, invalidated=0),
+        _outcome(ai_turn_id=4, invalidated=1,
+                  invalidation_reason="HORIZON_DATA_MISSING"),
+    ]
+    _make_bus_db(bus, ai_turn_rows=rows, trade_outcomes_rows=outcomes)
+    _seed_forecast(fc, chat_run_id="A", digest_sha256="d1" * 32,
+                     forecast_id="fc-A")
+    _seed_forecast(fc, chat_run_id="C", digest_sha256="d3" * 32,
+                     snapshot_sha256="x" * 64, forecast_id="fc-C1")
+    _seed_forecast(fc, chat_run_id="C", digest_sha256="d3" * 32,
+                     snapshot_sha256="y" * 64, forecast_id="fc-C2")
+    return audit.build_turn_audit_report(
+        bus_db_path=bus, forecast_db_path=fc,
+        start_ms=0, end_ms=10_000)
+
+
+def test_summary_string_includes_all_required_count_families(tmp_path):
+    """Every count family in the spec must appear in the rendered summary
+    so the operator can spot every defect category at a glance."""
+    report = _build_real_report(tmp_path)
+    text = audit.render_turn_audit_summary(report)
+    # Window header.
+    assert "start_ms" in text or "Turn audit summary" in text
+    # n_ai_turns count.
+    assert "n_ai_turns" in text
+    # Forecast counts.
+    assert "PRESENT"   in text
+    assert "MISSING"   in text
+    assert "AMBIGUOUS" in text
+    # Outcome counts.
+    assert "VALID"        in text
+    assert "INVALIDATED"  in text
+    # Prompt archive counts.
+    assert "PRESENT_VALID"  in text
+    assert "HASH_MISMATCH"  in text
+
+
+def test_summary_invalidation_reason_aggregation_appears_with_counts(tmp_path):
+    """When multiple rows share an invalidation_reason, the summary must
+    aggregate counts and list the reason in a Top section."""
+    bus = tmp_path / "bus-inv.db"
+    rows = [_ai_turn(id_=i, ts_ms=i, chat_run_id=f"R{i}",
+                       digest_sha256=f"d{i:02d}" * 16) for i in range(1, 6)]
+    outcomes = [
+        _outcome(ai_turn_id=1, invalidated=1,
+                  invalidation_reason="HORIZON_DATA_MISSING"),
+        _outcome(ai_turn_id=2, invalidated=1,
+                  invalidation_reason="HORIZON_DATA_MISSING"),
+        _outcome(ai_turn_id=3, invalidated=1,
+                  invalidation_reason="HORIZON_DATA_MISSING"),
+        _outcome(ai_turn_id=4, invalidated=1,
+                  invalidation_reason="SNAPSHOT_MISSING_AT_T0"),
+        _outcome(ai_turn_id=5, invalidated=1,
+                  invalidation_reason="FORECAST_MISSING_OR_AMBIGUOUS"),
+    ]
+    _make_bus_db(bus, ai_turn_rows=rows, trade_outcomes_rows=outcomes)
+    report = audit.build_turn_audit_report(
+        bus_db_path=bus, start_ms=0, end_ms=1_000_000)
+    text = audit.render_turn_audit_summary(report)
+    assert "HORIZON_DATA_MISSING" in text
+    assert "SNAPSHOT_MISSING_AT_T0" in text
+    assert "FORECAST_MISSING_OR_AMBIGUOUS" in text
+    # The horizon-missing line must carry its count (3).
+    # We pin the substring "HORIZON_DATA_MISSING: 3" to keep the format honest.
+    assert "HORIZON_DATA_MISSING: 3" in text
+    assert "SNAPSHOT_MISSING_AT_T0: 1" in text
+
+
+def test_summary_examples_are_capped_deterministically(tmp_path):
+    """Seed > cap forecast defects and verify the summary lists at most
+    the cap and the SAME set across two render calls."""
+    bus = tmp_path / "bus-cap.db"
+    rows = [_ai_turn(id_=i, ts_ms=i, chat_run_id=f"R{i}",
+                       digest_sha256=f"d{i:03d}" * 16,
+                       pax_text=f"defect-{i}")
+            for i in range(1, 21)]   # 20 forecast defects, no forecasts seeded
+    _make_bus_db(bus, ai_turn_rows=rows, trade_outcomes_rows=[])
+    report = audit.build_turn_audit_report(
+        bus_db_path=bus, start_ms=0, end_ms=1_000_000)
+    text1 = audit.render_turn_audit_summary(report)
+    text2 = audit.render_turn_audit_summary(report)
+    # Determinism: byte-equal across runs.
+    assert text1 == text2
+    # Cap proof: a known cap should appear at most CAP times. We assert
+    # 'defect-1 ' is present (first row by ts_ms) and 'defect-20' is NOT
+    # (well past the cap). The cap itself we treat as <= 10 for this test.
+    assert "defect-1 " in text1 or "defect-1\"" in text1 or "'defect-1'" in text1
+    assert "defect-20" not in text1
+
+
+def test_summary_truncates_long_pax_text_safely(tmp_path):
+    """A 500-char pax_text on a defect row must be truncated in the
+    summary so the line stays operator-readable."""
+    bus = tmp_path / "bus-long.db"
+    long_text = "X" * 500
+    rows = [_ai_turn(id_=1, ts_ms=1, chat_run_id="R", digest_sha256="d" * 64,
+                       pax_text=long_text)]
+    _make_bus_db(bus, ai_turn_rows=rows, trade_outcomes_rows=[])
+    report = audit.build_turn_audit_report(
+        bus_db_path=bus, start_ms=0, end_ms=1_000_000)
+    text = audit.render_turn_audit_summary(report)
+    # The full 500-X string must NOT survive verbatim into the summary.
+    assert long_text not in text
+    # A truncation marker ('...') must be present near the defect row.
+    assert "..." in text
+
+
+# --------------------------------------------------- Phase 8: CLI flags
+
+def test_cli_writes_summary_beside_json_in_normal_mode(tmp_path):
+    bus = tmp_path / "bus.db"
+    _make_bus_db(bus,
+                 ai_turn_rows=[_ai_turn(id_=1, ts_ms=500)],
+                 trade_outcomes_rows=[])
+    report_path  = tmp_path / "audit.json"
+    summary_path = tmp_path / "audit.txt"
+    rc = audit.main([
+        "--bus-db", str(bus),
+        "--start-ms", "0", "--end-ms", "1000",
+        "--report", str(report_path),
+        "--summary-report", str(summary_path),
+    ])
+    assert rc == 0
+    assert report_path.exists()
+    assert summary_path.exists()
+    summary_body = summary_path.read_text(encoding="utf-8")
+    assert "n_ai_turns" in summary_body
+
+
+def test_cli_summary_only_from_report_works_without_db_args(tmp_path, capsys):
+    # Pre-create a real JSON report.
+    bus = tmp_path / "bus.db"
+    _make_bus_db(bus,
+                 ai_turn_rows=[_ai_turn(id_=1, ts_ms=500)],
+                 trade_outcomes_rows=[])
+    report_path = tmp_path / "src.json"
+    audit.main([
+        "--bus-db", str(bus),
+        "--start-ms", "0", "--end-ms", "1000",
+        "--report", str(report_path),
+    ])
+    capsys.readouterr()  # drop the stderr line from the first run
+
+    rc = audit.main([
+        "--summary-only-from-report", str(report_path),
+    ])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "n_ai_turns" in captured.out
+
+
+def test_cli_summary_only_with_summary_report_writes_to_file(tmp_path):
+    bus = tmp_path / "bus.db"
+    _make_bus_db(bus,
+                 ai_turn_rows=[_ai_turn(id_=1, ts_ms=500)],
+                 trade_outcomes_rows=[])
+    report_path  = tmp_path / "src.json"
+    summary_path = tmp_path / "dst.txt"
+    audit.main([
+        "--bus-db", str(bus),
+        "--start-ms", "0", "--end-ms", "1000",
+        "--report", str(report_path),
+    ])
+
+    rc = audit.main([
+        "--summary-only-from-report", str(report_path),
+        "--summary-report", str(summary_path),
+    ])
+    assert rc == 0
+    assert summary_path.exists()
+    assert "n_ai_turns" in summary_path.read_text(encoding="utf-8")
+
+
+def test_summary_only_mode_preserves_input_json_bytes_and_mtime(tmp_path):
+    bus = tmp_path / "bus.db"
+    _make_bus_db(bus,
+                 ai_turn_rows=[_ai_turn(id_=1, ts_ms=500)],
+                 trade_outcomes_rows=[])
+    report_path = tmp_path / "src.json"
+    audit.main([
+        "--bus-db", str(bus),
+        "--start-ms", "0", "--end-ms", "1000",
+        "--report", str(report_path),
+    ])
+    before_body  = report_path.read_bytes()
+    before_mtime = report_path.stat().st_mtime_ns
+    audit.main([
+        "--summary-only-from-report", str(report_path),
+        "--summary-report", str(tmp_path / "ignore.txt"),
+    ])
+    assert report_path.read_bytes()        == before_body
+    assert report_path.stat().st_mtime_ns  == before_mtime
+
+
+def test_malformed_json_in_summary_only_mode_exits_nonzero_no_output(tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not valid json", encoding="utf-8")
+    summary_path = tmp_path / "should-not-exist.txt"
+    rc = audit.main([
+        "--summary-only-from-report", str(bad),
+        "--summary-report", str(summary_path),
+    ])
+    assert rc != 0
+    assert not summary_path.exists()
+
+
+def test_summary_only_mode_does_not_require_bus_db_or_window(tmp_path):
+    """Spec: summary-only mode must not require --bus-db, --date,
+    --start-ms, or --end-ms. argparse-level rejection would defeat the
+    purpose."""
+    bus = tmp_path / "bus.db"
+    _make_bus_db(bus,
+                 ai_turn_rows=[_ai_turn(id_=1, ts_ms=500)],
+                 trade_outcomes_rows=[])
+    report_path = tmp_path / "src.json"
+    audit.main([
+        "--bus-db", str(bus),
+        "--start-ms", "0", "--end-ms", "1000",
+        "--report", str(report_path),
+    ])
+    # Now run summary-only with NO bus-db, NO date, NO start/end.
+    rc = audit.main([
+        "--summary-only-from-report", str(report_path),
+        "--summary-report", str(tmp_path / "out.txt"),
+    ])
+    assert rc == 0
+
+
+def test_summary_only_missing_report_file_exits_nonzero(tmp_path):
+    rc = audit.main([
+        "--summary-only-from-report", str(tmp_path / "no-such.json"),
+    ])
+    assert rc != 0
+
+
 def test_summary_counts_all_categories_independently(tmp_path):
     """Mixed dataset: one clean, one missing forecast, one ambiguous,
     one invalidated outcome, one with no outcome."""

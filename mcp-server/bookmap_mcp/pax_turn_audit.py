@@ -420,6 +420,137 @@ def build_turn_audit_report(*,
     }
 
 
+# ------------------------------------------------------- summary renderer
+
+# Cap on per-section examples in the rendered summary. Small by design --
+# the summary is for at-a-glance triage, not full audit listing (the JSON
+# report still carries every row).
+_SUMMARY_TOP_N = 5
+
+# Truncation cap for inline pax_text previews in the rendered summary.
+_SUMMARY_PREVIEW_CHARS = 80
+
+
+def _truncate_for_summary(text: Optional[str],
+                           cap: int = _SUMMARY_PREVIEW_CHARS) -> str:
+    if not text:
+        return ""
+    s = str(text)
+    if len(s) <= cap:
+        return s
+    return s[: max(0, cap - 3)] + "..."
+
+
+def render_turn_audit_summary(report: Dict[str, Any]) -> str:
+    """Render a deterministic, markdown-safe operator summary from a
+    turn-audit ``report`` dict (the same shape ``build_turn_audit_report``
+    returns).
+
+    Pure: no I/O, no DB access, no mutation. The same input dict yields a
+    byte-identical string across runs. Caps every per-section example list
+    at ``_SUMMARY_TOP_N`` so the body stays operator-readable; long
+    ``pax_text`` previews are truncated to ``_SUMMARY_PREVIEW_CHARS``.
+    """
+    lines: List[str] = []
+    window = report.get("window") or {}
+    date_str = report.get("date") or report.get("date_utc")
+    if date_str:
+        lines.append(f"# Turn audit summary -- {date_str}")
+    elif window:
+        lines.append(
+            f"# Turn audit summary -- "
+            f"[{window.get('start_ms')}, {window.get('end_ms')})")
+    else:
+        lines.append("# Turn audit summary")
+    alias = report.get("alias")
+    if alias:
+        lines.append(f"alias: {alias}")
+    lines.append("")
+
+    summary = report.get("summary") or {}
+    n_ai_turns = int(summary.get("n_ai_turns", 0))
+    lines.append(f"n_ai_turns: {n_ai_turns}")
+    lines.append("")
+
+    # Forecast counts.
+    lines.append("## Forecast")
+    lines.append(f"  PRESENT:   {int(summary.get('n_with_forecast', 0))}")
+    lines.append(f"  MISSING:   {int(summary.get('n_forecast_missing', 0))}")
+    lines.append(f"  AMBIGUOUS: {int(summary.get('n_forecast_ambiguous', 0))}")
+    lines.append("")
+
+    # Outcome counts. The summary block carries n_with_outcome (VALID or
+    # INVALIDATED) and n_outcome_invalidated; VALID and MISSING fall out
+    # by arithmetic so the operator never has to compute them.
+    n_with_outcome = int(summary.get("n_with_outcome", 0))
+    n_invalidated  = int(summary.get("n_outcome_invalidated", 0))
+    n_outcome_missing = max(0, n_ai_turns - n_with_outcome)
+    n_outcome_valid   = max(0, n_with_outcome - n_invalidated)
+    lines.append("## Outcome")
+    lines.append(f"  VALID:       {n_outcome_valid}")
+    lines.append(f"  INVALIDATED: {n_invalidated}")
+    lines.append(f"  MISSING:     {n_outcome_missing}")
+    lines.append("")
+
+    # Prompt archive counts.
+    lines.append("## Prompt archive")
+    lines.append(f"  PRESENT_VALID: {int(summary.get('n_prompt_archive_present', 0))}")
+    lines.append(f"  MISSING:       {int(summary.get('n_prompt_archive_missing', 0))}")
+    lines.append(f"  HASH_MISMATCH: {int(summary.get('n_prompt_archive_hash_mismatch', 0))}")
+    lines.append("")
+
+    rows = report.get("rows") or []
+
+    # Top invalidation reasons: aggregate counts, sort by -count then
+    # alpha so ties are deterministic.
+    reason_counts: Dict[str, int] = {}
+    for r in rows:
+        reason = r.get("invalidation_reason")
+        if reason:
+            reason_counts[str(reason)] = reason_counts.get(str(reason), 0) + 1
+    if reason_counts:
+        lines.append("## Top invalidation reasons")
+        top = sorted(reason_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        for reason, n in top[:_SUMMARY_TOP_N]:
+            lines.append(f"  {reason}: {n}")
+        lines.append("")
+
+    # Top forecast defects (MISSING or AMBIGUOUS).
+    forecast_defects = [r for r in rows
+                         if r.get("forecast_status") in ("MISSING", "AMBIGUOUS")]
+    if forecast_defects:
+        lines.append("## Top forecast defects")
+        for r in forecast_defects[:_SUMMARY_TOP_N]:
+            digest = (r.get("digest_sha256") or "")[:12]
+            preview = _truncate_for_summary(r.get("pax_text"))
+            lines.append(
+                f"  ai_turn_id={r.get('ai_turn_id')} "
+                f"ts_ms={r.get('ts_ms')} "
+                f"chat_run_id={r.get('chat_run_id')} "
+                f"digest={digest} "
+                f"forecast_status={r.get('forecast_status')} "
+                f"pax_text={preview!r}"
+            )
+        lines.append("")
+
+    # Top prompt archive failures (MISSING or HASH_MISMATCH).
+    arc_failures = [r for r in rows
+                     if r.get("prompt_archive_status") in
+                        ("MISSING", "HASH_MISMATCH")]
+    if arc_failures:
+        lines.append("## Top prompt archive failures")
+        for r in arc_failures[:_SUMMARY_TOP_N]:
+            prompt_sha = (r.get("prompt_sha256") or "")[:12]
+            lines.append(
+                f"  ai_turn_id={r.get('ai_turn_id')} "
+                f"prompt_sha256={prompt_sha} "
+                f"status={r.get('prompt_archive_status')}"
+            )
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 # ------------------------------------------------------------------- CLI
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -429,14 +560,26 @@ def main(argv: Optional[List[str]] = None) -> int:
                       "trade_outcomes, and forecasts; verify prompt "
                       "archive integrity."),
     )
-    ap.add_argument("--bus-db", type=Path, required=True,
-                    help="Feature bus SQLite DB (ai_turns + trade_outcomes)")
+    ap.add_argument("--bus-db", type=Path, default=None,
+                    help="Feature bus SQLite DB (ai_turns + trade_outcomes). "
+                         "Required for normal mode; omitted under "
+                         "--summary-only-from-report.")
     ap.add_argument("--forecast-db", type=Path, default=None,
                     help="Forecast store SQLite DB (optional)")
     ap.add_argument("--prompt-archive-root", type=Path, default=None,
                     help="Prompt archive root directory (informational)")
-    ap.add_argument("--report", type=Path, required=True,
-                    help="Output JSON report path")
+    ap.add_argument("--report", type=Path, default=None,
+                    help="Output JSON report path (required for normal mode)")
+    ap.add_argument("--summary-report", type=Path, default=None,
+                    help="Optional text-summary output path. In normal "
+                         "mode it is written alongside --report; in "
+                         "--summary-only-from-report mode it replaces the "
+                         "default stdout sink.")
+    ap.add_argument("--summary-only-from-report", type=Path, default=None,
+                    help="Render a summary from an existing JSON report "
+                         "and exit. Requires no DB / window args. The "
+                         "input JSON is opened read-only and is NEVER "
+                         "mutated.")
     ap.add_argument("--date", default=None,
                     help="UTC day YYYY-MM-DD (mutually exclusive with "
                          "--start-ms/--end-ms)")
@@ -444,6 +587,44 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--end-ms",   type=int, default=None)
     ap.add_argument("--alias", default=None)
     args = ap.parse_args(argv)
+
+    # ---- Summary-only mode: read existing JSON, render summary, exit. ----
+    if args.summary_only_from_report is not None:
+        src = Path(args.summary_only_from_report)
+        try:
+            body = src.read_text(encoding="utf-8")
+        except OSError as exc:
+            sys.stderr.write(f"[pax_turn_audit] cannot read report: {exc}\n")
+            return 2
+        try:
+            report = json.loads(body)
+        except json.JSONDecodeError as exc:
+            sys.stderr.write(
+                f"[pax_turn_audit] invalid JSON report: {exc}\n")
+            return 2
+        if not isinstance(report, dict):
+            sys.stderr.write(
+                "[pax_turn_audit] report root must be an object\n")
+            return 2
+        summary_text = render_turn_audit_summary(report)
+        if args.summary_report is not None:
+            args.summary_report.parent.mkdir(parents=True, exist_ok=True)
+            args.summary_report.write_text(summary_text, encoding="utf-8")
+        else:
+            sys.stdout.write(summary_text + "\n")
+        return 0
+
+    # ---- Normal mode: build the report from the DBs. --------------------
+    if args.bus_db is None:
+        sys.stderr.write(
+            "[pax_turn_audit] --bus-db is required (or use "
+            "--summary-only-from-report)\n")
+        return 2
+    if args.report is None:
+        sys.stderr.write(
+            "[pax_turn_audit] --report is required (or use "
+            "--summary-only-from-report)\n")
+        return 2
 
     if args.date:
         try:
@@ -474,6 +655,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.report.write_text(json.dumps(report, indent=2, sort_keys=True),
                             encoding="utf-8")
     print(f"turn-audit report written: {args.report}", file=sys.stderr)
+
+    if args.summary_report is not None:
+        args.summary_report.parent.mkdir(parents=True, exist_ok=True)
+        args.summary_report.write_text(
+            render_turn_audit_summary(report), encoding="utf-8")
+        print(f"turn-audit summary written: {args.summary_report}",
+              file=sys.stderr)
+
     return 0
 
 
@@ -481,6 +670,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "build_turn_audit_report",
     "main",
+    "render_turn_audit_summary",
     "utc_day_window",
 ]
 

@@ -208,6 +208,68 @@ binary in the test image.
 - Does not promote a candidate from `replay_passed` to `paper_passed`
   or onward. Those transitions are still manual.
 
+## Daily turn audit + summary
+
+`pax_turn_audit` joins one operator-chosen UTC window of ai_turns to
+their trade_outcomes (Phase 1), forecasts (Phases 2 / 5), and prompt
+archive verification (Phase 4), and emits a structured JSON report plus
+an operator-friendly text summary.
+
+The module is **read-only against every input**: the bus DB and forecast
+DB are opened with SQLite `mode=ro`; archive files are read via
+`Path.read_bytes`; nothing in this path writes, ALTERs, or deletes.
+
+### Normal mode: build JSON + text summary side-by-side
+
+```powershell
+python -m bookmap_mcp.pax_turn_audit `
+    --bus-db D:\BookmapLogs\pax-bus.db `
+    --forecast-db D:\BookmapLogs\pax-forecast.db `
+    --prompt-archive-root $env:LOCALAPPDATA\pax-ai\prompt-archive `
+    --date 2026-05-25 `
+    --report reports\turn-audit-2026-05-25.json `
+    --summary-report reports\turn-audit-2026-05-25.txt
+```
+
+The JSON carries one row per ai_turn (forecast status, outcome status,
+prompt archive status, per-horizon realized_r, full lineage). The text
+summary aggregates count families and lists at most 5 examples per
+defect category for at-a-glance triage. Both files are written
+side-by-side; the operator can grep / cat the text summary first and
+drill into the JSON when something looks off.
+
+### Summary-only mode: re-render the summary from an existing JSON
+
+```powershell
+python -m bookmap_mcp.pax_turn_audit `
+    --summary-only-from-report reports\turn-audit-2026-05-25.json `
+    --summary-report reports\turn-audit-2026-05-25.txt
+```
+
+`--summary-only-from-report` opens the JSON read-only, renders the text
+summary, writes it to `--summary-report` (or prints to stdout when
+that flag is omitted), and exits. **No DB / window flags are
+required.** The source JSON is never mutated — pinned by
+`tests/test_pax_turn_audit.py::test_summary_only_mode_preserves_input_json_bytes_and_mtime`.
+
+Malformed JSON in summary-only mode produces a non-zero exit code and
+does NOT create the summary file.
+
+### What the summary contains
+
+- header (date or `[start_ms, end_ms)` window, alias if scoped)
+- `n_ai_turns`
+- Forecast counts: PRESENT / MISSING / AMBIGUOUS
+- Outcome counts: VALID / INVALIDATED / MISSING
+- Prompt archive counts: PRESENT_VALID / MISSING / HASH_MISMATCH
+- Top invalidation reasons with counts (cap 5, ties broken
+  alphabetically for determinism)
+- Top forecast defects (cap 5, in `ts_ms` order; each line carries
+  `ai_turn_id`, `ts_ms`, `chat_run_id`, digest prefix, status, and a
+  truncated `pax_text` preview)
+- Top prompt archive failures (cap 5; each line carries
+  `ai_turn_id`, prompt-sha prefix, status)
+
 ## Tests
 
 ```powershell
