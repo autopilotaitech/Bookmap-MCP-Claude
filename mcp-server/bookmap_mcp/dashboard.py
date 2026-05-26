@@ -1819,6 +1819,27 @@ def _chart_event_id(alias: str, label: str, event_type: str, anchor_ms: int) -> 
     return f"{alias}|{label}|{event_type}|{int(anchor_ms)}"
 
 
+def _dedupe_chart_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse duplicate chart-event IDs before they hit the snapshot API.
+
+    The Java side also keeps a bounded history keyed by event ID, but sending
+    duplicate objects every poll still bloats the JSON payload and forces
+    avoidable chart-side parsing/repaint work during the open.
+    """
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for ev in events:
+        event_id = ev.get("id")
+        if not event_id:
+            out.append(ev)
+            continue
+        if event_id in seen:
+            continue
+        seen.add(event_id)
+        out.append(ev)
+    return out
+
+
 def _chart_micro_events_at_price(me_obj: Optional[Dict[str, Any]],
                                   price: float
                                   ) -> List[Dict[str, Any]]:
@@ -2179,7 +2200,7 @@ def compute_institutional_chart_events(snap: Dict[str, Any]) -> List[Dict[str, A
                 "invalidation_price": invalidation_price,
                 "payline_price":      payline_price,
             })
-    return out
+    return _dedupe_chart_events(out)
 
 
 def compute_institutional_thesis(snap: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:

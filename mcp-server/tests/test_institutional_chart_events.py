@@ -154,6 +154,24 @@ def test_sweep_emits_even_when_no_proximity_at_mid():
 
 # ─── 3. ICEBERG_DEFENSE ─────────────────────────────────────────────────────
 
+def test_duplicate_micro_events_are_collapsed_by_chart_event_id():
+    me = {"events": [
+        {"kind": "STOP_SWEEP", "isBid": False,
+         "price": 20000.0, "size": 400, "timeMs": 123},
+        {"kind": "STOP_SWEEP", "isBid": False,
+         "price": 20000.0, "size": 400, "timeMs": 123},
+        {"kind": "STOP_SWEEP", "isBid": False,
+         "price": 20000.0, "size": 400, "timeMs": 123},
+    ]}
+    snap = _drive(19975.0, micro_events=me)
+    events = _events(snap)
+    ids = [e["id"] for e in events]
+    sweeps = [e for e in events if e["event_type"] == "LIQUIDITY_SWEEP"
+              and e["label"] == "OR-H"]
+    assert len(ids) == len(set(ids))
+    assert len(sweeps) == 1
+
+
 def test_iceberg_ask_at_or_h_emits_ice_a():
     me = {"events": [{"kind": "ICEBERG", "isBid": False,
                       "price": 20000.0, "size": 8000, "timeMs": 1}]}
