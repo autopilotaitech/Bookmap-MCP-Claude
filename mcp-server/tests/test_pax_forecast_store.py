@@ -207,3 +207,64 @@ def test_context_manager_closes(tmp_path):
     # Reopen after exit - should still be usable.
     with store.PaxForecastStore(path) as s2:
         assert s2.count() == 1
+
+
+# ---------------------------------------------------------------------------
+# Linkage metadata (Phase 3): chat_run_id / digest_sha256 / snapshot_sha256
+# ---------------------------------------------------------------------------
+
+def test_linkage_metadata_round_trips(tmp_path):
+    s = _open_store(tmp_path)
+    s.record(_raw_forecast(), ts_ms=1, source_turn_id=None,
+             chat_run_id="run-abc", digest_sha256="d" * 64,
+             snapshot_sha256="s" * 64)
+    rows = list(s.iter_forecasts())
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["chat_run_id"] == "run-abc"
+    assert r["digest_sha256"] == "d" * 64
+    assert r["snapshot_sha256"] == "s" * 64
+    assert r["source_turn_id"] is None
+    s.close()
+
+
+def test_iter_forecasts_filter_by_chat_run_id(tmp_path):
+    s = _open_store(tmp_path)
+    s.record(_raw_forecast(), ts_ms=1, source_turn_id=1, chat_run_id="run-A")
+    s.record(_raw_forecast(prob_success=0.65), ts_ms=2, source_turn_id=2,
+             chat_run_id="run-B")
+    rows = list(s.iter_forecasts(chat_run_id="run-B"))
+    assert [r["source_turn_id"] for r in rows] == [2]
+    s.close()
+
+
+def test_iter_forecasts_filter_by_digest_sha256(tmp_path):
+    s = _open_store(tmp_path)
+    s.record(_raw_forecast(), ts_ms=1, source_turn_id=1, digest_sha256="aaaa")
+    s.record(_raw_forecast(prob_success=0.65), ts_ms=2, source_turn_id=2,
+             digest_sha256="bbbb")
+    rows = list(s.iter_forecasts(digest_sha256="bbbb"))
+    assert [r["source_turn_id"] for r in rows] == [2]
+    s.close()
+
+
+def test_linkage_metadata_defaults_to_null(tmp_path):
+    s = _open_store(tmp_path)
+    s.record(_raw_forecast(), ts_ms=1, source_turn_id=1)
+    row = next(iter(s.iter_forecasts()))
+    assert row["chat_run_id"] is None
+    assert row["digest_sha256"] is None
+    assert row["snapshot_sha256"] is None
+    s.close()
+
+
+def test_record_validated_kwargs_override_dict(tmp_path):
+    """Explicit kwargs win over linkage values already on the dict."""
+    s = _open_store(tmp_path)
+    validated = schema.validate_forecast(_raw_forecast(), ts_ms=1,
+                                         source_turn_id=1)
+    validated["chat_run_id"] = "dict-value"
+    s.record_validated(validated, chat_run_id="kwarg-wins")
+    row = next(iter(s.iter_forecasts()))
+    assert row["chat_run_id"] == "kwarg-wins"
+    s.close()

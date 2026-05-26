@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS forecasts (
     schema_version     INTEGER NOT NULL,
     ts_ms              INTEGER NOT NULL,
     source_turn_id     INTEGER,
+    chat_run_id        TEXT,
+    digest_sha256      TEXT,
+    snapshot_sha256    TEXT,
     alias              TEXT    NOT NULL,
     level              TEXT    NOT NULL,
     thesis             TEXT    NOT NULL,
@@ -47,22 +50,35 @@ CREATE INDEX IF NOT EXISTS idx_forecasts_alias_ts ON forecasts(alias, ts_ms);
 CREATE INDEX IF NOT EXISTS idx_forecasts_setup ON forecasts(setup_bucket);
 CREATE INDEX IF NOT EXISTS idx_forecasts_prob_bucket ON forecasts(probability_bucket);
 CREATE INDEX IF NOT EXISTS idx_forecasts_source_turn ON forecasts(source_turn_id);
+CREATE INDEX IF NOT EXISTS idx_forecasts_chat_run ON forecasts(chat_run_id);
+CREATE INDEX IF NOT EXISTS idx_forecasts_digest ON forecasts(digest_sha256);
 """
+
+# Additive migrations for DBs created before the linkage columns existed.
+# Each ALTER is idempotent: a "duplicate column" error means the column is
+# already present, which is the desired post-state.
+_ADDITIVE_MIGRATIONS = (
+    "ALTER TABLE forecasts ADD COLUMN chat_run_id TEXT",
+    "ALTER TABLE forecasts ADD COLUMN digest_sha256 TEXT",
+    "ALTER TABLE forecasts ADD COLUMN snapshot_sha256 TEXT",
+)
 
 _INSERT_SQL = """
 INSERT OR IGNORE INTO forecasts (
     forecast_id, schema_version, ts_ms, source_turn_id,
+    chat_run_id, digest_sha256, snapshot_sha256,
     alias, level, thesis, execution_read, direction, horizon_sec,
     prob_success, expected_r, invalidation, features_used,
     setup_bucket, probability_bucket, ingested_ms
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _SELECT_COLS = (
-    "forecast_id, schema_version, ts_ms, source_turn_id, alias, level, "
-    "thesis, execution_read, direction, horizon_sec, prob_success, "
-    "expected_r, invalidation, features_used, setup_bucket, "
-    "probability_bucket, ingested_ms"
+    "forecast_id, schema_version, ts_ms, source_turn_id, "
+    "chat_run_id, digest_sha256, snapshot_sha256, "
+    "alias, level, thesis, execution_read, direction, horizon_sec, "
+    "prob_success, expected_r, invalidation, features_used, "
+    "setup_bucket, probability_bucket, ingested_ms"
 )
 
 
@@ -75,6 +91,11 @@ class PaxForecastStore:
         self._conn = sqlite3.connect(str(self._path))
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA_SQL)
+        for stmt in _ADDITIVE_MIGRATIONS:
+            try:
+                self._conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # column already present; idempotent
         self._conn.commit()
 
     # Context manager sugar so tests / scripts can use ``with``.
@@ -95,26 +116,57 @@ class PaxForecastStore:
                raw: Any,
                *,
                ts_ms: Optional[int] = None,
-               source_turn_id: Optional[int] = None) -> Dict[str, Any]:
+               source_turn_id: Optional[int] = None,
+               chat_run_id: Optional[str] = None,
+               digest_sha256: Optional[str] = None,
+               snapshot_sha256: Optional[str] = None) -> Dict[str, Any]:
         """Validate ``raw`` and persist the resulting forecast record."""
         validated = schema.validate_forecast(
             raw, ts_ms=ts_ms, source_turn_id=source_turn_id)
-        return self.record_validated(validated)
+        return self.record_validated(
+            validated,
+            chat_run_id=chat_run_id,
+            digest_sha256=digest_sha256,
+            snapshot_sha256=snapshot_sha256,
+        )
 
-    def record_validated(self, forecast: Dict[str, Any]) -> Dict[str, Any]:
-        """Persist a forecast that has already been validated."""
+    def record_validated(self,
+                         forecast: Dict[str, Any],
+                         *,
+                         chat_run_id: Optional[str] = None,
+                         digest_sha256: Optional[str] = None,
+                         snapshot_sha256: Optional[str] = None) -> Dict[str, Any]:
+        """Persist a forecast that has already been validated.
+
+        Linkage metadata (``chat_run_id`` / ``digest_sha256`` /
+        ``snapshot_sha256``) is the fallback join key when ``source_turn_id``
+        is not yet known (e.g., chat-capture writes the forecast before the
+        feature_bus writer thread has assigned an ``ai_turns.id``). The
+        downstream calibration / replay paths prefer ``source_turn_id`` when
+        present and fall back to the metadata join otherwise.
+        """
         ts_ms = forecast.get("ts_ms")
         if ts_ms is None:
             raise ValueError("ts_ms is required to persist a forecast")
         setup_bucket = schema.forecast_setup_bucket(forecast)
         prob_bucket = schema.probability_bucket(forecast["prob_success"])
         ingested_ms = int(time.time() * 1000)
+        # Linkage metadata can also live on the validated dict itself
+        # (the chat path injects it before calling record_validated). The
+        # explicit kwarg wins so callers always have an authoritative
+        # override.
+        _chat_run_id = chat_run_id if chat_run_id is not None else forecast.get("chat_run_id")
+        _digest_sha = digest_sha256 if digest_sha256 is not None else forecast.get("digest_sha256")
+        _snap_sha = snapshot_sha256 if snapshot_sha256 is not None else forecast.get("snapshot_sha256")
         self._conn.execute(_INSERT_SQL, (
             forecast["forecast_id"],
             int(forecast.get("schema_version") or schema.SCHEMA_VERSION),
             int(ts_ms),
             (None if forecast.get("source_turn_id") is None
              else int(forecast["source_turn_id"])),
+            _chat_run_id,
+            _digest_sha,
+            _snap_sha,
             forecast["alias"],
             forecast["level"],
             forecast["thesis"],
@@ -142,12 +194,19 @@ class PaxForecastStore:
                        *,
                        start_ms: Optional[int] = None,
                        end_ms: Optional[int] = None,
-                       alias: Optional[str] = None) -> Iterator[Dict[str, Any]]:
+                       alias: Optional[str] = None,
+                       chat_run_id: Optional[str] = None,
+                       digest_sha256: Optional[str] = None,
+                       ) -> Iterator[Dict[str, Any]]:
         """Yield forecast records ordered by ``ts_ms``.
 
         The window is half-open: ``ts_ms >= start_ms AND ts_ms < end_ms`` to
         keep UTC-day queries collision-free (see ``half_open_utc_day_convention``
         in the memory index).
+
+        ``chat_run_id`` / ``digest_sha256`` enable the linkage-fallback
+        lookup used by Phase 4 calibration when ``source_turn_id`` was not
+        known at capture time.
         """
         where: list[str] = []
         params: list[Any] = []
@@ -160,6 +219,12 @@ class PaxForecastStore:
         if alias is not None:
             where.append("alias = ?")
             params.append(alias)
+        if chat_run_id is not None:
+            where.append("chat_run_id = ?")
+            params.append(chat_run_id)
+        if digest_sha256 is not None:
+            where.append("digest_sha256 = ?")
+            params.append(digest_sha256)
         clause = ("WHERE " + " AND ".join(where)) if where else ""
         sql = (
             f"SELECT {_SELECT_COLS} FROM forecasts {clause} "
@@ -177,6 +242,9 @@ def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "ts_ms": int(row["ts_ms"]),
         "source_turn_id": (None if row["source_turn_id"] is None
                            else int(row["source_turn_id"])),
+        "chat_run_id": row["chat_run_id"],
+        "digest_sha256": row["digest_sha256"],
+        "snapshot_sha256": row["snapshot_sha256"],
         "alias": row["alias"],
         "level": row["level"],
         "thesis": row["thesis"],

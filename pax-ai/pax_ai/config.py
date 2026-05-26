@@ -87,6 +87,16 @@ DEFAULTS: Dict[str, Any] = {
         "wake_interval_ms":   900_000, # 15 minutes
         "match_tolerance_ms": 5_000,   # +/- 5 seconds when finding snapshot_features rows
     },
+    "forecast": {
+        # Self-training research loop forecast capture. Default OFF;
+        # operator opts in once the prompt contract has been rolled out
+        # and validated.  When True, chat.py extracts and persists a
+        # structured <<PAX_FORECAST>> block from each Claude response.
+        # Persistence failures (missing mcp-server install, disk error,
+        # bad JSON) are silent and never break the chat path.
+        "enabled":    False,
+        "store_path": "D:/BookmapLogs/pax-forecast.db",
+    },
 }
 
 

@@ -204,6 +204,47 @@ def _capture_ai_chart_signal(pax_text: Optional[str],
         sys.stderr.write(f"[chat] ai_chart_signal capture failed: {exc}\n")
 
 
+def _capture_pax_forecast(pax_text: Optional[str],
+                           snap: Optional[Dict[str, Any]],
+                           *,
+                           ts_ms: int,
+                           chat_run_id: Optional[str],
+                           digest_sha256: Optional[str],
+                           snapshot_sha256: Optional[str]) -> None:
+    """Best-effort: extract a <<PAX_FORECAST>>...<<END_FORECAST>> block
+    from the Pax AI response, validate against the SAME snapshot the
+    digest was built from, and persist via the forecast store writer.
+
+    All failure paths are silent. The forecast pipeline must never break
+    the chat path. Capture only runs when ``forecast.enabled`` is True.
+
+    source_turn_id is intentionally NOT set here -- the feature_bus
+    writer thread assigns ai_turns.id asynchronously, so at chat-capture
+    time we do not yet know it. Linkage metadata (chat_run_id +
+    digest_sha256 + snapshot_sha256) is the fallback join key the
+    calibration / replay paths use.
+    """
+    try:
+        from . import forecast_signal, forecast_store_writer
+        if not forecast_store_writer.is_enabled():
+            return
+        blk = forecast_signal.extract_block(pax_text or "")
+        if blk is None:
+            return
+        validated = forecast_signal.validate_against_snapshot(
+            blk, snap or {}, ts_ms=ts_ms)
+        if validated is None:
+            return
+        forecast_store_writer.persist_validated(
+            validated,
+            chat_run_id=chat_run_id,
+            digest_sha256=digest_sha256,
+            snapshot_sha256=snapshot_sha256,
+        )
+    except Exception as exc:
+        sys.stderr.write(f"[chat] pax_forecast capture failed: {exc}\n")
+
+
 def _clear_abort_if_owned(abort: threading.Event) -> None:
     """Clear _CURRENT_ABORT only if it still points at our event.
 
@@ -440,5 +481,23 @@ def handle_chat_stream(wfile, user_text: str, deep: bool = False) -> None:
         # the digest was built from (NOT a fresh poll). Any failure is
         # silent — chart plumbing is not allowed to break the chat path.
         _capture_ai_chart_signal(pax_text, meta.get("_snapshot_for_capture"))
+
+        # Pax AI -> structured forecast capture for the self-training
+        # research loop. Same snapshot as the chart-signal capture. Same
+        # silent-failure contract; chat path must never break.
+        try:
+            _digest_sha = digest_sha if "digest_sha" in locals() else None
+            _snap_sha = snap_sha if "snap_sha" in locals() else None
+        except Exception:
+            _digest_sha = None
+            _snap_sha = None
+        _capture_pax_forecast(
+            pax_text,
+            meta.get("_snapshot_for_capture"),
+            ts_ms=int(time.time() * 1000),
+            chat_run_id=journal.current_run_id(),
+            digest_sha256=_digest_sha,
+            snapshot_sha256=_snap_sha,
+        )
     finally:
         _clear_abort_if_owned(abort)
