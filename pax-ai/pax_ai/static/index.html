@@ -705,24 +705,58 @@ async function pollLevel(label) {
   } catch (e) { target.textContent = 'edge fetch error: ' + e; }
 }
 
+const PLAYBOOK_HOLD_MS = 30000;
+let _playbookHold = {key: '', html: '', until: 0};
+
+function renderPlaybook(j) {
+  // current_state, active_level, branch.name/.if/.then are all snapshot
+  // fields and must be escaped before going into innerHTML.
+  const head = '<div><span class="state">' + _esc(j.current_state || '-') +
+    '</span>' + (j.active_level ? ' at <b>' + _esc(j.active_level) + '</b>' : '') + '</div>';
+  const branches = (j.branches || []).map(b =>
+    '<div class="branch">' +
+      '<div class="nm">' + _esc(b.name) + '</div>' +
+      '<div class="iff">if: ' + _esc(b.if) + '</div>' +
+      '<div class="ths">then: ' + _esc(b.then) + '</div>' +
+    '</div>').join('');
+  return head +
+    (branches || '<div style="color:var(--text-faint); padding-top:4px">no branches active</div>');
+}
+
+function playbookKey(j) {
+  const branches = (j.branches || []).map(b =>
+    [b.name || '', b.if || '', b.then || ''].join('|')).join('||');
+  return [j.current_state || '', j.active_level || '', branches].join('::');
+}
+
+function isMeaningfulPlaybook(j) {
+  return !!(j.active_level || (j.current_state && j.current_state !== 'WAIT_FOR_LEVEL')
+    || (j.branches && j.branches.length));
+}
+
 async function pollPlaybook() {
   const target = document.getElementById('playbook-content');
   try {
     const r = await fetch('/api/pax/playbook', {cache:'no-store'});
     if (!r.ok) { target.textContent = '-'; return; }
     const j = await r.json();
-    // current_state, active_level, branch.name/.if/.then are all snapshot
-    // fields and must be escaped before going into innerHTML.
-    const head = '<div><span class="state">' + _esc(j.current_state || '-') +
-      '</span>' + (j.active_level ? ' at <b>' + _esc(j.active_level) + '</b>' : '') + '</div>';
-    const branches = (j.branches || []).map(b =>
-      '<div class="branch">' +
-        '<div class="nm">' + _esc(b.name) + '</div>' +
-        '<div class="iff">if: ' + _esc(b.if) + '</div>' +
-        '<div class="ths">then: ' + _esc(b.then) + '</div>' +
-      '</div>').join('');
-    target.innerHTML = head +
-      (branches || '<div style="color:var(--text-faint); padding-top:4px">no branches active</div>');
+    const now = Date.now();
+    const html = renderPlaybook(j);
+    const key = playbookKey(j);
+    const meaningful = isMeaningfulPlaybook(j);
+
+    // The snapshot can churn level/branch state every second. Pin the
+    // last meaningful playbook for 30s so the trader has time to read it.
+    if (_playbookHold.html && key !== _playbookHold.key && now < _playbookHold.until) {
+      target.innerHTML = _playbookHold.html;
+      return;
+    }
+    target.innerHTML = html;
+    if (meaningful) {
+      _playbookHold = {key: key, html: html, until: now + PLAYBOOK_HOLD_MS};
+    } else if (now >= _playbookHold.until) {
+      _playbookHold = {key: '', html: '', until: 0};
+    }
   } catch (e) { target.textContent = 'playbook fetch error: ' + e; }
 }
 

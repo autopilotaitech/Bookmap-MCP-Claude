@@ -207,6 +207,18 @@ def test_machine_blocks_are_hidden_from_pax_chat_transcript(html_body):
     ) is not None
 
 
+def test_playbook_render_holds_meaningful_state_for_30_seconds(html_body):
+    """Playbook panel must not flash every 1s during level churn."""
+    assert "const PLAYBOOK_HOLD_MS = 30000;" in html_body
+    assert "let _playbookHold" in html_body
+    assert "function renderPlaybook(j)" in html_body
+    assert "function playbookKey(j)" in html_body
+    assert "function isMeaningfulPlaybook(j)" in html_body
+    assert "now < _playbookHold.until" in html_body
+    assert "target.innerHTML = _playbookHold.html;" in html_body
+    assert "until: now + PLAYBOOK_HOLD_MS" in html_body
+
+
 def test_deep_tag_dom_node_built_via_textcontent(html_body):
     """The DEEP marker on the YOU bubble must be a span built via DOM
     nodes + textContent, never innerHTML (so a future user-shaped flag
