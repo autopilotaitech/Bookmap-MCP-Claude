@@ -10,6 +10,26 @@
   "stale_snapshot_ms": 5000,
   "prox_ticks":        8,
 
+  "_feature_bus_comment": "Required for the self-training edge loop. feature_bus.enabled=true starts passive snapshot/turn capture into pax-bus.db at Pax-AI process startup. outcomes.enabled=true labels mature ai_turns into trade_outcomes so calibration/replay can score forecasts. Restart Pax-AI after changing these flags; hot reload updates config values but does not start daemon threads that were disabled at boot.",
+  "feature_bus": {
+    "enabled":           true,
+    "db_path":           "D:/BookmapLogs/pax-bus.db",
+    "snapshot_blob_dir": "D:/BookmapLogs/pax-snapshots",
+    "digest_blob_dir":   "D:/BookmapLogs/pax-digests",
+    "queue_max":         2000,
+    "writer_idle_ms":    100,
+    "capture_ms":        1000,
+    "retention_days":    30
+  },
+  "chat": {
+    "use_feature_bus_digest": false
+  },
+  "outcomes": {
+    "enabled":            true,
+    "wake_interval_ms":   900000,
+    "match_tolerance_ms": 5000
+  },
+
   "_forecast_comment": "Self-training research loop. forecast.enabled=true makes chat.py persist a structured <<PAX_FORECAST>> block (when Claude emits one) to the SQLite store at forecast.store_path. Capture is fire-and-forget; chat path never breaks on persistence failure. Outcomes still require feature_bus.enabled=true elsewhere for the trade_outcomes join to produce paired calibration rows.",
   "forecast": {
     "enabled":    true,
