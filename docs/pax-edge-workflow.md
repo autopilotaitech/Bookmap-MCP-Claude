@@ -270,6 +270,71 @@ does NOT create the summary file.
 - Top prompt archive failures (cap 5; each line carries
   `ai_turn_id`, prompt-sha prefix, status)
 
+## Research preflight
+
+`pax_research_preflight` wraps the promotion gate and the turn-audit
+summary into a **single operator-/CI-grade command**. One invocation
+answers "is it safe to land this research / promotion work?" with a
+structured JSON verdict and (when an audit JSON is provided) the
+operator-readable summary.
+
+### Local use with explicit changed files
+
+```powershell
+python -m bookmap_mcp.pax_research_preflight `
+    --changed-file mcp-server/bookmap_mcp/pax_weights.json `
+    --replay-report reports\replay-2026-05-25.json `
+    --turn-audit-report reports\turn-audit-2026-05-25.json `
+    --summary-report reports\turn-audit-2026-05-25.txt `
+    --json-report reports\preflight-2026-05-25.json
+```
+
+### CI-style use with a git diff base
+
+```powershell
+python -m bookmap_mcp.pax_research_preflight `
+    --git-base origin/main `
+    --replay-report reports\replay-latest.json `
+    --json-report reports\preflight-ci.json
+```
+
+`--git-base` resolves changed files via `git diff --name-only <ref>
+HEAD`. **Discovery failures fail closed** (matching the Phase-3 fix
+to `policy_promotion_gate`): if `git` is missing, the ref does not
+exist, or the diff returns non-zero, the preflight exits non-zero
+with `reason=git_diff_failed:<detail>` — never silently reports
+"no changes."
+
+`--changed-file` and `--git-base` may be combined; if neither is
+supplied the preflight fails closed with
+`reason=no_changed_input_supplied`. The operator must explicitly
+declare the change surface.
+
+### How the pieces fit together
+
+| Piece | Authoritative source | Preflight role |
+|---|---|---|
+| Promotion gate | `policy_promotion_gate.check_promotion_gate` | Always runs. Forwarded `--allow-active` + `--min-samples`. Preflight fails if the gate fails. |
+| Replay report files | Operator-supplied paths via `--replay-report` | **Validation is stricter than the gate alone** — a missing or malformed path fails the preflight even on a non-active diff, so a typo or broken artifact in CI cannot produce a false green. |
+| Turn-audit summary | `pax_turn_audit.render_turn_audit_summary` over a previously-built JSON | Informational. Included in the result when `--turn-audit-report` is supplied; written to disk only when `--summary-report` is also supplied. |
+
+### Fail-closed guarantees
+
+- Missing `--changed-file` AND `--git-base`: fail closed.
+- `--git-base` discovery error: fail closed.
+- Any `--replay-report` PATH that does not exist on disk: fail closed.
+- Any malformed `--replay-report` JSON/artifact: fail closed.
+- Malformed `--turn-audit-report` JSON: fail closed.
+- `--turn-audit-report` root is not a JSON object: fail closed.
+- Promotion gate rejects the diff: fail closed.
+
+This module is read-only against every input: the turn-audit JSON is
+opened with `Path.read_text` only and is **byte/mtime-identical**
+after the preflight runs (pinned by
+`tests/test_pax_research_preflight.py::test_turn_audit_read_preserves_bytes_and_mtime`).
+No DBs, weights, prompts, configs, replay reports, or audit reports
+are mutated.
+
 ## Tests
 
 ```powershell
