@@ -224,6 +224,7 @@ def test_pull_stack_rotation_up_at_proximate_or_h_emits_stacking():
     assert st is not None
     assert st["marker_text"] == "STACK"
     assert st["severity"] == "INFO"
+    assert st["confidence"] == 0.635
 
 
 def test_pull_stack_rotation_dn_at_proximate_or_h_emits_pulling():
@@ -232,6 +233,7 @@ def test_pull_stack_rotation_dn_at_proximate_or_h_emits_pulling():
     pl = _find(events, "PULLING", "OR-H")
     assert pl is not None
     assert pl["marker_text"] == "PULL"
+    assert pl["confidence"] == 0.635
 
 
 def test_pull_stack_emits_only_at_proximate_levels():

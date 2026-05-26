@@ -1981,6 +1981,12 @@ def _chart_emit_pull_stack(side: str, level: Dict[str, Any],
         agg_z = 0.0
     if agg_z < _CHART_PULL_STACK_MIN_AGG_Z:
         return None
+    # Match the dashboard pull/stack strength scale: z ~= 2 -> 0.76,
+    # z ~= 4 -> 0.96. This is marker confidence for the context event,
+    # not entry confidence. Previously the final event builder used the
+    # per-level thesis confidence fallback (usually 0.35), so chart labels
+    # printed C.PUL35 / C.STK35 even when live pull_stack aggregateZ changed.
+    confidence = abs(_tanh(agg_z / 2.0))
     is_above = (side == "above")
     if rot == ("ROTATION_UP" if is_above else "ROTATION_DN"):
         et = "STACKING"; text = "STACK"
@@ -1997,6 +2003,7 @@ def _chart_emit_pull_stack(side: str, level: Dict[str, Any],
         "execution_read": "CONTEXT",
         "anchor_ms": now_ms,
         "source": "pull_stack",
+        "confidence": confidence,
         "reasons": [f"rotation={rot} aggZ={agg_z:.2f}"],
     }
 
@@ -2148,7 +2155,7 @@ def compute_institutional_chart_events(snap: Dict[str, Any]) -> List[Dict[str, A
                 payline_price = round(price - 10.0, 2)
 
             try:
-                conf = float(ith.get("confidence") or 0.35)
+                conf = float(c.get("confidence", ith.get("confidence") or 0.35))
             except (TypeError, ValueError):
                 conf = 0.35
 
