@@ -172,3 +172,65 @@ def test_render_system_prompt_pax_ai_json_exclusion_is_explicit():
     body = prompts.render_system_prompt()
     assert "never Pax AI" in body or "never** Pax AI" in body, (
         "HFT skill must explicitly disclaim Pax AI as a JSON-output context")
+
+
+# ---------------------------------------------------------------------------
+# PAX_FORECAST emission contract (self-training research loop).
+# ---------------------------------------------------------------------------
+
+def test_base_preamble_includes_pax_forecast_contract():
+    """The system prompt must teach Claude how to emit the structured
+    <<PAX_FORECAST>> block consumed by the calibration / replay pipeline."""
+    body = prompts.render_system_prompt()
+    assert "<<PAX_FORECAST>>" in body
+    assert "<<END_FORECAST>>" in body
+    for label in ("OR-H", "OR-L", "+1", "+2", "+3", "-1", "-2", "-3"):
+        assert label in body
+    # Required field names appear in the block contract.
+    for field in ("alias", "level", "thesis", "execution_read", "direction",
+                  "horizon_sec", "prob_success", "expected_r",
+                  "invalidation", "features_used"):
+        assert field in body, f"forecast contract missing field: {field}"
+    # Conditional-emission language must be present.
+    assert "Emit NO block" in body or "emit no block" in body.lower()
+
+
+def test_pax_forecast_has_distinct_end_marker_from_chart_signal():
+    """The chart-signal block ends with <<END>>; the forecast block ends
+    with <<END_FORECAST>>. Distinct markers keep the two regex extractors
+    from overlapping."""
+    body = prompts.render_system_prompt()
+    assert "<<END_FORECAST>>" in body
+    # And the chart signal contract still uses <<END>>.
+    assert "<<END>>" in body
+
+
+def test_pax_forecast_block_direction_rules_documented():
+    body = prompts.render_system_prompt()
+    # PAY_FOR_TRADE -> LONG or SHORT; otherwise NONE.
+    # The chart-signal section uses the same rule. We just need the
+    # forecast section to repeat it so the model has no excuse to mix.
+    forecast_section = body.split("PAX FORECAST", 1)[-1]
+    assert "PAY_FOR_TRADE" in forecast_section
+    assert "LONG or SHORT" in forecast_section
+    assert "NONE" in forecast_section
+
+
+def test_pax_forecast_block_listed_after_chart_signal():
+    """If both blocks are emitted, the forecast must come AFTER the chart
+    signal. The prompt should describe ordering explicitly."""
+    body = prompts.render_system_prompt()
+    chart_pos = body.find("<<PAX_AI_CHART_SIGNAL>>")
+    forecast_pos = body.find("<<PAX_FORECAST>>")
+    assert chart_pos != -1 and forecast_pos != -1
+    assert chart_pos < forecast_pos, (
+        "the prompt must describe the chart signal before the forecast "
+        "so the ordering is clear to Claude")
+
+
+def test_pax_forecast_block_features_used_must_be_non_empty():
+    body = prompts.render_system_prompt()
+    forecast_section = body.split("PAX FORECAST", 1)[-1]
+    assert "features_used" in forecast_section
+    assert "Empty list is invalid" in forecast_section or \
+           "must list" in forecast_section

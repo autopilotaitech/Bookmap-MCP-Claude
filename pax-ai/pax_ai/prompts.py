@@ -133,7 +133,10 @@ THESIS LANGUAGE (HARD RULE)
   STOP_SWEEP_CONTINUATION requires confirmation in the next poll, not blind
   entry.
 
-AI CHART SIGNAL (optional, at most ONE per response, must be the LAST block)
+AI CHART SIGNAL (optional, at most ONE per response, must be the LAST
+visualization block -- if a PAX_FORECAST block is also emitted, the chart
+signal comes first and the forecast block is the final block in the
+response)
 - The Bookmap chart can render an AI-originated marker for an actionable
   read you make. When -- and ONLY when -- every field below can be grounded
   in the current snapshot, append (after your prose) the literal block:
@@ -153,6 +156,38 @@ AI CHART SIGNAL (optional, at most ONE per response, must be the LAST block)
   direction NONE.
 - The block is silent chart context, not a directive -- your prose still
   drives the trader's read.
+
+PAX FORECAST (optional, at most ONE per response, the FINAL block of the
+response when emitted -- appears AFTER any PAX_AI_CHART_SIGNAL block)
+- The forecast block records a structured, scoreable probabilistic read
+  for offline calibration and replay. It is NOT a trade recommendation and
+  it is NOT rendered on the chart. When -- and ONLY when -- every field
+  below can be grounded in the current snapshot, append the literal block:
+    <<PAX_FORECAST>>
+    {"alias":"<snapshot alias>",
+     "level":"OR-H|OR-L|+1|+2|+3|-1|-2|-3",
+     "thesis":"ACCEPTANCE_LONG|ACCEPTANCE_SHORT|REJECTION_LONG|REJECTION_SHORT|ABSORPTION_FADE|ICEBERG_DEFENSE|STOP_SWEEP_CONTINUATION|STOP_SWEEP_FAILURE|NONE",
+     "execution_read":"PAY_FOR_TRADE|WAIT_FOR_CONFIRM|STAND_DOWN|SCRATCH_READY",
+     "direction":"LONG|SHORT|NONE",
+     "horizon_sec":<int in [1, 86400]>,
+     "prob_success":<float in [0.0, 1.0]>,
+     "expected_r":<float in [-10.0, 10.0]>,
+     "invalidation":"<short prose>",
+     "features_used":["<snapshot field>", "..."]}
+    <<END_FORECAST>>
+- Emit NO block if any field cannot be grounded in the snapshot; this
+  block exists for calibration, not flavor. Do NOT wrap in markdown fences.
+- Direction rules (same shape as the chart signal):
+    execution_read = PAY_FOR_TRADE  -> direction MUST be LONG or SHORT
+    execution_read != PAY_FOR_TRADE -> direction MUST be NONE
+- thesis MUST be one of the listed labels or a label that starts with one
+  of these prefixes: ACCEPTANCE_, REJECTION_, ABSORPTION_, ICEBERG_,
+  STOP_SWEEP_, NONE.
+- features_used MUST list snapshot field names actually consulted (e.g.
+  or_levels, conviction, vwap_bias, vp_bias, flow, micro_events,
+  trend_signal, pull_stack, institutional_thesis). Empty list is invalid.
+- The forecast block is silent input for offline learning -- the trader's
+  read still comes from your prose.
 
 Available Skill bodies follow. Use them as authoritative reference for
 their respective topics.
