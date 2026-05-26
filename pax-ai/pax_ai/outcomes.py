@@ -11,8 +11,12 @@ matching trade_outcomes row, the labeler:
      recorded as invalidated=1 / FORECAST_MISSING_OR_AMBIGUOUS.
 
   2. For PAY_FOR_TRADE + LONG/SHORT:
-       - reads mid_at_t0..t900s from snapshot_features via nearest-match
-         within +/- outcomes.match_tolerance_ms;
+       - reads mid_at_t0..t900s via time-aligned lookup (see
+         ``_mid_aligned``): exact-timestamp match preferred, otherwise
+         linear interpolation between bracketing snapshots when their
+         inter-snapshot gap is <= outcomes.match_tolerance_ms; one-sided
+         data or a wider gap returns None rather than scoring against a
+         nearby-but-wrong timestamp;
        - long  realized_r = mid_tN - mid_t0
          short realized_r = mid_t0 - mid_tN   (units: points);
        - missing mid_t0       -> invalidated=1 / SNAPSHOT_MISSING_AT_T0
@@ -21,7 +25,7 @@ matching trade_outcomes row, the labeler:
 
   3. For non-PAY forecasts (WAIT_FOR_CONFIRM / STAND_DOWN / SCRATCH_READY
      + NONE): writes verdict=<execution_read>, realized_r columns NULL,
-     invalidated=0, label_method='structured_v1'.
+     invalidated=0, label_method='structured_resampled_v1'.
 
 Daemon NEVER raises into the parent. start() is idempotent. stop() is
 safe when not running. Default disabled via outcomes.enabled=False.
@@ -54,7 +58,7 @@ _T_COLUMNS = ("mid_at_t0", "mid_at_t60s", "mid_at_t180s",
               "mid_at_t300s", "mid_at_t900s")
 _REALIZED_R_COLUMNS = ("realized_r_at_t60s", "realized_r_at_t180s",
                        "realized_r_at_t300s", "realized_r_at_t900s")
-_LABEL_METHOD = "structured_v1"
+_LABEL_METHOD = "structured_resampled_v1"
 
 _REASON_FORECAST = "FORECAST_MISSING_OR_AMBIGUOUS"
 _REASON_T0       = "SNAPSHOT_MISSING_AT_T0"
@@ -63,17 +67,61 @@ _REASON_HORIZON  = "HORIZON_DATA_MISSING"
 _VERDICT_UNKNOWN = "UNKNOWN"
 
 
-def _mid_near(conn: sqlite3.Connection, alias: str,
-              target_ts_ms: int, tolerance_ms: int) -> Optional[float]:
-    """Nearest snapshot_features.mid to target_ts_ms within +/- tolerance_ms."""
+def _mid_aligned(conn: sqlite3.Connection, alias: str,
+                  target_ts_ms: int, max_gap_ms: int) -> Optional[float]:
+    """Time-aligned snapshot_features.mid lookup. Returns ``None`` rather
+    than silently scoring against a nearby-but-wrong timestamp.
+
+    Resolution order:
+
+      1. Exact-timestamp match (alias + ts_ms = target). If present and
+         mid IS NOT NULL, return that mid verbatim.
+      2. Otherwise find the nearest snapshot strictly BEFORE and the
+         nearest snapshot strictly AFTER target_ts_ms (same alias, non-null
+         mid). If either side is missing, return ``None`` -- we do NOT
+         fall back to one-sided nearest matching.
+      3. If both sides exist, check the inter-snapshot gap
+         ``(after.ts_ms - before.ts_ms)``. If it exceeds ``max_gap_ms``,
+         return ``None`` -- the gap is too wide to interpolate honestly.
+      4. Otherwise linearly interpolate by timestamp:
+            frac = (target - t_before) / (t_after - t_before)
+            mid  = m_before + frac * (m_after - m_before)
+    """
     row = conn.execute("""
         SELECT mid FROM snapshot_features
-        WHERE alias=? AND ts_ms BETWEEN ? AND ?
-        ORDER BY ABS(ts_ms - ?) ASC
-        LIMIT 1
-    """, (alias, target_ts_ms - tolerance_ms,
-          target_ts_ms + tolerance_ms, target_ts_ms)).fetchone()
-    return row[0] if row else None
+        WHERE alias=? AND ts_ms=? AND mid IS NOT NULL
+        ORDER BY ts_ms DESC, id DESC LIMIT 1
+    """, (alias, target_ts_ms)).fetchone()
+    if row is not None and row[0] is not None:
+        return float(row[0])
+
+    before = conn.execute("""
+        SELECT ts_ms, mid FROM snapshot_features
+        WHERE alias=? AND ts_ms < ? AND mid IS NOT NULL
+        ORDER BY ts_ms DESC, id DESC LIMIT 1
+    """, (alias, target_ts_ms)).fetchone()
+    after = conn.execute("""
+        SELECT ts_ms, mid FROM snapshot_features
+        WHERE alias=? AND ts_ms > ? AND mid IS NOT NULL
+        ORDER BY ts_ms ASC, id DESC LIMIT 1
+    """, (alias, target_ts_ms)).fetchone()
+
+    if before is None or after is None:
+        return None
+
+    t_before = int(before[0])
+    t_after  = int(after[0])
+    if (t_after - t_before) > int(max_gap_ms):
+        return None
+
+    m_before = float(before[1])
+    m_after  = float(after[1])
+    span = t_after - t_before
+    if span <= 0:
+        # Degenerate (same ts on both sides); fall back to before-mid.
+        return m_before
+    frac = (int(target_ts_ms) - t_before) / float(span)
+    return m_before + frac * (m_after - m_before)
 
 
 def _resolve_forecast_db_path() -> Optional[Path]:
@@ -235,7 +283,7 @@ def _label_one(conn: sqlite3.Connection,
         return
 
     verdict = "ENTER_LONG" if direction == "LONG" else "ENTER_SHORT"
-    mids = tuple(_mid_near(conn, alias, ai_ts_ms + off * 1000, tolerance_ms)
+    mids = tuple(_mid_aligned(conn, alias, ai_ts_ms + off * 1000, tolerance_ms)
                  for off in _T_OFFSETS_S)
     m0 = mids[0]
 

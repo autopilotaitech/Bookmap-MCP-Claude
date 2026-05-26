@@ -253,7 +253,7 @@ def test_pay_for_trade_long_emits_enter_long_with_directional_r(
     assert row["verdict"] == "ENTER_LONG"
     assert row["invalidated"] == 0
     assert row["invalidation_reason"] is None
-    assert row["label_method"] == "structured_v1"
+    assert row["label_method"] == "structured_resampled_v1"
     assert row["entry_price"] == 100.0
     assert row["mid_at_t0"]    == 100.0
     assert row["mid_at_t60s"]  == 101.0
@@ -433,7 +433,7 @@ def test_ambiguous_forecast_invalidates_forecast_missing_or_ambiguous(
 def test_non_pay_forecast_is_not_a_directional_trade(
         tmp_path, monkeypatch):
     """STAND_DOWN/NONE -> verdict='STAND_DOWN', realized_r NULL,
-    invalidated=0, label_method='structured_v1'."""
+    invalidated=0, label_method='structured_resampled_v1'."""
     from pax_ai import outcomes
     bus, fc = _enable_outcomes(tmp_path, monkeypatch)
     ai_ts = int(time.time() * 1000) - 86_400_000
@@ -449,7 +449,7 @@ def test_non_pay_forecast_is_not_a_directional_trade(
     assert row["verdict"] == "STAND_DOWN"
     assert row["invalidated"] == 0
     assert row["invalidation_reason"] is None
-    assert row["label_method"] == "structured_v1"
+    assert row["label_method"] == "structured_resampled_v1"
     assert row["entry_price"] is None
     assert row["realized_r_at_t60s"]  is None
     assert row["realized_r_at_t180s"] is None
@@ -474,3 +474,282 @@ def test_outcomes_does_not_relabel_already_labeled_rows(
         n2 = conn.execute("SELECT COUNT(*) FROM trade_outcomes").fetchone()[0]
     outcomes.stop()
     assert n2 == 1
+
+
+# ---------------------------------------------------------- time alignment
+
+def _insert_snapshot(bus_db, *, ts_ms, mid, alias="NQM6"):
+    """Insert a snapshot_features row at the exact ``ts_ms``.
+
+    Used by the Phase 6 time-aligned-lookup tests to seed bracketing
+    snapshots at custom millisecond offsets that the legacy
+    (offset_s * 1000) seed helper can't express.
+    """
+    from pax_ai import feature_bus
+    with feature_bus._open_db(bus_db) as conn:
+        conn.execute("""
+            INSERT INTO snapshot_features
+              (schema_version, ts_ms, alias, health, mid)
+            VALUES (1, ?, ?, 'ok', ?)
+        """, (int(ts_ms), alias, float(mid)))
+
+
+def test_exact_timestamp_match_uses_exact_mid(tmp_path, monkeypatch):
+    """A snapshot at exactly the target ts must short-circuit interpolation
+    and return that mid verbatim. We prove 'no interpolation' by also
+    seeding bracketing snapshots whose interpolated value would be very
+    different from the exact-hit mid -- the exact-match path must win."""
+    from pax_ai import outcomes
+    bus, fc = _enable_outcomes(tmp_path, monkeypatch)
+    ai_ts = int(time.time() * 1000) - 86_400_000
+    ai_id = _seed_ai_turn(bus, ai_ts_ms=ai_ts, snapshots=())
+    # Exact-hit snapshots at every required offset, plus distractor
+    # snapshots that would skew an interpolation if it ran.
+    for off_s, mid in ((0, 100.0), (60, 110.0), (180, 120.0),
+                        (300, 130.0), (900, 140.0)):
+        _insert_snapshot(bus, ts_ms=ai_ts + off_s * 1000, mid=mid)
+        # Distractor: 100ms before and 100ms after each target, mid=999.
+        # If interpolation ran, mid_at_tN would be ~999, not the exact value.
+        _insert_snapshot(bus, ts_ms=ai_ts + off_s * 1000 - 100, mid=999.0)
+        _insert_snapshot(bus, ts_ms=ai_ts + off_s * 1000 + 100, mid=999.0)
+    _seed_forecast(fc, execution_read="PAY_FOR_TRADE", direction="LONG")
+
+    outcomes.start()
+    assert _wait_outcomes(bus, target=1) == 1
+    outcomes.stop()
+
+    row = _read_outcome(bus, ai_id)
+    assert row["mid_at_t0"]    == 100.0
+    assert row["mid_at_t60s"]  == 110.0
+    assert row["mid_at_t180s"] == 120.0
+    assert row["mid_at_t300s"] == 130.0
+    assert row["mid_at_t900s"] == 140.0
+    assert row["invalidated"] == 0
+
+
+def test_duplicate_exact_timestamp_uses_latest_snapshot_deterministically(
+        tmp_path, monkeypatch):
+    """Duplicate snapshot timestamps are legal in the append-only bus table.
+    The aligned lookup must use a stable tie-breaker rather than depending on
+    SQLite's planner order for equal ts_ms rows."""
+    from pax_ai import outcomes
+    bus, fc = _enable_outcomes(tmp_path, monkeypatch)
+    ai_ts = int(time.time() * 1000) - 86_400_000
+    ai_id = _seed_ai_turn(bus, ai_ts_ms=ai_ts, snapshots=())
+    # Two exact t0 rows: the newer append should win via ORDER BY id DESC.
+    _insert_snapshot(bus, ts_ms=ai_ts, mid=99.0)
+    _insert_snapshot(bus, ts_ms=ai_ts, mid=100.0)
+    for off_s, mid in ((60, 101.0), (180, 102.0),
+                        (300, 103.0), (900, 104.0)):
+        _insert_snapshot(bus, ts_ms=ai_ts + off_s * 1000, mid=mid)
+    _seed_forecast(fc, execution_read="PAY_FOR_TRADE", direction="LONG")
+
+    outcomes.start()
+    assert _wait_outcomes(bus, target=1) == 1
+    outcomes.stop()
+
+    row = _read_outcome(bus, ai_id)
+    assert row["invalidated"] == 0
+    assert row["mid_at_t0"] == 100.0
+    assert row["entry_price"] == 100.0
+
+
+def test_interpolation_halfway_between_two_snapshots(
+        tmp_path, monkeypatch):
+    """Two snapshots straddle each target with gap <= max_gap_ms.
+    Target sits exactly halfway -> mid = (m_before + m_after) / 2."""
+    from pax_ai import outcomes
+    bus, fc = _enable_outcomes(tmp_path, monkeypatch)
+    ai_ts = int(time.time() * 1000) - 86_400_000
+    ai_id = _seed_ai_turn(bus, ai_ts_ms=ai_ts, snapshots=())
+    # For every target offset, place a snapshot 2s before and 2s after
+    # (gap = 4s, under the 5s default). Target is exactly halfway.
+    layout = [
+        (0,   98.0, 102.0),     # halfway -> 100.0
+        (60,  99.0, 103.0),     # halfway -> 101.0
+        (180, 100.0, 105.0),    # halfway -> 102.5
+        (300, 99.0, 102.0),     # halfway -> 100.5
+        (900, 96.0, 102.0),     # halfway -> 99.0
+    ]
+    for off_s, before, after in layout:
+        _insert_snapshot(bus, ts_ms=ai_ts + off_s * 1000 - 2_000, mid=before)
+        _insert_snapshot(bus, ts_ms=ai_ts + off_s * 1000 + 2_000, mid=after)
+    _seed_forecast(fc, execution_read="PAY_FOR_TRADE", direction="LONG")
+
+    outcomes.start()
+    assert _wait_outcomes(bus, target=1) == 1
+    outcomes.stop()
+
+    row = _read_outcome(bus, ai_id)
+    assert row["mid_at_t0"]    == pytest.approx(100.0)
+    assert row["mid_at_t60s"]  == pytest.approx(101.0)
+    assert row["mid_at_t180s"] == pytest.approx(102.5)
+    assert row["mid_at_t300s"] == pytest.approx(100.5)
+    assert row["mid_at_t900s"] == pytest.approx(99.0)
+    assert row["invalidated"] == 0
+
+
+def test_interpolation_yields_correct_realized_r_for_long(
+        tmp_path, monkeypatch):
+    """LONG realized_r_at_tN = mid_tN - mid_t0 when both sides
+    are interpolated."""
+    from pax_ai import outcomes
+    bus, fc = _enable_outcomes(tmp_path, monkeypatch)
+    ai_ts = int(time.time() * 1000) - 86_400_000
+    ai_id = _seed_ai_turn(bus, ai_ts_ms=ai_ts, snapshots=())
+    # t0 halfway between 99 and 101 -> 100.
+    # t60 halfway between 102 and 104 -> 103. realized_r_at_t60s = +3.
+    # t180 halfway between 95 and 99 -> 97.  realized_r_at_t180s = -3.
+    _insert_snapshot(bus, ts_ms=ai_ts - 1_000,            mid=99.0)
+    _insert_snapshot(bus, ts_ms=ai_ts + 1_000,            mid=101.0)
+    _insert_snapshot(bus, ts_ms=ai_ts + 60_000 - 1_000,  mid=102.0)
+    _insert_snapshot(bus, ts_ms=ai_ts + 60_000 + 1_000,  mid=104.0)
+    _insert_snapshot(bus, ts_ms=ai_ts + 180_000 - 1_000, mid=95.0)
+    _insert_snapshot(bus, ts_ms=ai_ts + 180_000 + 1_000, mid=99.0)
+    # Also seed exact hits for t300 and t900 so those don't invalidate.
+    _insert_snapshot(bus, ts_ms=ai_ts + 300_000, mid=100.0)
+    _insert_snapshot(bus, ts_ms=ai_ts + 900_000, mid=100.0)
+    _seed_forecast(fc, execution_read="PAY_FOR_TRADE", direction="LONG")
+
+    outcomes.start()
+    assert _wait_outcomes(bus, target=1) == 1
+    outcomes.stop()
+
+    row = _read_outcome(bus, ai_id)
+    assert row["verdict"] == "ENTER_LONG"
+    assert row["invalidated"] == 0
+    assert row["entry_price"] == pytest.approx(100.0)
+    assert row["realized_r_at_t60s"]  == pytest.approx(+3.0)
+    assert row["realized_r_at_t180s"] == pytest.approx(-3.0)
+
+
+def test_interpolation_yields_correct_realized_r_for_short(
+        tmp_path, monkeypatch):
+    """SHORT realized_r flips the sign: mid_t0 - mid_tN."""
+    from pax_ai import outcomes
+    bus, fc = _enable_outcomes(tmp_path, monkeypatch)
+    ai_ts = int(time.time() * 1000) - 86_400_000
+    ai_id = _seed_ai_turn(bus, ai_ts_ms=ai_ts, snapshots=())
+    _insert_snapshot(bus, ts_ms=ai_ts - 1_000,            mid=99.0)
+    _insert_snapshot(bus, ts_ms=ai_ts + 1_000,            mid=101.0)
+    _insert_snapshot(bus, ts_ms=ai_ts + 60_000 - 1_000,  mid=102.0)
+    _insert_snapshot(bus, ts_ms=ai_ts + 60_000 + 1_000,  mid=104.0)
+    _insert_snapshot(bus, ts_ms=ai_ts + 180_000 - 1_000, mid=95.0)
+    _insert_snapshot(bus, ts_ms=ai_ts + 180_000 + 1_000, mid=99.0)
+    _insert_snapshot(bus, ts_ms=ai_ts + 300_000, mid=100.0)
+    _insert_snapshot(bus, ts_ms=ai_ts + 900_000, mid=100.0)
+    _seed_forecast(fc, execution_read="PAY_FOR_TRADE", direction="SHORT")
+
+    outcomes.start()
+    assert _wait_outcomes(bus, target=1) == 1
+    outcomes.stop()
+
+    row = _read_outcome(bus, ai_id)
+    assert row["verdict"] == "ENTER_SHORT"
+    assert row["invalidated"] == 0
+    assert row["realized_r_at_t60s"]  == pytest.approx(-3.0)
+    assert row["realized_r_at_t180s"] == pytest.approx(+3.0)
+
+
+def test_one_sided_snapshot_at_t0_invalidates_snapshot_missing_at_t0(
+        tmp_path, monkeypatch):
+    """Only an 'after' snapshot exists for t0. The new helper MUST refuse
+    to score on one-sided data and invalidate as SNAPSHOT_MISSING_AT_T0."""
+    from pax_ai import outcomes
+    bus, fc = _enable_outcomes(tmp_path, monkeypatch)
+    ai_ts = int(time.time() * 1000) - 86_400_000
+    ai_id = _seed_ai_turn(bus, ai_ts_ms=ai_ts, snapshots=())
+    # Only an after snapshot at t0, but exact hits at every forward horizon.
+    _insert_snapshot(bus, ts_ms=ai_ts + 100,             mid=100.5)
+    for off_s, mid in ((60, 101.0), (180, 102.5),
+                        (300, 100.5), (900, 99.0)):
+        _insert_snapshot(bus, ts_ms=ai_ts + off_s * 1000, mid=mid)
+    _seed_forecast(fc, execution_read="PAY_FOR_TRADE", direction="LONG")
+
+    outcomes.start()
+    assert _wait_outcomes(bus, target=1) == 1
+    outcomes.stop()
+
+    row = _read_outcome(bus, ai_id)
+    assert row["invalidated"] == 1
+    assert row["invalidation_reason"] == "SNAPSHOT_MISSING_AT_T0"
+    assert row["mid_at_t0"] is None
+    assert row["realized_r_at_t60s"] is None
+
+
+def test_one_sided_snapshot_at_horizon_invalidates_horizon_data_missing(
+        tmp_path, monkeypatch):
+    """t0 has an exact hit; t60 has only a 'before' snapshot (no after).
+    The forward horizon must invalidate as HORIZON_DATA_MISSING."""
+    from pax_ai import outcomes
+    bus, fc = _enable_outcomes(tmp_path, monkeypatch)
+    ai_ts = int(time.time() * 1000) - 86_400_000
+    ai_id = _seed_ai_turn(bus, ai_ts_ms=ai_ts, snapshots=())
+    # t0 exact.
+    _insert_snapshot(bus, ts_ms=ai_ts, mid=100.0)
+    # t60: only a 'before' snapshot, no 'after'.
+    _insert_snapshot(bus, ts_ms=ai_ts + 60_000 - 500, mid=99.5)
+    # Exact hits at remaining horizons.
+    for off_s, mid in ((180, 102.5), (300, 100.5), (900, 99.0)):
+        _insert_snapshot(bus, ts_ms=ai_ts + off_s * 1000, mid=mid)
+    _seed_forecast(fc, execution_read="PAY_FOR_TRADE", direction="LONG")
+
+    outcomes.start()
+    assert _wait_outcomes(bus, target=1) == 1
+    outcomes.stop()
+
+    row = _read_outcome(bus, ai_id)
+    assert row["invalidated"] == 1
+    assert row["invalidation_reason"] == "HORIZON_DATA_MISSING"
+    assert row["mid_at_t0"]    == 100.0      # t0 resolved
+    assert row["realized_r_at_t60s"] is None
+
+
+def test_gap_exceeds_max_gap_at_t0_invalidates(tmp_path, monkeypatch):
+    """Both sides bracket t0 but the inter-snapshot gap exceeds
+    max_gap_ms (5_000 default). Refuses to interpolate."""
+    from pax_ai import outcomes
+    bus, fc = _enable_outcomes(tmp_path, monkeypatch)
+    ai_ts = int(time.time() * 1000) - 86_400_000
+    ai_id = _seed_ai_turn(bus, ai_ts_ms=ai_ts, snapshots=())
+    # before 4s ahead of t0, after 4s past t0 -> gap = 8s > 5s default.
+    _insert_snapshot(bus, ts_ms=ai_ts - 4_000, mid=98.0)
+    _insert_snapshot(bus, ts_ms=ai_ts + 4_000, mid=102.0)
+    # Exact hits for forward horizons so we isolate the t0 failure.
+    for off_s, mid in ((60, 101.0), (180, 102.5),
+                        (300, 100.5), (900, 99.0)):
+        _insert_snapshot(bus, ts_ms=ai_ts + off_s * 1000, mid=mid)
+    _seed_forecast(fc, execution_read="PAY_FOR_TRADE", direction="LONG")
+
+    outcomes.start()
+    assert _wait_outcomes(bus, target=1) == 1
+    outcomes.stop()
+
+    row = _read_outcome(bus, ai_id)
+    assert row["invalidated"] == 1
+    assert row["invalidation_reason"] == "SNAPSHOT_MISSING_AT_T0"
+    assert row["mid_at_t0"] is None
+
+
+def test_gap_exceeds_max_gap_at_horizon_invalidates(tmp_path, monkeypatch):
+    """Same gap test but at a forward horizon -> HORIZON_DATA_MISSING."""
+    from pax_ai import outcomes
+    bus, fc = _enable_outcomes(tmp_path, monkeypatch)
+    ai_ts = int(time.time() * 1000) - 86_400_000
+    ai_id = _seed_ai_turn(bus, ai_ts_ms=ai_ts, snapshots=())
+    _insert_snapshot(bus, ts_ms=ai_ts, mid=100.0)                  # t0 exact
+    # t60: bracket but gap = 8s.
+    _insert_snapshot(bus, ts_ms=ai_ts + 60_000 - 4_000, mid=99.0)
+    _insert_snapshot(bus, ts_ms=ai_ts + 60_000 + 4_000, mid=101.0)
+    for off_s, mid in ((180, 102.5), (300, 100.5), (900, 99.0)):
+        _insert_snapshot(bus, ts_ms=ai_ts + off_s * 1000, mid=mid)
+    _seed_forecast(fc, execution_read="PAY_FOR_TRADE", direction="LONG")
+
+    outcomes.start()
+    assert _wait_outcomes(bus, target=1) == 1
+    outcomes.stop()
+
+    row = _read_outcome(bus, ai_id)
+    assert row["invalidated"] == 1
+    assert row["invalidation_reason"] == "HORIZON_DATA_MISSING"
+    assert row["realized_r_at_t60s"] is None
