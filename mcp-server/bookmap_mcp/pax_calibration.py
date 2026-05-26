@@ -189,29 +189,42 @@ def _has_outcome(outcome: Optional[Dict[str, Any]]) -> bool:
 
 # --------------------------------------------------------------- bus outcomes
 
-def bus_outcome_lookup(bus_db_path: Path) -> OutcomeLookup:
+def bus_outcome_lookup(bus_db_path: Path,
+                        *,
+                        allow_linkage_fallback: bool = True) -> OutcomeLookup:
     """Return an OutcomeLookup that reads from a bus SQLite database.
 
-    Looks for a ``trade_outcomes`` row keyed by ``forecast['source_turn_id']``
-    and picks the ``realized_r_at_t{horizon_sec}s`` column. If the exact
-    horizon column does not exist the lookup returns ``None`` rather than
-    silently substituting a different horizon.
+    Lookup order (first hit wins):
+
+    1. ``forecast['source_turn_id']`` -> ``trade_outcomes.ai_turn_id``
+       direct join. This is the canonical path when source_turn_id was
+       known at capture (e.g., a future code path that captures forecasts
+       inside the bus writer thread).
+
+    2. (when ``allow_linkage_fallback=True``) Deterministic linkage join:
+       look up ``ai_turns.id`` by ``digest_sha256`` AND ``chat_run_id``;
+       a unique match gives the ai_turn_id which then drives the same
+       ``trade_outcomes`` query as path 1. Ambiguous matches return
+       ``None`` (we never invent a join).
+
+    In all cases the horizon column is matched strictly:
+    ``realized_r_at_t{horizon_sec}s``. A missing column or missing row is
+    reported as ``None`` rather than silently using a different horizon.
     """
     bus_db_path = Path(bus_db_path)
 
-    def _lookup(forecast: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        turn_id = forecast.get("source_turn_id")
-        horizon = int(forecast.get("horizon_sec") or 0)
-        if turn_id is None or horizon <= 0:
-            return None
-        col = f"realized_r_at_t{horizon}s"
+    def _open() -> Optional[sqlite3.Connection]:
         if not bus_db_path.exists():
             return None
         uri = f"file:{bus_db_path.resolve().as_posix()}?mode=ro"
         try:
-            conn = sqlite3.connect(uri, uri=True)
+            return sqlite3.connect(uri, uri=True)
         except sqlite3.Error:
             return None
+
+    def _trade_outcome_row(conn: sqlite3.Connection,
+                            turn_id: int,
+                            col: str) -> Optional[float]:
         try:
             cur = conn.execute(f"PRAGMA table_info(trade_outcomes)")
             cols = {r[1] for r in cur.fetchall()}
@@ -225,17 +238,108 @@ def bus_outcome_lookup(bus_db_path: Path) -> OutcomeLookup:
             row = cur.fetchone()
             if row is None or row[0] is None:
                 return None
-            return {
-                "realized_r": float(row[0]),
-                "horizon_used_sec": horizon,
-                "source": "bus_trade_outcomes",
-            }
+            return float(row[0])
         except sqlite3.Error:
+            return None
+
+    def _ai_turn_id_via_linkage(conn: sqlite3.Connection,
+                                  digest_sha: Optional[str],
+                                  chat_run_id: Optional[str],
+                                  ) -> Optional[int]:
+        if not digest_sha or not chat_run_id:
+            return None
+        try:
+            cur = conn.execute(
+                "SELECT id FROM ai_turns "
+                "WHERE digest_sha256 = ? AND chat_run_id = ? "
+                "ORDER BY id ASC LIMIT 2",
+                (digest_sha, chat_run_id),
+            )
+            rows = cur.fetchall()
+        except sqlite3.Error:
+            return None
+        if len(rows) != 1:
+            return None  # 0 = no match; >1 = ambiguous, never invent
+        return int(rows[0][0])
+
+    def _lookup(forecast: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        horizon = int(forecast.get("horizon_sec") or 0)
+        if horizon <= 0:
+            return None
+        col = f"realized_r_at_t{horizon}s"
+        conn = _open()
+        if conn is None:
+            return None
+        try:
+            turn_id = forecast.get("source_turn_id")
+            source = None
+            if turn_id is not None:
+                r = _trade_outcome_row(conn, int(turn_id), col)
+                if r is not None:
+                    source = "bus_trade_outcomes"
+                    return {
+                        "realized_r": r,
+                        "horizon_used_sec": horizon,
+                        "source": source,
+                    }
+
+            if allow_linkage_fallback:
+                fallback_turn_id = _ai_turn_id_via_linkage(
+                    conn,
+                    forecast.get("digest_sha256"),
+                    forecast.get("chat_run_id"),
+                )
+                if fallback_turn_id is not None:
+                    r = _trade_outcome_row(conn, fallback_turn_id, col)
+                    if r is not None:
+                        return {
+                            "realized_r": r,
+                            "horizon_used_sec": horizon,
+                            "source": "bus_trade_outcomes_via_linkage",
+                            "linkage": {
+                                "ai_turn_id": fallback_turn_id,
+                                "digest_sha256": forecast.get("digest_sha256"),
+                                "chat_run_id": forecast.get("chat_run_id"),
+                            },
+                        }
+
             return None
         finally:
             conn.close()
 
     return _lookup
+
+
+def linkage_audit(forecasts_path: Path,
+                   bus_db_path: Path) -> Dict[str, Any]:
+    """Report how many stored forecasts can be paired with bus outcomes.
+
+    Pure audit: counts paired_via_source_id / paired_via_fallback /
+    unpaired. Useful before running a full calibration to confirm the
+    capture pipeline is producing joinable rows.
+    """
+    counts = {
+        "n_forecasts":           0,
+        "paired_via_source_id":  0,
+        "paired_via_fallback":   0,
+        "unpaired":              0,
+    }
+    if not Path(forecasts_path).exists():
+        return counts
+    lookup = bus_outcome_lookup(bus_db_path, allow_linkage_fallback=True)
+    with PaxForecastStore(forecasts_path) as s:
+        for forecast in s.iter_forecasts():
+            counts["n_forecasts"] += 1
+            outcome = lookup(forecast)
+            if outcome is None:
+                counts["unpaired"] += 1
+                continue
+            src = outcome.get("source") or ""
+            if "via_linkage" in src:
+                counts["paired_via_fallback"] += 1
+            else:
+                counts["paired_via_source_id"] += 1
+    return counts
 
 
 # --------------------------------------------------------------- day wrapper
@@ -302,6 +406,7 @@ __all__ = [
     "bus_outcome_lookup",
     "calibration_for_day",
     "compute_calibration",
+    "linkage_audit",
     "main",
     "utc_day_window",
 ]
