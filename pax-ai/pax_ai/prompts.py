@@ -19,10 +19,22 @@ MESSAGE, not by swapping system-prompt files. See chat module.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
+import tempfile
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+
+# Phase 4: turn-level audit trail.
+# PROMPT_VERSION is the semver of the prompt-schema contract (preamble +
+# ROUTER hint format + skill-bundle assembly rules). Bump on any
+# breaking change to the assembly shape so audit replay can distinguish
+# eras. Independent of model_release_id and skill_bundle_sha256.
+PROMPT_VERSION = "1.0.0"
+
+_SHA256_EMPTY = hashlib.sha256(b"").hexdigest()
 
 # Skill registry: id -> trigger keywords (lowercase, substring match).
 # Order matters: first match wins as the "primary" skill.
@@ -236,6 +248,108 @@ def write_frozen_prompt() -> Path:
     out_file.write_text(body, encoding="utf-8")
     sys.stderr.write(f"[prompts] wrote {out_file} ({len(body)} chars)\n")
     return out_file
+
+
+def _skill_bundle_text() -> str:
+    """Return the concatenated skill bodies -- the SAME text that
+    render_system_prompt embeds after the base preamble. Iterates
+    SKILL_TRIGGERS in declared order so the hash is deterministic for a
+    given on-disk skills tree.
+
+    If the skills directory is missing or every skill body fails to load,
+    the result is an empty string (its sha256 is the well-known constant
+    e3b0c442...; documented Phase-4 v1 fallback)."""
+    parts: List[str] = []
+    seen: set = set()
+    for skill_id, _kw in SKILL_TRIGGERS:
+        if skill_id in seen:
+            continue
+        seen.add(skill_id)
+        parts.append(_load_skill_body(skill_id))
+    return "".join(parts)
+
+
+def compute_skill_bundle_sha256() -> str:
+    """Deterministic sha256 over the concatenated skill bodies."""
+    return hashlib.sha256(_skill_bundle_text().encode("utf-8")).hexdigest()
+
+
+def _prompt_archive_dir() -> Path:
+    """%LOCALAPPDATA%/pax-ai/prompt-archive/ (created on first archive)."""
+    local = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    return Path(local) / "pax-ai" / "prompt-archive"
+
+
+def _atomic_archive_write(target: Path, body: bytes) -> None:
+    """Atomic, idempotent archive write. No-op when target already exists.
+    Same shape as feature_bus._atomic_write_text but for bytes."""
+    if target.exists():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(body)
+        os.replace(tmp_path, target)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def compute_prompt_lineage(sp_path: Path) -> Dict[str, str]:
+    """Read the frozen prompt file at sp_path, compute its sha256, archive
+    the exact bytes idempotently, and return a lineage dict carrying:
+
+      - prompt_sha256       : sha256(file bytes)        (always 64 hex chars)
+      - prompt_version      : PROMPT_VERSION
+      - skill_bundle_sha256 : sha256(concatenated skill bodies)
+      - prompt_archive_path : absolute path to the archived prompt copy,
+                              or "" when there were no bytes to archive
+
+    Degenerate cases (missing file, empty file) return prompt_sha256 ==
+    sha256(b"") and prompt_archive_path == "". The lineage dict is ALWAYS
+    populated so callers don't need fallback logic.
+
+    Side effects:
+      - Creates _prompt_archive_dir() on first use.
+      - Writes <archive_dir>/<sha>.txt at most once per unique sha
+        (idempotent re-runs are cheap no-ops).
+    """
+    skill_sha = compute_skill_bundle_sha256()
+    try:
+        body = Path(sp_path).read_bytes()
+    except (OSError, ValueError):
+        return {
+            "prompt_sha256":       _SHA256_EMPTY,
+            "prompt_version":      PROMPT_VERSION,
+            "skill_bundle_sha256": skill_sha,
+            "prompt_archive_path": "",
+        }
+    if not body:
+        return {
+            "prompt_sha256":       _SHA256_EMPTY,
+            "prompt_version":      PROMPT_VERSION,
+            "skill_bundle_sha256": skill_sha,
+            "prompt_archive_path": "",
+        }
+    sha = hashlib.sha256(body).hexdigest()
+    archive_dir = _prompt_archive_dir()
+    target = archive_dir / f"{sha}.txt"
+    try:
+        _atomic_archive_write(target, body)
+        archive_path = str(target)
+    except OSError as exc:
+        sys.stderr.write(f"[prompts] archive write failed: {exc}\n")
+        archive_path = ""
+    return {
+        "prompt_sha256":       sha,
+        "prompt_version":      PROMPT_VERSION,
+        "skill_bundle_sha256": skill_sha,
+        "prompt_archive_path": archive_path,
+    }
 
 
 def route(user_message: str) -> Dict[str, object]:

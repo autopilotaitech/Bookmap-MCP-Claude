@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
+
+import pytest
+
 from pax_ai import prompts
+
+
+_SHA256_EMPTY = hashlib.sha256(b"").hexdigest()
 
 
 def test_route_pax_or_keyword():
@@ -234,3 +242,133 @@ def test_pax_forecast_block_features_used_must_be_non_empty():
     assert "features_used" in forecast_section
     assert "Empty list is invalid" in forecast_section or \
            "must list" in forecast_section
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: turn-level audit trail -- prompt lineage helpers
+# ---------------------------------------------------------------------------
+
+def test_prompt_version_constant_exists_and_is_semver_shaped():
+    """PROMPT_VERSION is the version of the prompt schema, not the model."""
+    assert hasattr(prompts, "PROMPT_VERSION")
+    v = prompts.PROMPT_VERSION
+    assert isinstance(v, str) and v.strip()
+    # Soft semver shape (major.minor.patch). Don't pin exact value.
+    parts = v.split(".")
+    assert 2 <= len(parts) <= 4
+    assert all(p.isdigit() for p in parts), v
+
+
+def test_compute_prompt_lineage_returns_required_fields(tmp_path, monkeypatch):
+    """Required keys: prompt_sha256, prompt_version, skill_bundle_sha256,
+    prompt_archive_path. (model_release_id is filled by the chat caller, not
+    here -- it's a per-turn fact, not a per-prompt-file fact.)"""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    sp = tmp_path / "system_prompt.txt"
+    sp.write_text("SYSTEM PROMPT BODY", encoding="utf-8")
+    out = prompts.compute_prompt_lineage(sp)
+    for key in ("prompt_sha256", "prompt_version",
+                "skill_bundle_sha256", "prompt_archive_path"):
+        assert key in out, f"missing key: {key}"
+
+
+def test_compute_prompt_lineage_hashes_exact_file_bytes(tmp_path, monkeypatch):
+    """SHA must be over the on-disk bytes of sp_path, not a reconstructed string."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    sp = tmp_path / "system_prompt.txt"
+    payload = b"EXACTLY THESE BYTES\nnewline-sensitive\n"
+    sp.write_bytes(payload)
+    out = prompts.compute_prompt_lineage(sp)
+    assert out["prompt_sha256"] == hashlib.sha256(payload).hexdigest()
+
+
+def test_compute_prompt_lineage_archives_prompt_at_sha_path(tmp_path, monkeypatch):
+    """Archive lands at <archive_dir>/<sha>.txt with byte-identical content."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    sp = tmp_path / "system_prompt.txt"
+    payload = b"ARCHIVE ME"
+    sp.write_bytes(payload)
+    out = prompts.compute_prompt_lineage(sp)
+
+    arc = Path(out["prompt_archive_path"])
+    assert arc.exists()
+    sha = hashlib.sha256(payload).hexdigest()
+    assert arc.name == f"{sha}.txt"
+    assert arc.read_bytes() == payload
+
+
+def test_compute_prompt_lineage_archive_is_idempotent(tmp_path, monkeypatch):
+    """Two calls with the same prompt SHA must NOT rewrite the archive
+    file. Idempotent + atomic. Compare mtime + content as the canary."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    sp = tmp_path / "system_prompt.txt"
+    sp.write_text("SAME BYTES", encoding="utf-8")
+
+    first = prompts.compute_prompt_lineage(sp)
+    arc = Path(first["prompt_archive_path"])
+    body_before = arc.read_bytes()
+    mtime_before = arc.stat().st_mtime_ns
+
+    second = prompts.compute_prompt_lineage(sp)
+    arc2 = Path(second["prompt_archive_path"])
+    assert arc2 == arc
+    assert arc2.read_bytes() == body_before
+    assert arc2.stat().st_mtime_ns == mtime_before
+
+
+def test_compute_prompt_lineage_keeps_entries_when_new_prompt_arrives(
+        tmp_path, monkeypatch):
+    """A second, different prompt must NOT delete the first archive entry."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    sp_a = tmp_path / "a.txt"; sp_a.write_text("PROMPT A", encoding="utf-8")
+    sp_b = tmp_path / "b.txt"; sp_b.write_text("PROMPT B", encoding="utf-8")
+
+    out_a = prompts.compute_prompt_lineage(sp_a)
+    out_b = prompts.compute_prompt_lineage(sp_b)
+
+    arc_a = Path(out_a["prompt_archive_path"])
+    arc_b = Path(out_b["prompt_archive_path"])
+    assert arc_a.exists() and arc_b.exists()
+    assert arc_a != arc_b
+
+
+def test_compute_prompt_lineage_handles_missing_prompt_file(tmp_path, monkeypatch):
+    """A non-existent sp_path must not raise -- the helper falls back to
+    the empty-bytes SHA and skips the archive (empty path string)."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    out = prompts.compute_prompt_lineage(tmp_path / "does-not-exist.txt")
+    # Empty-bytes SHA is a fixed 64-char hex string; non-empty, audit-safe.
+    assert out["prompt_sha256"] == _SHA256_EMPTY
+    assert out["prompt_archive_path"] == ""
+    assert isinstance(out["skill_bundle_sha256"], str)
+    assert len(out["skill_bundle_sha256"]) == 64
+    assert out["prompt_version"] == prompts.PROMPT_VERSION
+
+
+def test_compute_prompt_lineage_does_not_raise_on_empty_file(tmp_path, monkeypatch):
+    """Empty file => sha-of-empty + empty archive path (we do not archive
+    an empty body; nothing to learn from it later)."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    sp = tmp_path / "empty.txt"; sp.write_bytes(b"")
+    out = prompts.compute_prompt_lineage(sp)
+    assert out["prompt_sha256"] == _SHA256_EMPTY
+    assert out["prompt_archive_path"] == ""
+
+
+def test_compute_skill_bundle_sha256_is_deterministic():
+    """The skill-bundle SHA must be stable across calls for the same on-disk
+    skills. It is hashed over the same concatenated text that
+    render_system_prompt embeds after the base preamble."""
+    a = prompts.compute_skill_bundle_sha256()
+    b = prompts.compute_skill_bundle_sha256()
+    assert isinstance(a, str) and len(a) == 64
+    assert a == b
+
+
+def test_skill_bundle_sha256_differs_from_prompt_sha256(tmp_path, monkeypatch):
+    """They hash different bodies (skills only vs full preamble + skills)."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    sp = tmp_path / "system_prompt.txt"
+    sp.write_text(prompts.render_system_prompt(), encoding="utf-8")
+    out = prompts.compute_prompt_lineage(sp)
+    assert out["prompt_sha256"] != out["skill_bundle_sha256"]

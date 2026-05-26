@@ -805,6 +805,119 @@ def test_capture_ai_chart_signal_invalid_block_no_write(tmp_path, monkeypatch):
     assert out == []
 
 
+# ---------------------------------------------------------------------------
+# Phase 4: turn-level audit trail -- _persist_turn populates prompt lineage
+# ---------------------------------------------------------------------------
+
+
+def test_persist_turn_populates_phase4_lineage_from_actual_prompt_file(
+        tmp_path, monkeypatch):
+    """When the bus captures an AiTurnRecord, the five lineage fields must
+    be populated from the SAME on-disk prompt file the chat path passed to
+    Claude. The hash must be over the file bytes, not a reconstructed string."""
+    import hashlib
+    from pax_ai import chat, feature_bus, prompts
+    from pax_ai import claude_stream as cs
+    from pax_ai import config as cfg_mod
+
+    # Isolate the prompt archive directory to tmp_path so we don't write to
+    # the real %LOCALAPPDATA%/pax-ai/prompt-archive.
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    sp_body = b"SYSTEM PROMPT BODY -- phase 4 lineage test\n"
+    sp_path = tmp_path / "system_prompt.txt"
+    sp_path.write_bytes(sp_body)
+    expected_prompt_sha = hashlib.sha256(sp_body).hexdigest()
+
+    monkeypatch.setattr(cfg_mod, "_reload_if_stale", lambda: None)
+    monkeypatch.setattr(cfg_mod, "_CACHE", {**cfg_mod._CACHE,
+        "feature_bus": {"enabled": True,
+                          "db_path": str(tmp_path / "bus.db"),
+                          "snapshot_blob_dir": str(tmp_path / "s"),
+                          "digest_blob_dir":   str(tmp_path / "d"),
+                          "queue_max": 2000, "writer_idle_ms": 100,
+                          "capture_ms": 1000, "retention_days": 30}})
+    feature_bus._HEALTHY = True
+    feature_bus._RUNNING = True
+
+    captured = []
+    monkeypatch.setattr(feature_bus, "record_ai_turn",
+                         lambda rec: captured.append(rec))
+    monkeypatch.setattr(chat.prompts, "write_frozen_prompt", lambda: sp_path)
+    monkeypatch.setattr(chat.prompts, "route", lambda t: {"primary": "pax-or",
+                                                             "secondary": [],
+                                                             "router_hint": ""})
+    monkeypatch.setattr(cs, "stream_chat", lambda **kw: (
+        kw["on_token"]("ok"),
+        kw["on_done"]({"exit_code": 0}), 0)[2])
+
+    class _W:
+        def write(self, b): pass
+        def flush(self): pass
+    chat.handle_chat_stream(_W(), "ping", deep=False)
+
+    assert len(captured) == 1, "exactly one AiTurnRecord must be enqueued"
+    rec = captured[0]
+    assert rec.prompt_sha256       == expected_prompt_sha
+    assert rec.prompt_version      == prompts.PROMPT_VERSION
+    assert rec.model_release_id    == rec.model      # for now, mirror of model
+    assert len(rec.skill_bundle_sha256) == 64
+    # archive should land at tmp_path/pax-ai/prompt-archive/{sha}.txt
+    arc = Path(rec.prompt_archive_path)
+    assert arc.exists(), f"prompt archive not written: {arc}"
+    assert arc.read_bytes() == sp_body
+
+
+def test_persist_turn_archive_is_idempotent_across_two_chats(
+        tmp_path, monkeypatch):
+    """Two chats with the SAME prompt SHA must NOT rewrite the archive."""
+    from pax_ai import chat, feature_bus
+    from pax_ai import claude_stream as cs
+    from pax_ai import config as cfg_mod
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    sp_path = tmp_path / "system_prompt.txt"
+    sp_path.write_text("SAME PROMPT BODY", encoding="utf-8")
+
+    monkeypatch.setattr(cfg_mod, "_reload_if_stale", lambda: None)
+    monkeypatch.setattr(cfg_mod, "_CACHE", {**cfg_mod._CACHE,
+        "feature_bus": {"enabled": True,
+                          "db_path": str(tmp_path / "bus.db"),
+                          "snapshot_blob_dir": str(tmp_path / "s"),
+                          "digest_blob_dir":   str(tmp_path / "d"),
+                          "queue_max": 2000, "writer_idle_ms": 100,
+                          "capture_ms": 1000, "retention_days": 30}})
+    feature_bus._HEALTHY = True
+    feature_bus._RUNNING = True
+
+    captured = []
+    monkeypatch.setattr(feature_bus, "record_ai_turn",
+                         lambda rec: captured.append(rec))
+    monkeypatch.setattr(chat.prompts, "write_frozen_prompt", lambda: sp_path)
+    monkeypatch.setattr(chat.prompts, "route", lambda t: {"primary": "pax-or",
+                                                             "secondary": [],
+                                                             "router_hint": ""})
+    monkeypatch.setattr(cs, "stream_chat", lambda **kw: (
+        kw["on_token"]("ok"),
+        kw["on_done"]({"exit_code": 0}), 0)[2])
+
+    class _W:
+        def write(self, b): pass
+        def flush(self): pass
+    chat.handle_chat_stream(_W(), "first", deep=False)
+    chat.handle_chat_stream(_W(), "second", deep=False)
+
+    assert len(captured) == 2
+    arc1 = Path(captured[0].prompt_archive_path)
+    arc2 = Path(captured[1].prompt_archive_path)
+    assert arc1 == arc2, "same prompt SHA must reuse the same archive path"
+    # Archive directory contains exactly one .txt (the shared one).
+    arc_dir = arc1.parent
+    archive_files = list(arc_dir.glob("*.txt"))
+    assert len(archive_files) == 1
+
+
 def test_capture_ai_chart_signal_swallows_exceptions(monkeypatch):
     """If the validator raises, the chat path must NOT propagate. Pax AI
     chart plumbing is never allowed to break the chat itself."""

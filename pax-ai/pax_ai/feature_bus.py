@@ -128,12 +128,33 @@ class AiTurnRecord:
     cache_read_tokens:     Optional[int]
     aborted:               bool
     error:                 Optional[str]
+    # Phase 4: turn-level audit trail. Each turn carries its own prompt
+    # lineage so a future audit can answer "what exact prompt did the
+    # model see, what model identity was used, what skill bundle was
+    # bundled, where is the byte-archive of that prompt?".
+    prompt_sha256:         str
+    prompt_version:        str
+    model_release_id:      str
+    skill_bundle_sha256:   str
+    prompt_archive_path:   str
 
     def __post_init__(self) -> None:
         if not self.digest_sha256:
             raise ValueError("digest_sha256 required, NOT NULL")
         if not self.snapshot_sha256:
             raise ValueError("snapshot_sha256 required, NOT NULL")
+        # Phase 4: prompt-lineage identity fields are required. The archive
+        # path is allowed to be empty (the audit pointer is informational;
+        # archiving may legitimately be skipped on empty / unreadable
+        # prompt files).
+        if not self.prompt_sha256:
+            raise ValueError("prompt_sha256 required, NOT NULL")
+        if not self.prompt_version:
+            raise ValueError("prompt_version required, NOT NULL")
+        if not self.model_release_id:
+            raise ValueError("model_release_id required, NOT NULL")
+        if not self.skill_bundle_sha256:
+            raise ValueError("skill_bundle_sha256 required, NOT NULL")
 
 
 # -- Public API stubs (filled in later tasks) --------------------------------
@@ -395,7 +416,12 @@ _DDL: List[str] = [
       total_cost_usd REAL,
       input_tokens INTEGER, output_tokens INTEGER,
       cache_creation_tokens INTEGER, cache_read_tokens INTEGER,
-      aborted INTEGER NOT NULL, error TEXT
+      aborted INTEGER NOT NULL, error TEXT,
+      prompt_sha256 TEXT,
+      prompt_version TEXT,
+      model_release_id TEXT,
+      skill_bundle_sha256 TEXT,
+      prompt_archive_path TEXT
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_aiturn_ts ON ai_turns (ts_ms)",
@@ -456,10 +482,38 @@ def _open_db(path: Path) -> sqlite3.Connection:
     return conn
 
 
+# Additive migrations for DBs created before each schema bump. Each ALTER
+# is idempotent: a "duplicate column" OperationalError means the column is
+# already present, which IS the desired post-state.
+_AI_TURNS_ADDITIVE_MIGRATIONS: List[str] = [
+    # Phase 4 lineage columns.
+    "ALTER TABLE ai_turns ADD COLUMN prompt_sha256 TEXT",
+    "ALTER TABLE ai_turns ADD COLUMN prompt_version TEXT",
+    "ALTER TABLE ai_turns ADD COLUMN model_release_id TEXT",
+    "ALTER TABLE ai_turns ADD COLUMN skill_bundle_sha256 TEXT",
+    "ALTER TABLE ai_turns ADD COLUMN prompt_archive_path TEXT",
+]
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
-    """Run all DDL statements. Idempotent (IF NOT EXISTS everywhere)."""
+    """Run all DDL statements. Idempotent (IF NOT EXISTS everywhere).
+
+    For additive migrations the only acceptable OperationalError is the
+    "duplicate column name" raised by ALTER TABLE ADD COLUMN when the
+    column is already present (the desired post-state). Every other
+    OperationalError -- locked DB, no such table, malformed SQL,
+    disk-full -- MUST propagate so the operator sees it. Swallowing
+    everything would hide real migration failures.
+    """
     for stmt in _DDL:
         conn.execute(stmt)
+    for stmt in _AI_TURNS_ADDITIVE_MIGRATIONS:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" in str(exc).lower():
+                continue
+            raise
 
 
 def _canonical_snapshot_json(snap: Dict[str, Any]) -> str:
@@ -699,8 +753,11 @@ def _insert_ai_turn(conn: sqlite3.Connection, rec: "AiTurnRecord") -> None:
           exit_code, elapsed_ms, api_duration_ms,
           total_cost_usd, input_tokens, output_tokens,
           cache_creation_tokens, cache_read_tokens,
-          aborted, error
-        ) VALUES (?,?,?,?,?,  ?,?,  ?,?,?,  ?,?,?,  ?,?,  ?,?,?,  ?,?,?,  ?,?,  ?,?)
+          aborted, error,
+          prompt_sha256, prompt_version, model_release_id,
+          skill_bundle_sha256, prompt_archive_path
+        ) VALUES (?,?,?,?,?,  ?,?,  ?,?,?,  ?,?,?,  ?,?,  ?,?,?,  ?,?,?,  ?,?,  ?,?,
+                  ?,?,?, ?,?)
     """, (
         rec.schema_version, rec.ts_ms, rec.chat_run_id, int(rec.deep), rec.model,
         rec.router_primary,
@@ -712,6 +769,8 @@ def _insert_ai_turn(conn: sqlite3.Connection, rec: "AiTurnRecord") -> None:
         rec.total_cost_usd, rec.input_tokens, rec.output_tokens,
         rec.cache_creation_tokens, rec.cache_read_tokens,
         int(rec.aborted), rec.error,
+        rec.prompt_sha256, rec.prompt_version, rec.model_release_id,
+        rec.skill_bundle_sha256, rec.prompt_archive_path,
     ))
 
 

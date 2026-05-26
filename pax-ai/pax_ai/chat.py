@@ -214,7 +214,8 @@ def _persist_turn(*,
                    rc: int,
                    elapsed_ms: int,
                    final_info: Dict[str, Any],
-                   aborted: bool) -> None:
+                   aborted: bool,
+                   sp_path: Optional[Path] = None) -> None:
     """Persist one Pax AI turn into feature_bus + chart signal store +
     forecast store. Fire-and-forget; never raises into the caller.
 
@@ -224,6 +225,14 @@ def _persist_turn(*,
     Re-polling here would race against the 1 Hz snapshot poller and
     break feature-bus replay byte-exactness.
 
+    ``sp_path`` is the on-disk frozen-prompt file that was passed to
+    Claude via ``--append-system-prompt-file``. Phase 4 uses it to
+    compute prompt_sha256 + skill_bundle_sha256 over the EXACT bytes
+    the model saw and to archive a copy under
+    ``%LOCALAPPDATA%/pax-ai/prompt-archive/{sha}.txt``. When not
+    supplied (or unreadable) the lineage falls back to the empty-bytes
+    SHA so the dataclass invariant still holds.
+
     Reused by both ``handle_chat_stream`` (interactive SSE path) and
     ``fire_triggered_turn`` (background trigger path).
     """
@@ -232,6 +241,20 @@ def _persist_turn(*,
     snap_age_ms = int(meta.get("_snapshot_age_ms_capture") or 0)
     digest_sha: Optional[str] = None
     snap_sha: Optional[str] = None
+    # Phase 4: prompt lineage. compute_prompt_lineage always returns a
+    # populated dict (degenerate cases use the empty-bytes SHA fallback),
+    # so we never need a NULL guard on the dataclass identity fields.
+    try:
+        lineage = prompts.compute_prompt_lineage(sp_path) if sp_path else \
+            prompts.compute_prompt_lineage(Path(""))
+    except Exception as exc:
+        sys.stderr.write(f"[chat] prompt lineage failed: {exc}\n")
+        lineage = {
+            "prompt_sha256":       hashlib.sha256(b"").hexdigest(),
+            "prompt_version":      prompts.PROMPT_VERSION,
+            "skill_bundle_sha256": hashlib.sha256(b"").hexdigest(),
+            "prompt_archive_path": "",
+        }
     try:
         snapshot_json = feature_bus._canonical_snapshot_json(snap or {})
         digest_sha = hashlib.sha256(full_msg.encode("utf-8")).hexdigest()
@@ -264,6 +287,11 @@ def _persist_turn(*,
             cache_read_tokens=final_info.get("cache_read_input_tokens"),
             aborted=bool(aborted),
             error=final_info.get("error"),
+            prompt_sha256=lineage["prompt_sha256"],
+            prompt_version=lineage["prompt_version"],
+            model_release_id=model,
+            skill_bundle_sha256=lineage["skill_bundle_sha256"],
+            prompt_archive_path=lineage["prompt_archive_path"],
         )
         feature_bus.record_ai_turn(rec)
     except Exception as exc:
@@ -356,6 +384,7 @@ def fire_triggered_turn(trigger_user_text: str,
         elapsed_ms=elapsed_ms,
         final_info=final_info,
         aborted=bool(final_info.get("aborted", False)),
+        sp_path=sp_path,
     )
 
     out["exit_code"] = rc
@@ -608,6 +637,7 @@ def handle_chat_stream(wfile, user_text: str, deep: bool = False) -> None:
             elapsed_ms=elapsed_ms,
             final_info=final_info,
             aborted=bool(final_info.get("aborted", abort.is_set())),
+            sp_path=sp_path,
         )
     finally:
         _clear_abort_if_owned(abort)

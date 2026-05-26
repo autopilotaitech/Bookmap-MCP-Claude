@@ -22,6 +22,12 @@ def _valid_kwargs(**overrides):
         total_cost_usd=None, input_tokens=None, output_tokens=None,
         cache_creation_tokens=None, cache_read_tokens=None,
         aborted=False, error=None,
+        # Phase 4: turn-level audit trail.
+        prompt_sha256="p" * 64,
+        prompt_version="1.0.0",
+        model_release_id="claude-haiku-4-5",
+        skill_bundle_sha256="k" * 64,
+        prompt_archive_path="",
     )
     base.update(overrides)
     return base
@@ -49,7 +55,65 @@ def test_aiturn_record_is_frozen():
         rec.digest_sha256 = "xxxxxxxx"
 
 
-def test_module_exports_status_returns_disabled_safe_default():
+# ---------------------------------------------------------------------------
+# Phase 4: turn-level audit trail -- AiTurnRecord lineage fields
+# ---------------------------------------------------------------------------
+
+def test_aiturn_record_carries_phase4_lineage_fields():
+    """The five Phase 4 fields must be surfaced as attributes."""
+    rec = feature_bus.AiTurnRecord(**_valid_kwargs(
+        prompt_sha256="a" * 64,
+        prompt_version="1.0.0",
+        model_release_id="claude-haiku-4-5",
+        skill_bundle_sha256="b" * 64,
+        prompt_archive_path=r"C:\some\archive\a.txt",
+    ))
+    assert rec.prompt_sha256       == "a" * 64
+    assert rec.prompt_version      == "1.0.0"
+    assert rec.model_release_id    == "claude-haiku-4-5"
+    assert rec.skill_bundle_sha256 == "b" * 64
+    assert rec.prompt_archive_path == r"C:\some\archive\a.txt"
+
+
+def test_aiturn_record_rejects_empty_prompt_sha256():
+    """prompt_sha256 is the turn's prompt-identity field; empty is a defect."""
+    with pytest.raises(ValueError, match="prompt_sha256"):
+        feature_bus.AiTurnRecord(**_valid_kwargs(prompt_sha256=""))
+
+
+def test_aiturn_record_rejects_empty_prompt_version():
+    with pytest.raises(ValueError, match="prompt_version"):
+        feature_bus.AiTurnRecord(**_valid_kwargs(prompt_version=""))
+
+
+def test_aiturn_record_rejects_empty_model_release_id():
+    with pytest.raises(ValueError, match="model_release_id"):
+        feature_bus.AiTurnRecord(**_valid_kwargs(model_release_id=""))
+
+
+def test_aiturn_record_rejects_empty_skill_bundle_sha256():
+    with pytest.raises(ValueError, match="skill_bundle_sha256"):
+        feature_bus.AiTurnRecord(**_valid_kwargs(skill_bundle_sha256=""))
+
+
+def test_aiturn_record_allows_empty_prompt_archive_path():
+    """archive_path may be empty when archiving was skipped (e.g. empty
+    prompt file) -- it's an optional audit pointer, not an identity."""
+    rec = feature_bus.AiTurnRecord(**_valid_kwargs(prompt_archive_path=""))
+    assert rec.prompt_archive_path == ""
+
+
+def test_module_exports_status_returns_disabled_safe_default(monkeypatch):
+    # Explicitly override the config so the test does NOT depend on
+    # the developer's pax_ai_config.json (which may legitimately have
+    # feature_bus.enabled=true) or on prior tests resetting _CACHE.
+    from pax_ai import config as cfg_mod
+    monkeypatch.setattr(cfg_mod, "_reload_if_stale", lambda: None)
+    monkeypatch.setattr(cfg_mod, "_CACHE", {
+        **cfg_mod._CACHE,
+        "feature_bus": {**(cfg_mod._CACHE.get("feature_bus") or {}),
+                         "enabled": False},
+    })
     # Reset module-level state so prior test files' pollution does not affect us.
     feature_bus._QUEUE.clear()
     feature_bus._HEALTHY = True

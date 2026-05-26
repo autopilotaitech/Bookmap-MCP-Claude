@@ -146,6 +146,12 @@ def test_writer_drains_ai_turn_record_to_blobs_and_db(bus_enabled):
         total_cost_usd=0.001, input_tokens=100, output_tokens=1,
         cache_creation_tokens=0, cache_read_tokens=0,
         aborted=False, error=None,
+        # Phase 4: turn-level audit trail.
+        prompt_sha256=hashlib.sha256(b"SYSTEM PROMPT").hexdigest(),
+        prompt_version="1.0.0",
+        model_release_id="claude-haiku-4-5",
+        skill_bundle_sha256=hashlib.sha256(b"SKILLS").hexdigest(),
+        prompt_archive_path=r"C:\test\archive.txt",
     )
     feature_bus.record_ai_turn(rec)             # returns immediately (enqueue only)
     rows: list = []
@@ -315,6 +321,55 @@ def test_writer_thread_tolerates_none_snapshot(bus_enabled, monkeypatch):
         except sqlite3.OperationalError:
             n = 0
     assert n == 0
+
+
+def test_writer_persists_phase4_lineage_columns(bus_enabled):
+    """The five Phase 4 lineage fields (prompt_sha256, prompt_version,
+    model_release_id, skill_bundle_sha256, prompt_archive_path) must land
+    in the ai_turns row when an AiTurnRecord with those fields is drained."""
+    feature_bus.start()
+    rec = feature_bus.AiTurnRecord(
+        schema_version=1, ts_ms=1715000000000, chat_run_id="r4",
+        deep=False, model="claude-haiku-4-5",
+        router_primary="pax-or", router_secondary=None,
+        user_text_raw="hi", user_text_normalized="hi",
+        digest_text="D4",
+        digest_sha256=hashlib.sha256(b"D4").hexdigest(),
+        snapshot_json='{"k":4}',
+        snapshot_sha256=hashlib.sha256(b'{"k":4}').hexdigest(),
+        snapshot_alias="NQM6", snapshot_ts_ms=1715000000000, snapshot_age_ms=0,
+        pax_text="x", exit_code=0, elapsed_ms=1, api_duration_ms=1,
+        total_cost_usd=None, input_tokens=None, output_tokens=None,
+        cache_creation_tokens=None, cache_read_tokens=None,
+        aborted=False, error=None,
+        prompt_sha256=hashlib.sha256(b"PROMPT-BODY").hexdigest(),
+        prompt_version="1.0.0",
+        model_release_id="claude-haiku-4-5-20251001",
+        skill_bundle_sha256=hashlib.sha256(b"SKILL-BUNDLE").hexdigest(),
+        prompt_archive_path=r"D:\local\pax-ai\prompt-archive\abc.txt",
+    )
+    feature_bus.record_ai_turn(rec)
+    row = None
+    for _ in range(100):
+        try:
+            with sqlite3.connect(bus_enabled["db"]) as conn:
+                conn.row_factory = sqlite3.Row
+                rs = conn.execute(
+                    "SELECT prompt_sha256, prompt_version, model_release_id, "
+                    "skill_bundle_sha256, prompt_archive_path "
+                    "FROM ai_turns WHERE chat_run_id='r4'").fetchall()
+            if rs:
+                row = rs[0]
+                break
+        except sqlite3.OperationalError:
+            pass
+        time.sleep(0.02)
+    assert row is not None, "ai_turns row not drained"
+    assert row["prompt_sha256"]       == rec.prompt_sha256
+    assert row["prompt_version"]      == "1.0.0"
+    assert row["model_release_id"]    == "claude-haiku-4-5-20251001"
+    assert row["skill_bundle_sha256"] == rec.skill_bundle_sha256
+    assert row["prompt_archive_path"] == rec.prompt_archive_path
 
 
 def test_concurrent_writer_lock_refuses_second_start(bus_enabled):
