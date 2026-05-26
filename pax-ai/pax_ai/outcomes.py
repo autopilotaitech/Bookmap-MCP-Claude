@@ -1,17 +1,30 @@
-"""Phase 4A outcomes labeler daemon.
+"""Outcomes labeler daemon (structured-forecast based).
 
 Wakes every outcomes.wake_interval_ms (default 15 min). For each ai_turns
-row older than the largest T-offset (15 min) that doesn't yet have a
-matching trade_outcomes row, computes mid_at_t0 / mid_at_t60s / t180 / t300
-/ t900 by reading the NEAREST snapshot_features row within
-+/- outcomes.match_tolerance_ms (default 5 s). Missing snapshots produce
-NULL mid columns (no crash). Writes one trade_outcomes row per ai_turn.
+row older than the largest T-offset (15 min) that doesn't already have a
+matching trade_outcomes row, the labeler:
+
+  1. Looks up the structured PAX_FORECAST captured for the same chat turn
+     by deterministic join on (chat_run_id, digest_sha256), using
+     snapshot_sha256 to break ambiguity. Substring-matching the user's
+     raw text is explicitly NOT a fallback -- a forecast-less turn is
+     recorded as invalidated=1 / FORECAST_MISSING_OR_AMBIGUOUS.
+
+  2. For PAY_FOR_TRADE + LONG/SHORT:
+       - reads mid_at_t0..t900s from snapshot_features via nearest-match
+         within +/- outcomes.match_tolerance_ms;
+       - long  realized_r = mid_tN - mid_t0
+         short realized_r = mid_t0 - mid_tN   (units: points);
+       - missing mid_t0       -> invalidated=1 / SNAPSHOT_MISSING_AT_T0
+       - missing forward mid  -> invalidated=1 / HORIZON_DATA_MISSING
+         and realized_r columns NULL.
+
+  3. For non-PAY forecasts (WAIT_FOR_CONFIRM / STAND_DOWN / SCRATCH_READY
+     + NONE): writes verdict=<execution_read>, realized_r columns NULL,
+     invalidated=0, label_method='structured_v1'.
 
 Daemon NEVER raises into the parent. start() is idempotent. stop() is
 safe when not running. Default disabled via outcomes.enabled=False.
-
-verdict column is a Phase-4A placeholder derived heuristically from
-user_text_raw; Phase 5 will replace with a real verdict-extraction model.
 """
 
 from __future__ import annotations
@@ -21,7 +34,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from . import config
 
@@ -37,57 +50,239 @@ _LABELED_TODAY: int = 0
 
 
 _T_OFFSETS_S = (0, 60, 180, 300, 900)
-_T_COLUMNS   = ("mid_at_t0", "mid_at_t60s", "mid_at_t180s",
-                 "mid_at_t300s", "mid_at_t900s")
+_T_COLUMNS = ("mid_at_t0", "mid_at_t60s", "mid_at_t180s",
+              "mid_at_t300s", "mid_at_t900s")
+_REALIZED_R_COLUMNS = ("realized_r_at_t60s", "realized_r_at_t180s",
+                       "realized_r_at_t300s", "realized_r_at_t900s")
+_LABEL_METHOD = "structured_v1"
 
+_REASON_FORECAST = "FORECAST_MISSING_OR_AMBIGUOUS"
+_REASON_T0       = "SNAPSHOT_MISSING_AT_T0"
+_REASON_HORIZON  = "HORIZON_DATA_MISSING"
 
-def _classify_verdict(user_text: str) -> str:
-    """Phase-4A heuristic: rough verdict guess from user text."""
-    t = (user_text or "").lower()
-    if "enter long" in t or "buy" in t or " long" in t:
-        return "ENTER_LONG"
-    if "enter short" in t or "sell" in t or " short" in t:
-        return "ENTER_SHORT"
-    return "INFO"
+_VERDICT_UNKNOWN = "UNKNOWN"
 
 
 def _mid_near(conn: sqlite3.Connection, alias: str,
-               target_ts_ms: int, tolerance_ms: int) -> Optional[float]:
-    """Find the snapshot_features.mid nearest to target_ts_ms within
-    +/- tolerance_ms. Returns None if no row in window."""
+              target_ts_ms: int, tolerance_ms: int) -> Optional[float]:
+    """Nearest snapshot_features.mid to target_ts_ms within +/- tolerance_ms."""
     row = conn.execute("""
         SELECT mid FROM snapshot_features
         WHERE alias=? AND ts_ms BETWEEN ? AND ?
         ORDER BY ABS(ts_ms - ?) ASC
         LIMIT 1
     """, (alias, target_ts_ms - tolerance_ms,
-                target_ts_ms + tolerance_ms, target_ts_ms)).fetchone()
+          target_ts_ms + tolerance_ms, target_ts_ms)).fetchone()
     return row[0] if row else None
 
 
-def _label_one(conn: sqlite3.Connection, ai_turn_id: int,
-                ai_ts_ms: int, alias: str, user_text: str,
-                tolerance_ms: int) -> None:
-    """Compute + insert one trade_outcomes row for the given ai_turn."""
-    mids = [_mid_near(conn, alias, ai_ts_ms + off * 1000, tolerance_ms)
-            for off in _T_OFFSETS_S]
-    verdict = _classify_verdict(user_text)
+def _resolve_forecast_db_path() -> Optional[Path]:
+    raw = config.get("forecast.store_path", "") or ""
+    if not raw:
+        return None
+    p = Path(raw)
+    return p if p.exists() else None
+
+
+def _lookup_forecast(forecast_db: Optional[Path],
+                      *,
+                      chat_run_id: Optional[str],
+                      digest_sha256: Optional[str],
+                      snapshot_sha256: Optional[str]
+                      ) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Return (forecast_dict, status).
+
+    status:
+      'UNIQUE'    -> exactly one matching forecast row;
+      'NONE'      -> no forecast DB / no rows / missing linkage keys;
+      'AMBIGUOUS' -> >1 row even after disambiguating on snapshot_sha256.
+
+    Read-only on the forecast DB. All sqlite errors degrade to 'NONE'.
+    """
+    if forecast_db is None or not chat_run_id or not digest_sha256:
+        return (None, "NONE")
+    try:
+        uri = f"file:{forecast_db.resolve().as_posix()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error:
+        return (None, "NONE")
+    try:
+        rows = conn.execute("""
+            SELECT execution_read, direction, horizon_sec, snapshot_sha256
+            FROM forecasts
+            WHERE chat_run_id = ? AND digest_sha256 = ?
+        """, (chat_run_id, digest_sha256)).fetchall()
+    except sqlite3.Error:
+        conn.close()
+        return (None, "NONE")
+    conn.close()
+
+    if not rows:
+        return (None, "NONE")
+    if len(rows) > 1 and snapshot_sha256:
+        narrowed = [r for r in rows if r[3] == snapshot_sha256]
+        if len(narrowed) == 1:
+            rows = narrowed
+    if len(rows) != 1:
+        return (None, "AMBIGUOUS")
+
+    er, direction, horizon_sec, _snap = rows[0]
+    return ({
+        "execution_read": er,
+        "direction":      direction,
+        "horizon_sec":    int(horizon_sec) if horizon_sec is not None else None,
+    }, "UNIQUE")
+
+
+def _insert_outcome(conn: sqlite3.Connection,
+                     *,
+                     ai_turn_id: int,
+                     alias: str,
+                     verdict: str,
+                     entry_price: Optional[float],
+                     mids: Tuple[Optional[float], ...],
+                     realized_rs: Tuple[Optional[float], ...],
+                     invalidated: int,
+                     invalidation_reason: Optional[str]) -> None:
     conn.execute(
         f"""
         INSERT INTO trade_outcomes
           (schema_version, ai_turn_id, alias, verdict, entry_price,
            {','.join(_T_COLUMNS)},
-           realized_r_at_t60s, realized_r_at_t180s,
-           realized_r_at_t300s, realized_r_at_t900s,
+           {','.join(_REALIZED_R_COLUMNS)},
            expected_r, prob_pay, invalidated, invalidation_reason,
            label_method, labeled_at_ms)
-        VALUES (1, ?, ?, ?, NULL,
+        VALUES (1, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?,
-                NULL, NULL, NULL, NULL,
-                NULL, NULL, NULL, NULL,
-                'phase4a_heuristic_v1', ?)
+                ?, ?, ?, ?,
+                NULL, NULL, ?, ?,
+                ?, ?)
         """,
-        (ai_turn_id, alias, verdict, *mids, int(time.time() * 1000)),
+        (
+            ai_turn_id, alias, verdict, entry_price,
+            mids[0], mids[1], mids[2], mids[3], mids[4],
+            realized_rs[0], realized_rs[1], realized_rs[2], realized_rs[3],
+            invalidated, invalidation_reason,
+            _LABEL_METHOD, int(time.time() * 1000),
+        ),
+    )
+
+
+def _label_one(conn: sqlite3.Connection,
+                forecast_db: Optional[Path],
+                *,
+                ai_turn_id: int,
+                ai_ts_ms: int,
+                alias: str,
+                chat_run_id: Optional[str],
+                digest_sha256: Optional[str],
+                snapshot_sha256: Optional[str],
+                tolerance_ms: int) -> None:
+    """Compute + insert one trade_outcomes row for the given ai_turn."""
+    forecast, status = _lookup_forecast(
+        forecast_db,
+        chat_run_id=chat_run_id,
+        digest_sha256=digest_sha256,
+        snapshot_sha256=snapshot_sha256,
+    )
+    if status != "UNIQUE":
+        _insert_outcome(
+            conn,
+            ai_turn_id=ai_turn_id,
+            alias=alias,
+            verdict=_VERDICT_UNKNOWN,
+            entry_price=None,
+            mids=(None, None, None, None, None),
+            realized_rs=(None, None, None, None),
+            invalidated=1,
+            invalidation_reason=_REASON_FORECAST,
+        )
+        return
+
+    execution_read = forecast["execution_read"]
+    direction = forecast["direction"]
+
+    # Non-directional verdict: STAND_DOWN / WAIT_FOR_CONFIRM / SCRATCH_READY.
+    if execution_read != "PAY_FOR_TRADE":
+        _insert_outcome(
+            conn,
+            ai_turn_id=ai_turn_id,
+            alias=alias,
+            verdict=str(execution_read),
+            entry_price=None,
+            mids=(None, None, None, None, None),
+            realized_rs=(None, None, None, None),
+            invalidated=0,
+            invalidation_reason=None,
+        )
+        return
+
+    # Directional: PAY_FOR_TRADE + LONG/SHORT.
+    if direction not in ("LONG", "SHORT"):
+        # Schema invariant says PAY_FOR_TRADE requires LONG/SHORT. Defense
+        # in depth: a bad row in the forecast store is treated as ambiguous.
+        _insert_outcome(
+            conn,
+            ai_turn_id=ai_turn_id,
+            alias=alias,
+            verdict=_VERDICT_UNKNOWN,
+            entry_price=None,
+            mids=(None, None, None, None, None),
+            realized_rs=(None, None, None, None),
+            invalidated=1,
+            invalidation_reason=_REASON_FORECAST,
+        )
+        return
+
+    verdict = "ENTER_LONG" if direction == "LONG" else "ENTER_SHORT"
+    mids = tuple(_mid_near(conn, alias, ai_ts_ms + off * 1000, tolerance_ms)
+                 for off in _T_OFFSETS_S)
+    m0 = mids[0]
+
+    if m0 is None:
+        _insert_outcome(
+            conn,
+            ai_turn_id=ai_turn_id,
+            alias=alias,
+            verdict=verdict,
+            entry_price=None,
+            mids=mids,
+            realized_rs=(None, None, None, None),
+            invalidated=1,
+            invalidation_reason=_REASON_T0,
+        )
+        return
+
+    forward_mids = mids[1:]
+    if any(m is None for m in forward_mids):
+        _insert_outcome(
+            conn,
+            ai_turn_id=ai_turn_id,
+            alias=alias,
+            verdict=verdict,
+            entry_price=float(m0),
+            mids=mids,
+            realized_rs=(None, None, None, None),
+            invalidated=1,
+            invalidation_reason=_REASON_HORIZON,
+        )
+        return
+
+    if direction == "LONG":
+        realized_rs = tuple(float(m) - float(m0) for m in forward_mids)
+    else:
+        realized_rs = tuple(float(m0) - float(m) for m in forward_mids)
+
+    _insert_outcome(
+        conn,
+        ai_turn_id=ai_turn_id,
+        alias=alias,
+        verdict=verdict,
+        entry_price=float(m0),
+        mids=mids,
+        realized_rs=realized_rs,
+        invalidated=0,
+        invalidation_reason=None,
     )
 
 
@@ -104,6 +299,7 @@ def _outcomes_pass() -> int:
     largest_offset_ms = max(_T_OFFSETS_S) * 1000
     now_ms = int(time.time() * 1000)
     cutoff_ms = now_ms - largest_offset_ms
+    forecast_db = _resolve_forecast_db_path()
     labeled = 0
     try:
         conn = sqlite3.connect(str(db_path), timeout=2.0,
@@ -112,16 +308,30 @@ def _outcomes_pass() -> int:
         try:
             with conn:
                 rows = conn.execute("""
-                    SELECT id, ts_ms, snapshot_alias, user_text_raw FROM ai_turns
+                    SELECT id, ts_ms, snapshot_alias,
+                           chat_run_id, digest_sha256, snapshot_sha256
+                    FROM ai_turns
                     WHERE ts_ms <= ?
                       AND id NOT IN (SELECT ai_turn_id FROM trade_outcomes)
                     ORDER BY ts_ms ASC
                 """, (cutoff_ms,)).fetchall()
-                for ai_id, ai_ts_ms, alias, user_text in rows:
+                for (ai_id, ai_ts_ms, alias,
+                     chat_run_id, digest_sha256, snapshot_sha256) in rows:
                     if not alias:
                         continue
-                    _label_one(conn, ai_id, int(ai_ts_ms), str(alias),
-                                user_text or "", tolerance_ms)
+                    _label_one(
+                        conn,
+                        forecast_db,
+                        ai_turn_id=int(ai_id),
+                        ai_ts_ms=int(ai_ts_ms),
+                        alias=str(alias),
+                        chat_run_id=(str(chat_run_id) if chat_run_id else None),
+                        digest_sha256=(str(digest_sha256)
+                                        if digest_sha256 else None),
+                        snapshot_sha256=(str(snapshot_sha256)
+                                          if snapshot_sha256 else None),
+                        tolerance_ms=tolerance_ms,
+                    )
                     labeled += 1
         finally:
             conn.close()
@@ -185,8 +395,7 @@ def stop(timeout_s: float = 2.0) -> None:
 
 
 def status() -> Dict[str, Any]:
-    """Returns {enabled, running, healthy, labeled_today, last_run_ms,
-    last_error}. Cheap; safe from any thread."""
+    """{enabled, running, healthy, labeled_today, last_run_ms, last_error}."""
     with _STATE_LOCK:
         return {
             "enabled":       bool(config.get("outcomes.enabled", False)),

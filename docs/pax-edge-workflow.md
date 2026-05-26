@@ -120,6 +120,94 @@ daemon-journal outcomes, while `pax_calibration` consumes feature-bus
 | `reports/prompt-lessons-YYYY-MM-DD.md`            | `pax_research_claude`    | human / Claude prompt summarizing calibration + lessons    |
 | `reports/replay-YYYY-MM-DD.json`                  | `pax_policy_replay`      | per-candidate current vs. candidate metrics on train/val/test + promotion_status + reason |
 
+## Promotion gate
+
+`policy_promotion_gate.py` turns the documented promotion ladder into a
+mechanical check. Given a list of changed files and a list of replay
+report paths, it answers one question: *is there enough structural
+evidence to allow this active-policy change?* It never runs the replay,
+never scores edge — that's the replay module's job. It only refuses to
+wave a change through when the discipline has not been followed.
+
+### Active-policy surfaces
+
+A change is "active-policy" when it touches one of:
+
+- `mcp-server/bookmap_mcp/pax_weights.json`
+- `pax-ai/pax_ai/prompts.py`
+- any file under `pax-ai/skills/`
+- any file under `skills/`
+
+If the diff touches nothing on this list, the gate passes with
+`reason=no_active_policy_change` (no report needed).
+
+### What the gate requires for an active-policy change
+
+1. At least one structurally valid replay report JSON, with all of:
+   `generated_ms`, `n_forecasts`, `n_paired`, `split_sizes`
+   (`train`/`validation`/`test`), and a `candidates` list.
+2. Each candidate must carry `promotion_status`, `reason`, and `splits`
+   with `current` + `candidate` metrics on every split (test-split
+   `candidate.n_samples >= --min-samples`, default 30).
+3. At least one candidate with `promotion_status` past `research_only`.
+4. Every non-research-only candidate must carry a `promoted_by` actor.
+5. `active` is rejected by default. It passes only when both
+   `allow_active=True` is set AND the candidate carries a
+   `human_approved_by` actor field.
+
+### Run from Python (preferred — used by CI / tests)
+
+```python
+from bookmap_mcp.policy_promotion_gate import check_promotion_gate
+
+result = check_promotion_gate(
+    changed_files=[
+        "mcp-server/bookmap_mcp/pax_weights.json",
+    ],
+    report_paths=[Path("reports/replay-2026-05-25.json")],
+    allow_active=False,    # default; only promote past `human_approved`
+                            # in an explicit operator-driven branch
+    min_samples=30,
+)
+assert result["passed"], result
+```
+
+### Run from the CLI
+
+```powershell
+python -m bookmap_mcp.policy_promotion_gate `
+    --changed-file mcp-server/bookmap_mcp/pax_weights.json `
+    --report reports\replay-2026-05-25.json `
+    --min-samples 30
+```
+
+Exit code 0 = passed, non-zero = blocked. The full result dict is
+emitted to stdout for log capture.
+
+`--git-base <ref>` resolves additional changed files via
+`git diff --name-only <ref> HEAD`. **Discovery failures fail closed.**
+If `git` is not on PATH, the ref does not exist, or the diff returns
+a non-zero exit code for any other reason, the CLI exits non-zero with
+`reason=git_diff_failed:<detail>` and empty result lists. The gate
+will never silently report `no_active_policy_change` on a failed
+discovery — a gate that cannot see the diff must refuse, not wave it
+through.
+
+CI may still prefer the explicit `--changed-file` form (one flag per
+file, repeated) for fully deterministic input — it does not depend on
+the working tree, the git index, or the availability of the git
+binary in the test image.
+
+### What the gate does NOT do
+
+- Does not rerun the replay or recompute calibration. The replay report
+  is the authoritative artifact.
+- Does not mutate `pax_weights.json`, `pax_ai_config.json`, prompts,
+  reports, or any database — pinned by
+  `tests/test_policy_promotion_gate.py::test_gate_is_read_only_against_sentinel_files`.
+- Does not promote a candidate from `replay_passed` to `paper_passed`
+  or onward. Those transitions are still manual.
+
 ## Tests
 
 ```powershell
@@ -131,7 +219,8 @@ python -m pytest -q `
     tests\test_pax_outcome_linkage.py `
     tests\test_pax_research_claude.py `
     tests\test_pax_policy_replay.py `
-    tests\test_pax_edge_workflow_e2e.py
+    tests\test_pax_edge_workflow_e2e.py `
+    tests\test_policy_promotion_gate.py
 
 cd ..\pax-ai
 python -m pytest -q `

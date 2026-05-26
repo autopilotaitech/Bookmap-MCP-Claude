@@ -299,3 +299,180 @@ def test_bus_outcome_lookup_missing_db_does_not_create_file(tmp_path):
 
     assert lookup({"source_turn_id": 1, "horizon_sec": 300}) is None
     assert not missing.exists()
+
+
+# --------------------------------------------------- Phase 2 calibration honesty
+
+def _invalidated_outcome(r=1.0, reason="HORIZON_DATA_MISSING"):
+    """An outcome dict shaped the way bus_outcome_lookup(include_invalidated=True)
+    produces them: realized_r is present but invalidated=1 must keep the row
+    out of calibration math."""
+    return {"realized_r": r, "horizon_used_sec": 300, "source": "test",
+            "invalidated": 1, "invalidation_reason": reason}
+
+
+def test_global_counts_include_phase2_breakdown():
+    """Global block carries explicit n_pay_for_trade / n_non_pay_for_trade
+    / n_paired_valid / n_invalidated alongside the existing n_paired."""
+    pairs = []
+    # 5 PAY rows with valid outcomes
+    for i in range(5):
+        f = schema.validate_forecast(_raw(prob=0.62), ts_ms=1000 + i,
+                                      source_turn_id=i + 1)
+        pairs.append((f, _outcome(0.5 if i < 3 else -0.5)))
+    # 2 PAY rows that surface as invalidated (audit-mode lookup)
+    for i in range(2):
+        f = schema.validate_forecast(_raw(prob=0.62), ts_ms=1100 + i,
+                                      source_turn_id=10 + i)
+        pairs.append((f, _invalidated_outcome(1.0)))
+    # 3 non-PAY rows
+    for i in range(3):
+        f = schema.validate_forecast(_raw(prob=0.4,
+                                          execution_read="STAND_DOWN",
+                                          direction="NONE"),
+                                      ts_ms=1200 + i, source_turn_id=20 + i)
+        pairs.append((f, None))
+    # 1 PAY row with no outcome (truly unpaired)
+    f = schema.validate_forecast(_raw(prob=0.62), ts_ms=1300,
+                                  source_turn_id=30)
+    pairs.append((f, None))
+
+    report = calib.compute_calibration(pairs, min_samples=5)
+    g = report["global"]
+    assert g["n_forecasts"]          == 11
+    assert g["n_pay_for_trade"]      == 8
+    assert g["n_non_pay_for_trade"]  == 3
+    assert g["n_paired_valid"]       == 5
+    assert g["n_invalidated"]        == 2
+    # n_paired stays backwards-compat: anything returned by lookup with a
+    # realized_r counts, regardless of validity.
+    assert g["n_paired"]             == 7
+    # n_unpaired counts pairs across the whole input where lookup returned
+    # nothing (the truly missing rows). non-PAY rows + unpaired-PAY row.
+    assert g["n_unpaired"]           == 4
+
+
+def test_invalidated_rows_excluded_from_calibration_math():
+    """Five valid wins at p=0.6 + invalidated noise must not move hit_rate."""
+    pairs = []
+    for i in range(5):
+        f = schema.validate_forecast(_raw(prob=0.60),
+                                      ts_ms=2000 + i, source_turn_id=i + 1)
+        pairs.append((f, _outcome(1.0)))  # all valid wins
+    for i in range(3):
+        f = schema.validate_forecast(_raw(prob=0.60),
+                                      ts_ms=2100 + i, source_turn_id=100 + i)
+        pairs.append((f, _invalidated_outcome(-5.0)))  # invalidated loss
+
+    report = calib.compute_calibration(pairs, min_samples=5)
+    g = report["global"]
+    # Math sees only the 5 valid wins.
+    assert g["actual_hit_rate"] == pytest.approx(1.0)
+    assert g["mean_realized_r"] == pytest.approx(1.0)
+    assert g["n_paired_valid"] == 5
+    assert g["n_invalidated"] == 3
+
+
+def test_brier_score_global_correct_for_known_outcomes():
+    """Brier = mean((p - hit)^2). 10 forecasts at p=0.6, 6 wins, 4 losses:
+       wins:   (0.6 - 1)^2 = 0.16  (x6 = 0.96)
+       losses: (0.6 - 0)^2 = 0.36  (x4 = 1.44)
+       brier  = 2.40 / 10           = 0.24
+    """
+    pairs = []
+    for i in range(10):
+        f = schema.validate_forecast(_raw(prob=0.60),
+                                      ts_ms=3000 + i, source_turn_id=i + 1)
+        pairs.append((f, _outcome(1.0 if i < 6 else -0.5)))
+
+    report = calib.compute_calibration(pairs, min_samples=5)
+    assert report["global"]["brier_score"] == pytest.approx(0.24)
+
+
+def test_brier_score_per_probability_bucket():
+    """Per-bucket Brier exposed alongside calibration_error.
+
+       Bucket 0.60-0.65 (p=0.62, n=10, 7 wins):
+         brier = (7*(0.62-1)^2 + 3*(0.62-0)^2) / 10
+               = (7*0.1444   + 3*0.3844)        / 10
+               = (1.0108     + 1.1532)          / 10
+               = 0.2164
+    """
+    pairs = []
+    for i in range(10):
+        f = schema.validate_forecast(_raw(prob=0.62),
+                                      ts_ms=4000 + i, source_turn_id=i + 1)
+        pairs.append((f, _outcome(0.5 if i < 7 else -0.3)))
+
+    report = calib.compute_calibration(pairs, min_samples=5)
+    buckets = {b["bucket"]: b for b in report["probability_buckets"]}
+    bucket = buckets["0.60-0.65"]
+    assert bucket["brier_score"] == pytest.approx(0.2164, abs=1e-6)
+
+
+def test_brier_score_zero_when_all_certainty_correct():
+    """All forecasts at p=0 with all losses -> hit=0 each -> brier=0."""
+    pairs = []
+    for i in range(8):
+        f = schema.validate_forecast(_raw(prob=0.0),
+                                      ts_ms=5000 + i, source_turn_id=i + 1)
+        pairs.append((f, _outcome(-0.5)))
+
+    report = calib.compute_calibration(pairs, min_samples=5)
+    assert report["global"]["brier_score"] == pytest.approx(0.0)
+
+
+def test_width_sensitivity_section_present_with_both_widths():
+    """The report exposes a width_sensitivity block keyed '0.05' and '0.10'."""
+    pairs = []
+    for i in range(5):
+        f = schema.validate_forecast(_raw(prob=0.62),
+                                      ts_ms=6000 + i, source_turn_id=i + 1)
+        pairs.append((f, _outcome(0.5)))
+    for i in range(5):
+        f = schema.validate_forecast(_raw(prob=0.68),
+                                      ts_ms=6100 + i, source_turn_id=100 + i)
+        pairs.append((f, _outcome(0.5)))
+
+    report = calib.compute_calibration(pairs, min_samples=5)
+    sens = report["width_sensitivity"]
+    assert "0.05" in sens
+    assert "0.10" in sens
+    assert sens["0.05"]["width"] == 0.05
+    assert sens["0.10"]["width"] == 0.10
+    # Two distinct p-values 0.62/0.68 fall in the same 0.10 bucket but in
+    # two different 0.05 buckets.
+    assert sens["0.05"]["bucket_count"] == 2
+    assert sens["0.10"]["bucket_count"] == 1
+
+
+def test_width_sensitivity_is_deterministic():
+    """Same input must yield byte-identical width_sensitivity output across
+    runs (the only time-varying part is generated_ms which lives above)."""
+    import json as _json
+    pairs = []
+    for i in range(7):
+        f = schema.validate_forecast(_raw(prob=0.62),
+                                      ts_ms=7000 + i, source_turn_id=i + 1)
+        pairs.append((f, _outcome(0.5 if i < 4 else -0.5)))
+
+    r1 = calib.compute_calibration(pairs, min_samples=5)["width_sensitivity"]
+    r2 = calib.compute_calibration(pairs, min_samples=5)["width_sensitivity"]
+    assert _json.dumps(r1, sort_keys=True) == _json.dumps(r2, sort_keys=True)
+
+
+def test_width_sensitivity_does_not_recommend_policy_changes():
+    """The sensitivity block is informational. It must not name an
+    optimal width, recommend re-tuning, or include 'recommended' keys."""
+    pairs = [
+        (schema.validate_forecast(_raw(prob=0.62),
+                                   ts_ms=8000 + i, source_turn_id=i + 1),
+         _outcome(0.5))
+        for i in range(5)
+    ]
+    report = calib.compute_calibration(pairs, min_samples=5)
+    sens = report["width_sensitivity"]
+    for body in sens.values():
+        for forbidden in ("recommended", "recommended_width",
+                           "best_width", "policy"):
+            assert forbidden not in body

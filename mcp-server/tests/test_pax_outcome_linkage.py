@@ -41,7 +41,9 @@ def _make_bus_db(path: Path,
           realized_r_at_t60s REAL,
           realized_r_at_t180s REAL,
           realized_r_at_t300s REAL,
-          realized_r_at_t900s REAL
+          realized_r_at_t900s REAL,
+          invalidated INTEGER,
+          invalidation_reason TEXT
         );
         """)
         for r in ai_turns_rows:
@@ -56,12 +58,15 @@ def _make_bus_db(path: Path,
             conn.execute(
                 "INSERT INTO trade_outcomes "
                 "(ai_turn_id, realized_r_at_t60s, realized_r_at_t180s, "
-                "realized_r_at_t300s, realized_r_at_t900s) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "realized_r_at_t300s, realized_r_at_t900s, "
+                "invalidated, invalidation_reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (r["ai_turn_id"], r.get("realized_r_at_t60s"),
                  r.get("realized_r_at_t180s"),
                  r.get("realized_r_at_t300s"),
-                 r.get("realized_r_at_t900s")),
+                 r.get("realized_r_at_t900s"),
+                 r.get("invalidated"),
+                 r.get("invalidation_reason")),
             )
         conn.commit()
     finally:
@@ -281,6 +286,115 @@ def test_linkage_audit_with_missing_forecasts_db_returns_zeros(tmp_path):
     counts = calib.linkage_audit(tmp_path / "missing.db", tmp_path / "bus.db")
     assert counts["n_forecasts"] == 0
     assert counts["unpaired"] == 0
+
+
+# ---------------------------------------------------------------- invalidated
+
+def test_invalidated_row_excluded_by_default(tmp_path):
+    """invalidated=1 must read as no outcome unless the caller opts in."""
+    bus = tmp_path / "bus.db"
+    _make_bus_db(bus, [], [
+        {"ai_turn_id": 7, "realized_r_at_t300s": 1.5,
+         "invalidated": 1, "invalidation_reason": "HORIZON_DATA_MISSING"},
+    ])
+    forecast = {"source_turn_id": 7, "horizon_sec": 300}
+    assert calib.bus_outcome_lookup(bus)(forecast) is None
+
+
+def test_invalidated_row_surfaced_when_include_invalidated_true(tmp_path):
+    """include_invalidated=True is the audit path: surface the row with the
+    invalidated flag set so calibration can count it without scoring it."""
+    bus = tmp_path / "bus.db"
+    _make_bus_db(bus, [], [
+        {"ai_turn_id": 7, "realized_r_at_t300s": 1.5,
+         "invalidated": 1, "invalidation_reason": "HORIZON_DATA_MISSING"},
+    ])
+    forecast = {"source_turn_id": 7, "horizon_sec": 300}
+    out = calib.bus_outcome_lookup(bus, include_invalidated=True)(forecast)
+    assert out is not None
+    assert out["realized_r"] == 1.5
+    assert out["source"] == "bus_trade_outcomes"
+    assert out["invalidated"] == 1
+    assert out["invalidation_reason"] == "HORIZON_DATA_MISSING"
+
+
+def test_valid_row_carries_invalidated_zero(tmp_path):
+    """Even in default mode a valid (non-invalidated) row must surface
+    invalidated=0 in the outcome dict so downstream counts can group correctly."""
+    bus = tmp_path / "bus.db"
+    _make_bus_db(bus, [], [
+        {"ai_turn_id": 11, "realized_r_at_t300s": 0.75,
+         "invalidated": 0, "invalidation_reason": None},
+    ])
+    forecast = {"source_turn_id": 11, "horizon_sec": 300}
+    out = calib.bus_outcome_lookup(bus)(forecast)
+    assert out is not None
+    assert out["realized_r"] == 0.75
+    assert out["invalidated"] == 0
+    assert out["invalidation_reason"] is None
+
+
+def test_invalidated_row_via_linkage_excluded_by_default(tmp_path):
+    """Invalidation filtering must also apply to the linkage-fallback path."""
+    bus = tmp_path / "bus.db"
+    _make_bus_db(bus,
+                 ai_turns_rows=[{
+                     "id": 21, "ts_ms": 1,
+                     "chat_run_id": "run-Z",
+                     "digest_sha256": "dz",
+                     "snapshot_sha256": "sz",
+                 }],
+                 trade_outcomes_rows=[
+                     {"ai_turn_id": 21, "realized_r_at_t300s": -0.4,
+                      "invalidated": 1,
+                      "invalidation_reason": "SNAPSHOT_MISSING_AT_T0"},
+                 ])
+    forecast = {
+        "source_turn_id": None,
+        "chat_run_id": "run-Z",
+        "digest_sha256": "dz",
+        "horizon_sec": 300,
+    }
+    # Default: linkage match exists but it's invalidated -> None.
+    assert calib.bus_outcome_lookup(bus)(forecast) is None
+    # Audit path: surface it with the flag set.
+    audit = calib.bus_outcome_lookup(bus, include_invalidated=True)(forecast)
+    assert audit is not None
+    assert audit["realized_r"] == -0.4
+    assert audit["invalidated"] == 1
+    assert audit["source"] == "bus_trade_outcomes_via_linkage"
+
+
+def test_legacy_schema_without_invalidated_column_is_treated_as_valid(tmp_path):
+    """A bus DB that predates Phase 1 will not have invalidated/invalidation_reason
+    columns. Default behavior must still return the row (treated as valid)."""
+    bus = tmp_path / "legacy-bus.db"
+    conn = sqlite3.connect(str(bus))
+    try:
+        conn.executescript("""
+        CREATE TABLE ai_turns (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          chat_run_id TEXT NOT NULL,
+          digest_sha256 TEXT NOT NULL,
+          snapshot_sha256 TEXT NOT NULL
+        );
+        CREATE TABLE trade_outcomes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ai_turn_id INTEGER NOT NULL,
+          realized_r_at_t300s REAL
+        );
+        """)
+        conn.execute("INSERT INTO trade_outcomes (ai_turn_id, realized_r_at_t300s) "
+                     "VALUES (?, ?)", (5, 0.9))
+        conn.commit()
+    finally:
+        conn.close()
+    forecast = {"source_turn_id": 5, "horizon_sec": 300}
+    out = calib.bus_outcome_lookup(bus)(forecast)
+    assert out is not None
+    assert out["realized_r"] == 0.9
+    assert out["invalidated"] == 0
 
 
 def test_calibration_for_day_uses_linkage_outcomes(tmp_path):

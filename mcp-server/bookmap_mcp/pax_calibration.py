@@ -51,8 +51,10 @@ def compute_calibration(
     """Aggregate forecast/outcome pairs into a calibration report.
 
     Each pair is ``(forecast_dict, outcome_dict_or_None)``. ``outcome_dict``
-    must contain at least ``realized_r``; ``horizon_used_sec`` and ``source``
-    are passed through into the per-bucket aggregation but are optional.
+    must contain at least ``realized_r``; ``invalidated`` (0/1) and
+    ``invalidation_reason`` are optional. Calibration math NEVER uses
+    invalidated rows -- they are counted separately so the audit reader can
+    see how much evidence was dropped, never silently scored.
     """
     pair_list = list(pairs)
 
@@ -65,29 +67,36 @@ def compute_calibration(
             non_pay.append(forecast)
 
     paired_pay = [(f, o) for f, o in pay_pairs if _has_outcome(o)]
+    paired_valid = [(f, o) for f, o in paired_pay if not _is_invalidated(o)]
+    paired_invalidated = [(f, o) for f, o in paired_pay if _is_invalidated(o)]
     unpaired_pay = [(f, o) for f, o in pay_pairs if not _has_outcome(o)]
 
-    global_block = _aggregate_block(paired_pay,
+    global_block = _aggregate_block(paired_valid,
                                     total_forecasts=len(pay_pairs),
                                     total_unpaired=len(unpaired_pay))
-    global_block["n_forecasts"] = len(pair_list)
-    global_block["n_paired"] = len(paired_pay)
-    global_block["n_unpaired"] = len(pair_list) - len(paired_pay)
+    global_block["n_forecasts"]         = len(pair_list)
+    global_block["n_pay_for_trade"]     = len(pay_pairs)
+    global_block["n_non_pay_for_trade"] = len(non_pay)
+    global_block["n_paired"]            = len(paired_pay)
+    global_block["n_paired_valid"]      = len(paired_valid)
+    global_block["n_invalidated"]       = len(paired_invalidated)
+    global_block["n_unpaired"]          = len(pair_list) - len(paired_pay)
 
     notes: List[str] = []
-    probability_buckets = _group(paired_pay,
+    probability_buckets = _group(paired_valid,
                                  key_fn=lambda f: schema.probability_bucket(
                                      f["prob_success"], width=width),
                                  min_samples=min_samples,
                                  notes=notes,
                                  kind="probability")
-    setup_buckets = _group(paired_pay,
+    setup_buckets = _group(paired_valid,
                            key_fn=schema.forecast_setup_bucket,
                            min_samples=min_samples,
                            notes=notes,
                            kind="setup")
-    horizon_breakdown = _group_horizon(paired_pay, min_samples=min_samples,
+    horizon_breakdown = _group_horizon(paired_valid, min_samples=min_samples,
                                        notes=notes)
+    sensitivity = _width_sensitivity(paired_valid, min_samples=min_samples)
 
     return {
         "generated_ms": int(time.time() * 1000),
@@ -98,8 +107,43 @@ def compute_calibration(
         "setup_buckets": setup_buckets,
         "horizon_breakdown": horizon_breakdown,
         "non_pay_for_trade": {"n_forecasts": len(non_pay)},
+        "width_sensitivity": sensitivity,
         "notes": notes,
     }
+
+
+def _width_sensitivity(
+        paired_valid: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+        *,
+        min_samples: int) -> Dict[str, Dict[str, Any]]:
+    """Compute probability-bucket calibration at two fixed widths (0.05,
+    0.10) so the reader can see how bucket granularity moves the headline
+    numbers. Informational only -- this block must not recommend a width."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for w in (0.05, 0.10):
+        groups: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+        for forecast, outcome in paired_valid:
+            key = schema.probability_bucket(forecast["prob_success"], width=w)
+            groups.setdefault(key, []).append((forecast, outcome))
+        rows: List[Dict[str, Any]] = []
+        for key in sorted(groups):
+            block = _aggregate_block(groups[key])
+            block["bucket"] = key
+            block["warning"] = (
+                "insufficient_sample_count"
+                if block["n_samples"] < min_samples else None
+            )
+            rows.append(block)
+        max_err   = max((r["calibration_error"] for r in rows), default=0.0)
+        max_brier = max((r["brier_score"]       for r in rows), default=0.0)
+        out[f"{w:.2f}"] = {
+            "width":                 round(w, 2),
+            "bucket_count":          len(rows),
+            "max_calibration_error": round(max_err, 6),
+            "max_brier_score":       round(max_brier, 6),
+            "buckets":               rows,
+        }
+    return out
 
 
 # --------------------------------------------------------------- group helpers
@@ -163,18 +207,28 @@ def _aggregate_block(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
             "actual_hit_rate": 0.0,
             "calibration_error": 0.0,
             "mean_realized_r": 0.0,
+            "brier_score": 0.0,
         }
     else:
         stated = sum(float(f["prob_success"]) for f, _ in pairs) / n
         wins = sum(1 for _, o in pairs if float(o["realized_r"]) > 0.0)
         rs = sum(float(o["realized_r"]) for _, o in pairs) / n
         hit_rate = wins / n
+        # Brier = mean((stated_prob - hit)^2). hit is 1 if realized_r > 0
+        # else 0 -- same binarization used for hit_rate so the two stats
+        # decompose the same evidence.
+        brier = sum(
+            (float(f["prob_success"]) -
+             (1.0 if float(o["realized_r"]) > 0.0 else 0.0)) ** 2
+            for f, o in pairs
+        ) / n
         block = {
             "n_samples": n,
             "mean_stated_prob": round(stated, 6),
             "actual_hit_rate": round(hit_rate, 6),
             "calibration_error": round(abs(stated - hit_rate), 6),
             "mean_realized_r": round(rs, 6),
+            "brier_score": round(brier, 6),
         }
     if total_forecasts is not None:
         block["n_forecasts"] = total_forecasts
@@ -187,11 +241,24 @@ def _has_outcome(outcome: Optional[Dict[str, Any]]) -> bool:
     return bool(outcome) and outcome.get("realized_r") is not None
 
 
+def _is_invalidated(outcome: Optional[Dict[str, Any]]) -> bool:
+    """True iff the outcome dict carries the audit-mode invalidated flag.
+
+    Default-mode ``bus_outcome_lookup`` filters invalidated rows out to
+    ``None``, so this only fires when the caller opted into
+    ``include_invalidated=True`` or constructed the dict manually.
+    """
+    if not outcome:
+        return False
+    return int(outcome.get("invalidated") or 0) == 1
+
+
 # --------------------------------------------------------------- bus outcomes
 
 def bus_outcome_lookup(bus_db_path: Path,
                         *,
-                        allow_linkage_fallback: bool = True) -> OutcomeLookup:
+                        allow_linkage_fallback: bool = True,
+                        include_invalidated: bool = False) -> OutcomeLookup:
     """Return an OutcomeLookup that reads from a bus SQLite database.
 
     Lookup order (first hit wins):
@@ -210,6 +277,12 @@ def bus_outcome_lookup(bus_db_path: Path,
     In all cases the horizon column is matched strictly:
     ``realized_r_at_t{horizon_sec}s``. A missing column or missing row is
     reported as ``None`` rather than silently using a different horizon.
+
+    ``include_invalidated`` is the audit-mode switch. By default rows whose
+    ``invalidated`` column is 1 (Phase 1 outcome-truth) read as None so the
+    calibration pipeline cannot silently treat them as evidence. Audit and
+    diagnostic callers can opt in to surface invalidated rows with the flag
+    set on the returned dict.
     """
     bus_db_path = Path(bus_db_path)
 
@@ -224,21 +297,45 @@ def bus_outcome_lookup(bus_db_path: Path,
 
     def _trade_outcome_row(conn: sqlite3.Connection,
                             turn_id: int,
-                            col: str) -> Optional[float]:
+                            col: str) -> Optional[Dict[str, Any]]:
+        """Return {'realized_r', 'invalidated', 'invalidation_reason'} or
+        None when the lookup should fail (no row / NULL realized_r /
+        invalidated row with include_invalidated=False).
+        """
         try:
-            cur = conn.execute(f"PRAGMA table_info(trade_outcomes)")
+            cur = conn.execute("PRAGMA table_info(trade_outcomes)")
             cols = {r[1] for r in cur.fetchall()}
             if col not in cols:
                 return None
-            cur = conn.execute(
-                f"SELECT {col} FROM trade_outcomes WHERE ai_turn_id = ? "
-                "ORDER BY id DESC LIMIT 1",
-                (int(turn_id),),
-            )
-            row = cur.fetchone()
+            has_inv    = "invalidated"         in cols
+            has_reason = "invalidation_reason" in cols
+            select_parts = [col]
+            if has_inv:
+                select_parts.append("invalidated")
+            if has_reason:
+                select_parts.append("invalidation_reason")
+            sql = (f"SELECT {', '.join(select_parts)} FROM trade_outcomes "
+                    "WHERE ai_turn_id = ? ORDER BY id DESC LIMIT 1")
+            row = conn.execute(sql, (int(turn_id),)).fetchone()
             if row is None or row[0] is None:
                 return None
-            return float(row[0])
+            rr = float(row[0])
+            invalidated = 0
+            reason: Optional[str] = None
+            i = 1
+            if has_inv:
+                v = row[i]
+                invalidated = int(v) if v is not None else 0
+                i += 1
+            if has_reason:
+                reason = row[i] if row[i] is not None else None
+            if invalidated and not include_invalidated:
+                return None
+            return {
+                "realized_r":          rr,
+                "invalidated":         invalidated,
+                "invalidation_reason": reason,
+            }
         except sqlite3.Error:
             return None
 
@@ -272,15 +369,15 @@ def bus_outcome_lookup(bus_db_path: Path,
             return None
         try:
             turn_id = forecast.get("source_turn_id")
-            source = None
             if turn_id is not None:
-                r = _trade_outcome_row(conn, int(turn_id), col)
-                if r is not None:
-                    source = "bus_trade_outcomes"
+                rec = _trade_outcome_row(conn, int(turn_id), col)
+                if rec is not None:
                     return {
-                        "realized_r": r,
-                        "horizon_used_sec": horizon,
-                        "source": source,
+                        "realized_r":          rec["realized_r"],
+                        "horizon_used_sec":    horizon,
+                        "source":              "bus_trade_outcomes",
+                        "invalidated":         rec["invalidated"],
+                        "invalidation_reason": rec["invalidation_reason"],
                     }
 
             if allow_linkage_fallback:
@@ -290,17 +387,19 @@ def bus_outcome_lookup(bus_db_path: Path,
                     forecast.get("chat_run_id"),
                 )
                 if fallback_turn_id is not None:
-                    r = _trade_outcome_row(conn, fallback_turn_id, col)
-                    if r is not None:
+                    rec = _trade_outcome_row(conn, fallback_turn_id, col)
+                    if rec is not None:
                         return {
-                            "realized_r": r,
-                            "horizon_used_sec": horizon,
-                            "source": "bus_trade_outcomes_via_linkage",
+                            "realized_r":          rec["realized_r"],
+                            "horizon_used_sec":    horizon,
+                            "source":              "bus_trade_outcomes_via_linkage",
                             "linkage": {
-                                "ai_turn_id": fallback_turn_id,
-                                "digest_sha256": forecast.get("digest_sha256"),
-                                "chat_run_id": forecast.get("chat_run_id"),
+                                "ai_turn_id":      fallback_turn_id,
+                                "digest_sha256":   forecast.get("digest_sha256"),
+                                "chat_run_id":     forecast.get("chat_run_id"),
                             },
+                            "invalidated":         rec["invalidated"],
+                            "invalidation_reason": rec["invalidation_reason"],
                         }
 
             return None
