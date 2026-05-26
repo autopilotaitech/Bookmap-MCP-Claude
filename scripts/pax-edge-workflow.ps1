@@ -46,14 +46,41 @@ if (-not (Test-Path $ReportsDir)) {
 }
 
 function Invoke-Step {
-    param([string] $Title, [string[]] $Args)
+    # $Args is a PowerShell automatic variable; declaring a param of the
+    # same name yields ambiguous splat behavior depending on edition. Use
+    # $Argv instead so & $Python @Argv expands deterministically.
+    param([string] $Title, [string[]] $Argv)
     Write-Host ""
     Write-Host "[pax-edge] >>> $Title"
-    Write-Host "[pax-edge]     $Python $($Args -join ' ')"
-    & $Python @Args
-    if ($LASTEXITCODE -ne 0) {
-        throw "[pax-edge] step failed: $Title (exit $LASTEXITCODE)"
+    Write-Host "[pax-edge]     $Python $($Argv -join ' ')"
+    # Windows PowerShell 5.1 wraps every line a native EXE writes to
+    # stderr as an ErrorRecord (NativeCommandError). Our CLIs emit
+    # progress lines like "calibration report written: ..." to stderr, so
+    # we capture stderr to a temp file and surface it ONLY on a non-zero
+    # exit. The exit code is the authoritative success signal -- PS
+    # error-record semantics on native stderr are not.
+    $stderrFile = [System.IO.Path]::GetTempFileName()
+    $previousEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $proc = Start-Process -FilePath $Python -ArgumentList $Argv `
+                              -NoNewWindow -Wait -PassThru `
+                              -RedirectStandardError $stderrFile
+        $ec = $proc.ExitCode
+    } finally {
+        $ErrorActionPreference = $previousEAP
     }
+    if ($ec -ne 0) {
+        $stderrText = (Get-Content -LiteralPath $stderrFile -Raw `
+                        -ErrorAction SilentlyContinue)
+        Remove-Item -LiteralPath $stderrFile -Force -ErrorAction SilentlyContinue
+        if ($stderrText) {
+            Write-Host "[pax-edge] stderr:"
+            Write-Host $stderrText
+        }
+        throw "[pax-edge] step failed: $Title (exit $ec)"
+    }
+    Remove-Item -LiteralPath $stderrFile -Force -ErrorAction SilentlyContinue
 }
 
 # 1. Bus replay (digest-replay sanity check).

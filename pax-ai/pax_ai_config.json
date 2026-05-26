@@ -8,5 +8,11 @@
   },
   "poll_ms":           1000,
   "stale_snapshot_ms": 5000,
-  "prox_ticks":        8
+  "prox_ticks":        8,
+
+  "_forecast_comment": "Self-training research loop. forecast.enabled=true makes chat.py persist a structured <<PAX_FORECAST>> block (when Claude emits one) to the SQLite store at forecast.store_path. Capture is fire-and-forget; chat path never breaks on persistence failure. Outcomes still require feature_bus.enabled=true elsewhere for the trade_outcomes join to produce paired calibration rows.",
+  "forecast": {
+    "enabled":    true,
+    "store_path": "D:/BookmapLogs/pax-forecast.db"
+  }
 }
