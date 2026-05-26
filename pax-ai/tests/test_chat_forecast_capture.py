@@ -194,6 +194,101 @@ def test_never_raises_on_persistence_failure(isolated_writer, monkeypatch):
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase 7: forecast emission guardrails. Pin capture-side behavior for
+# multi-block responses and explicit linkage propagation. Existing tests
+# cover the other spec items (malformed JSON, missing fields, offline
+# snapshot, never-raises) via forecast_signal and the disabled-flag path.
+# ---------------------------------------------------------------------------
+
+def _two_forecast_blocks_text() -> str:
+    """Pax response containing two well-formed forecast blocks. The second
+    block carries distinct prob_success / expected_r so we can tell which
+    one was persisted (forecast_signal picks the LAST well-formed block)."""
+    first = {
+        "alias":          "NQM6.CME@RITHMIC",
+        "level":          "OR-H",
+        "thesis":         "ACCEPTANCE_LONG",
+        "execution_read": "PAY_FOR_TRADE",
+        "direction":      "LONG",
+        "horizon_sec":    300,
+        "prob_success":   0.55,
+        "expected_r":     0.50,
+        "invalidation":   "back below OR-H",
+        "features_used":  ["or_levels"],
+    }
+    second = {**first, "prob_success": 0.80, "expected_r": 1.50,
+               "invalidation": "back below OR-H with absorption"}
+    return (
+        "First read.\n"
+        f"<<PAX_FORECAST>>\n{json.dumps(first)}\n<<END_FORECAST>>\n"
+        "Refinement.\n"
+        f"<<PAX_FORECAST>>\n{json.dumps(second)}\n<<END_FORECAST>>\n"
+    )
+
+
+def test_two_valid_forecast_blocks_persist_exactly_one_row_last_wins(
+        isolated_writer, tmp_path):
+    """Two well-formed blocks in one response -> exactly one row, and the
+    persisted row is the LAST block (deterministic per
+    forecast_signal.extract_block). Phase 1 outcome labeling joins on
+    (chat_run_id, digest_sha256); if capture wrote both rows, the labeler
+    would mark the turn FORECAST_MISSING_OR_AMBIGUOUS."""
+    isolated_writer["forecast.enabled"] = True
+    chat._capture_pax_forecast(
+        _two_forecast_blocks_text(), _snap(),
+        ts_ms=1_765_000_000_000,
+        chat_run_id="run-M",
+        digest_sha256="d" * 64,
+        snapshot_sha256="s" * 64,
+    )
+    db = tmp_path / "pax-forecast.db"
+    assert db.exists()
+    conn = sqlite3.connect(str(db))
+    try:
+        cur = conn.execute(
+            "SELECT prob_success, expected_r, chat_run_id "
+            "FROM forecasts")
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 1, (
+        f"capture must write exactly one row for two valid blocks, got {len(rows)}")
+    # Last block won: prob_success=0.80, expected_r=1.50.
+    assert rows[0][0] == pytest.approx(0.80)
+    assert rows[0][1] == pytest.approx(1.50)
+    assert rows[0][2] == "run-M"
+
+
+def test_capture_propagates_linkage_metadata_to_persisted_row(
+        isolated_writer, tmp_path):
+    """All three linkage fields (chat_run_id / digest_sha256 /
+    snapshot_sha256) must make it onto the persisted row when supplied.
+    Phase 5 turn audit joins forecasts on (chat_run_id, digest_sha256);
+    Phase 2 calibration's linkage-fallback lookup uses the same join."""
+    isolated_writer["forecast.enabled"] = True
+    chat._capture_pax_forecast(
+        _pax_text_with_forecast(), _snap(),
+        ts_ms=1_765_000_000_000,
+        chat_run_id="run-LINK",
+        digest_sha256="abc" * 21 + "f",            # 64 chars
+        snapshot_sha256="xyz" * 21 + "f",          # 64 chars
+    )
+    db = tmp_path / "pax-forecast.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        cur = conn.execute(
+            "SELECT chat_run_id, digest_sha256, snapshot_sha256 "
+            "FROM forecasts")
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row[0] == "run-LINK"
+    assert row[1] == "abc" * 21 + "f"
+    assert row[2] == "xyz" * 21 + "f"
+
+
 def test_never_raises_on_garbage_input(isolated_writer):
     isolated_writer["forecast.enabled"] = True
     # None pax_text / snap, weird types: must not raise.

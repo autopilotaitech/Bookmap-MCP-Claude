@@ -245,6 +245,96 @@ def test_pax_forecast_block_features_used_must_be_non_empty():
 
 
 # ---------------------------------------------------------------------------
+# Phase 7: strengthen the forecast-emission contract guardrails.
+# Every Phase 7 test pins a piece of the prompt that documents the
+# <<PAX_FORECAST>> schema; the production prompt already carries the
+# content, these tests pin it so a silent regression breaks here first.
+# ---------------------------------------------------------------------------
+
+def test_pax_forecast_lists_all_execution_read_values():
+    """All four execution_read enum values must be documented in the
+    forecast section. Phase 1 outcome labeling depends on the model
+    emitting exactly these strings."""
+    body = prompts.render_system_prompt()
+    forecast_section = body.split("PAX FORECAST", 1)[-1]
+    for v in ("PAY_FOR_TRADE", "WAIT_FOR_CONFIRM",
+               "STAND_DOWN", "SCRATCH_READY"):
+        assert v in forecast_section, (
+            f"forecast section must list execution_read={v}")
+
+
+def test_pax_forecast_lists_thesis_label_set():
+    """The named thesis labels must appear so Claude does not invent
+    its own. The validator's _THESIS_PREFIXES set is the contract."""
+    body = prompts.render_system_prompt()
+    forecast_section = body.split("PAX FORECAST", 1)[-1]
+    for label in ("ACCEPTANCE_LONG", "ACCEPTANCE_SHORT",
+                   "REJECTION_LONG",  "REJECTION_SHORT",
+                   "ABSORPTION_FADE", "ICEBERG_DEFENSE",
+                   "STOP_SWEEP_CONTINUATION", "STOP_SWEEP_FAILURE",
+                   "NONE"):
+        assert label in forecast_section, (
+            f"forecast section must list thesis={label}")
+
+
+def test_pax_forecast_documents_thesis_prefix_rule():
+    """The thesis-prefix allowlist (ACCEPTANCE_/REJECTION_/...) backs the
+    validator's prefix match. The prompt must teach the rule."""
+    body = prompts.render_system_prompt()
+    forecast_section = body.split("PAX FORECAST", 1)[-1]
+    for prefix in ("ACCEPTANCE_", "REJECTION_", "ABSORPTION_",
+                    "ICEBERG_", "STOP_SWEEP_"):
+        assert prefix in forecast_section, (
+            f"forecast section must mention thesis prefix {prefix}")
+
+
+def test_pax_forecast_documents_numeric_ranges():
+    """Range bounds enforced by pax_forecast_schema must appear in the
+    contract: horizon_sec in [1, 86400], prob_success in [0.0, 1.0],
+    expected_r in [-10.0, 10.0]. Without these, Claude has no source
+    of truth for the bounds the validator enforces."""
+    body = prompts.render_system_prompt()
+    forecast_section = body.split("PAX FORECAST", 1)[-1]
+    assert "86400"   in forecast_section, "horizon_sec upper bound missing"
+    assert "0.0"     in forecast_section, "prob_success lower bound missing"
+    assert "1.0"     in forecast_section, "prob_success upper bound missing"
+    assert "-10.0"   in forecast_section, "expected_r lower bound missing"
+    assert "10.0"    in forecast_section, "expected_r upper bound missing"
+
+
+def test_pax_forecast_documents_no_markdown_fences_rule():
+    """Markdown fences would break the regex extractor in
+    forecast_signal.extract_block. The prompt must forbid them."""
+    body = prompts.render_system_prompt()
+    forecast_section = body.split("PAX FORECAST", 1)[-1]
+    lowered = forecast_section.lower()
+    assert "markdown fences" in lowered or "markdown fence" in lowered, (
+        "forecast section must forbid wrapping the block in markdown fences")
+
+
+def test_pax_forecast_documents_at_most_one_per_response():
+    """forecast_signal.extract_block picks the LAST well-formed block when
+    multiple appear; the prompt must say 'at most one per response' so the
+    model does not rely on accidental retention semantics."""
+    body = prompts.render_system_prompt()
+    forecast_section = body.split("PAX FORECAST", 1)[-1]
+    lowered = forecast_section.lower()
+    assert "at most one" in lowered, (
+        "forecast section must state 'at most one' per response")
+
+
+def test_pax_forecast_direction_NONE_mapped_to_non_pay_execution_reads():
+    """The contract must spell out that WAIT_FOR_CONFIRM / STAND_DOWN /
+    SCRATCH_READY all require direction=NONE (not just 'execution_read
+    != PAY_FOR_TRADE -> NONE')."""
+    body = prompts.render_system_prompt()
+    forecast_section = body.split("PAX FORECAST", 1)[-1]
+    # The contract has two equivalent statements -- accept either form.
+    assert "MUST be NONE" in forecast_section or \
+           "direction MUST be NONE" in forecast_section
+
+
+# ---------------------------------------------------------------------------
 # Phase 4: turn-level audit trail -- prompt lineage helpers
 # ---------------------------------------------------------------------------
 
