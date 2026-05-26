@@ -360,6 +360,22 @@ def test_main_writes_replay_report_file(tmp_path):
     assert "candidates" in payload
 
 
+def test_outcomes_json_lookup_requires_matching_horizon(tmp_path):
+    outcomes_json = tmp_path / "outcomes.json"
+    outcomes_json.write_text(json.dumps([
+        {"source_turn_id": 7, "realized_r": 1.0, "horizon_used_sec": 180}
+    ]), encoding="utf-8")
+
+    lookup = replay._outcomes_from_json(outcomes_json)
+
+    assert lookup({"source_turn_id": 7, "horizon_sec": 300}) is None
+    assert lookup({"source_turn_id": 7, "horizon_sec": 180}) == {
+        "realized_r": 1.0,
+        "horizon_used_sec": 180,
+        "source": "json",
+    }
+
+
 def test_replay_does_not_mutate_active_config(tmp_path):
     forbidden = {
         tmp_path / "pax_ai_config.json": "ORIG_CONFIG",

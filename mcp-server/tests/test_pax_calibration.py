@@ -291,3 +291,11 @@ def test_calibration_is_read_only(tmp_path):
 
     for p, content in forbidden.items():
         assert p.read_text(encoding="utf-8") == content
+
+
+def test_bus_outcome_lookup_missing_db_does_not_create_file(tmp_path):
+    missing = tmp_path / "missing-bus.db"
+    lookup = calib.bus_outcome_lookup(missing)
+
+    assert lookup({"source_turn_id": 1, "horizon_sec": 300}) is None
+    assert not missing.exists()

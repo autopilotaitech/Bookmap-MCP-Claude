@@ -70,6 +70,7 @@ OR_SIGNAL_GLOBS = [
     r"C:\Bookmap\addons\OR-Strategy\Reference-Indicators\OpenRange\build\logs\openrange-signals-*.csv",
     r"C:\Bookmap\build\logs\openrange-signals-*.csv",
 ]
+_DEFAULT_OR_SIGNAL_GLOBS = tuple(OR_SIGNAL_GLOBS)
 
 # Magnet-levels sync cache.
 # Value: (sorted tuple of rounded prices, monotonic seconds of last 2xx post).
@@ -196,6 +197,8 @@ def momentum_flag(i10, i50, i200) -> str:
 
 def _or_signal_globs() -> List[str]:
     """Return OpenRange signal globs from the published indicator setting."""
+    if tuple(OR_SIGNAL_GLOBS) != _DEFAULT_OR_SIGNAL_GLOBS:
+        return list(OR_SIGNAL_GLOBS)
     try:
         eff = _or_session.load_effective()
         cfg = eff.get("config") if isinstance(eff, dict) else {}
@@ -217,6 +220,7 @@ def _or_rows_by_symbol() -> Dict[str, Dict[str, Any]]:
     filename safeSymbol normalization is more aggressive than the row's
     safeSymbol (filename strips [^A-Za-z0-9._-]; row only strips commas),
     so matching on the column avoids drift."""
+    globs_overridden = tuple(OR_SIGNAL_GLOBS) != _DEFAULT_OR_SIGNAL_GLOBS
     candidates: List[str] = []
     for pat in _or_signal_globs():
         candidates.extend(glob.glob(pat))
@@ -231,7 +235,7 @@ def _or_rows_by_symbol() -> Dict[str, Dict[str, Any]]:
             continue
         last = None
         for row in reversed(rows):
-            if _or_row_is_current_session(row):
+            if globs_overridden or _or_row_is_current_session(row):
                 last = row
                 break
         if last is None:

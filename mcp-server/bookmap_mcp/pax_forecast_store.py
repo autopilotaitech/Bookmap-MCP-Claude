@@ -50,7 +50,7 @@ CREATE INDEX IF NOT EXISTS idx_forecasts_source_turn ON forecasts(source_turn_id
 """
 
 _INSERT_SQL = """
-INSERT OR REPLACE INTO forecasts (
+INSERT OR IGNORE INTO forecasts (
     forecast_id, schema_version, ts_ms, source_turn_id,
     alias, level, thesis, execution_read, direction, horizon_sec,
     prob_success, expected_r, invalidation, features_used,

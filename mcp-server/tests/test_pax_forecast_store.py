@@ -80,6 +80,24 @@ def test_record_is_idempotent(tmp_path):
     s.close()
 
 
+def test_record_duplicate_does_not_rewrite_existing_row(tmp_path, monkeypatch):
+    s = _open_store(tmp_path)
+    raw = _raw_forecast()
+
+    monkeypatch.setattr(store.time, "time", lambda: 1000.0)
+    s.record(raw, ts_ms=1_765_000_000_000, source_turn_id=42)
+    first = list(s.iter_forecasts())[0]["ingested_ms"]
+
+    monkeypatch.setattr(store.time, "time", lambda: 2000.0)
+    s.record(raw, ts_ms=1_765_000_000_000, source_turn_id=42)
+    second = list(s.iter_forecasts())[0]["ingested_ms"]
+
+    assert first == 1_000_000
+    assert second == first
+    assert s.count() == 1
+    s.close()
+
+
 def test_iter_filters_by_time_window(tmp_path):
     s = _open_store(tmp_path)
     s.record(_raw_forecast(), ts_ms=1_000, source_turn_id=1)

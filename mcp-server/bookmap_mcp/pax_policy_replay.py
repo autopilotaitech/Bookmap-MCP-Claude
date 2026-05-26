@@ -293,14 +293,17 @@ def replay_for_day(*,
 
 def _outcomes_from_json(path: Path) -> OutcomeLookup:
     rows = json.loads(Path(path).read_text(encoding="utf-8"))
-    by_turn: Dict[int, Dict[str, Any]] = {}
+    by_turn_horizon: Dict[Tuple[int, int], Dict[str, Any]] = {}
     for r in rows:
         sid = r.get("source_turn_id")
         if sid is None:
             continue
-        by_turn[int(sid)] = {
+        horizon = int(r.get("horizon_used_sec") or 0)
+        if horizon <= 0:
+            continue
+        by_turn_horizon[(int(sid), horizon)] = {
             "realized_r": float(r["realized_r"]),
-            "horizon_used_sec": int(r.get("horizon_used_sec") or 0),
+            "horizon_used_sec": horizon,
             "source": r.get("source", "json"),
         }
 
@@ -308,7 +311,10 @@ def _outcomes_from_json(path: Path) -> OutcomeLookup:
         sid = forecast.get("source_turn_id")
         if sid is None:
             return None
-        return by_turn.get(int(sid))
+        horizon = int(forecast.get("horizon_sec") or 0)
+        if horizon <= 0:
+            return None
+        return by_turn_horizon.get((int(sid), horizon))
 
     return _lookup
 

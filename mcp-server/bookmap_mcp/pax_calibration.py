@@ -205,8 +205,11 @@ def bus_outcome_lookup(bus_db_path: Path) -> OutcomeLookup:
         if turn_id is None or horizon <= 0:
             return None
         col = f"realized_r_at_t{horizon}s"
+        if not bus_db_path.exists():
+            return None
+        uri = f"file:{bus_db_path.resolve().as_posix()}?mode=ro"
         try:
-            conn = sqlite3.connect(str(bus_db_path))
+            conn = sqlite3.connect(uri, uri=True)
         except sqlite3.Error:
             return None
         try:
