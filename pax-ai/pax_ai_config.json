@@ -32,8 +32,8 @@
   "_trigger_engine_comment": "Auto-fire Pax AI on existing trigger chips so the trader does not have to type during the session. One Claude call per selected trigger; conservative hard caps prevent cost runaway. Restart Pax-AI after changing this flag.",
   "trigger_engine": {
     "enabled":                 true,
-    "min_global_interval_sec": 30,
-    "cooldown_per_kind_sec":   120,
+    "min_global_interval_sec": 90,
+    "cooldown_per_kind_sec":   300,
     "tick_interval_sec":       1.0,
     "deep":                    false,
     "fireable_kinds": [
