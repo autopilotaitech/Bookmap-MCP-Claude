@@ -56,6 +56,13 @@ def main() -> int:
     from . import journal
     journal.init()
 
+    # Trigger engine: auto-fires Pax AI on snapshot triggers so the
+    # trader does not have to type during the session. Start it after
+    # journal.init() so background turns get a stable chat_run_id for
+    # forecast/outcome linkage. Default OFF; hard caps on cost.
+    from . import trigger_engine
+    trigger_engine.start()
+
     if args.shell:
         _start_server_thread(args.port)
         # Give the server a moment to bind before the WebView2 page loads.

@@ -204,6 +204,167 @@ def _capture_ai_chart_signal(pax_text: Optional[str],
         sys.stderr.write(f"[chat] ai_chart_signal capture failed: {exc}\n")
 
 
+def _persist_turn(*,
+                   pax_text: str,
+                   full_msg: str,
+                   meta: Dict[str, Any],
+                   user_text: str,
+                   model: str,
+                   deep: bool,
+                   rc: int,
+                   elapsed_ms: int,
+                   final_info: Dict[str, Any],
+                   aborted: bool) -> None:
+    """Persist one Pax AI turn into feature_bus + chart signal store +
+    forecast store. Fire-and-forget; never raises into the caller.
+
+    The caller has already collected ``pax_text`` (the assistant text)
+    and ``full_msg`` (the digest sent to Claude). The snapshot the
+    digest was built from MUST live on ``meta["_snapshot_for_capture"]``.
+    Re-polling here would race against the 1 Hz snapshot poller and
+    break feature-bus replay byte-exactness.
+
+    Reused by both ``handle_chat_stream`` (interactive SSE path) and
+    ``fire_triggered_turn`` (background trigger path).
+    """
+    snap = meta.get("_snapshot_for_capture")
+    snap_ts_ms = int(meta.get("_snapshot_ts_ms_capture") or 0)
+    snap_age_ms = int(meta.get("_snapshot_age_ms_capture") or 0)
+    digest_sha: Optional[str] = None
+    snap_sha: Optional[str] = None
+    try:
+        snapshot_json = feature_bus._canonical_snapshot_json(snap or {})
+        digest_sha = hashlib.sha256(full_msg.encode("utf-8")).hexdigest()
+        snap_sha = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+        rec = feature_bus.AiTurnRecord(
+            schema_version=1,
+            ts_ms=int(time.time() * 1000),
+            chat_run_id=journal.current_run_id(),
+            deep=bool(deep),
+            model=model,
+            router_primary=meta.get("router_primary"),
+            router_secondary=meta.get("router_secondary"),
+            user_text_raw=user_text,
+            user_text_normalized=meta.get("user_normalized") or user_text,
+            digest_text=full_msg,
+            digest_sha256=digest_sha,
+            snapshot_json=snapshot_json,
+            snapshot_sha256=snap_sha,
+            snapshot_alias=(snap or {}).get("alias"),
+            snapshot_ts_ms=snap_ts_ms if snap_ts_ms > 0 else None,
+            snapshot_age_ms=snap_age_ms,
+            pax_text=pax_text,
+            exit_code=rc,
+            elapsed_ms=elapsed_ms,
+            api_duration_ms=final_info.get("duration_api_ms"),
+            total_cost_usd=final_info.get("total_cost_usd"),
+            input_tokens=final_info.get("input_tokens"),
+            output_tokens=final_info.get("output_tokens"),
+            cache_creation_tokens=final_info.get("cache_creation_input_tokens"),
+            cache_read_tokens=final_info.get("cache_read_input_tokens"),
+            aborted=bool(aborted),
+            error=final_info.get("error"),
+        )
+        feature_bus.record_ai_turn(rec)
+    except Exception as exc:
+        sys.stderr.write(f"[chat] feature_bus capture failed: {exc}\n")
+
+    _capture_ai_chart_signal(pax_text, snap)
+    _capture_pax_forecast(
+        pax_text,
+        snap,
+        ts_ms=int(time.time() * 1000),
+        chat_run_id=journal.current_run_id(),
+        digest_sha256=digest_sha,
+        snapshot_sha256=snap_sha,
+    )
+
+
+def fire_triggered_turn(trigger_user_text: str,
+                         *,
+                         deep: bool = False,
+                         timeout_sec: Optional[float] = None) -> Dict[str, Any]:
+    """Run a single Claude call for an auto-fired trigger and persist.
+
+    No SSE. No journal transcript entry (this is a background turn, not
+    a user-visible chat). The captured pax_text is routed through the
+    same chart-signal + forecast persistence path as a manual chat
+    turn, so the existing UI marker pipeline and self-training research
+    loop both pick it up without changes.
+
+    Returns a small dict the caller (the trigger engine) can use for
+    logging / dedup accounting:
+        {"exit_code": int, "elapsed_ms": int, "pax_text_len": int,
+         "model": str, "error": Optional[str]}
+    """
+    out: Dict[str, Any] = {"exit_code": 1, "elapsed_ms": 0,
+                            "pax_text_len": 0, "model": "",
+                            "error": None}
+    try:
+        full_msg, meta = build_user_message(trigger_user_text)
+    except Exception as exc:
+        out["error"] = f"build_user_message: {exc}"
+        return out
+
+    try:
+        sp_path = prompts.write_frozen_prompt()
+    except Exception as exc:
+        out["error"] = f"write_frozen_prompt: {exc}"
+        return out
+
+    model = _select_model(deep)
+    out["model"] = model
+    chat_timeout = (claude_stream.DEEP_CHAT_TIMEOUT_SEC if deep
+                      else claude_stream.CHAT_TIMEOUT_SEC)
+    if timeout_sec is not None:
+        chat_timeout = float(timeout_sec)
+
+    pax_collected: List[str] = []
+    final_info: Dict[str, Any] = {}
+
+    def on_token(text: str) -> None:
+        pax_collected.append(text)
+
+    def on_done(info: Dict[str, Any]) -> None:
+        final_info.update(info)
+
+    t0 = time.monotonic()
+    try:
+        rc = claude_stream.stream_chat(
+            user_message=full_msg,
+            model=model,
+            system_prompt_path=sp_path,
+            on_token=on_token,
+            on_done=on_done,
+            abort=None,
+            timeout_sec=chat_timeout,
+        )
+    except Exception as exc:
+        out["error"] = f"stream_chat: {exc}"
+        return out
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    pax_text = "".join(pax_collected)
+
+    _persist_turn(
+        pax_text=pax_text,
+        full_msg=full_msg,
+        meta=meta,
+        user_text=trigger_user_text,
+        model=model,
+        deep=deep,
+        rc=rc,
+        elapsed_ms=elapsed_ms,
+        final_info=final_info,
+        aborted=bool(final_info.get("aborted", False)),
+    )
+
+    out["exit_code"] = rc
+    out["elapsed_ms"] = elapsed_ms
+    out["pax_text_len"] = len(pax_text)
+    out["error"] = final_info.get("error")
+    return out
+
+
 def _capture_pax_forecast(pax_text: Optional[str],
                            snap: Optional[Dict[str, Any]],
                            *,
@@ -431,73 +592,22 @@ def handle_chat_stream(wfile, user_text: str, deep: bool = False) -> None:
             pass
 
         # ------------------------------------------------------------------
-        # Phase 1 feature-bus capture. Strictly post-`done`-flush. Any
-        # failure logs to stderr but never raises into the chat path.
-        # The captured snapshot MUST be the one build_user_message used
-        # (carried in meta["_snapshot_for_capture"]); polling again here
-        # would race against the 1 Hz poller and break replay byte-exactness.
+        # Post-response capture (feature_bus ai_turn + chart signal +
+        # forecast). Strictly post-`done`-flush. The helper is shared
+        # with fire_triggered_turn so a trigger-driven Claude call lands
+        # in the same downstream pipeline.
         # ------------------------------------------------------------------
-        try:
-            snap = meta.get("_snapshot_for_capture")
-            snap_ts_ms = int(meta.get("_snapshot_ts_ms_capture") or 0)
-            snap_age_ms = int(meta.get("_snapshot_age_ms_capture") or 0)
-            snapshot_json = feature_bus._canonical_snapshot_json(snap or {})
-            digest_sha = hashlib.sha256(full_msg.encode("utf-8")).hexdigest()
-            snap_sha   = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
-            rec = feature_bus.AiTurnRecord(
-                schema_version=1,
-                ts_ms=int(time.time() * 1000),
-                chat_run_id=journal.current_run_id(),
-                deep=bool(deep),
-                model=model,
-                router_primary=meta.get("router_primary"),
-                router_secondary=meta.get("router_secondary"),
-                user_text_raw=user_text,
-                user_text_normalized=meta.get("user_normalized") or user_text,
-                digest_text=full_msg,
-                digest_sha256=digest_sha,
-                snapshot_json=snapshot_json,
-                snapshot_sha256=snap_sha,
-                snapshot_alias=(snap or {}).get("alias"),
-                snapshot_ts_ms=snap_ts_ms if snap_ts_ms > 0 else None,
-                snapshot_age_ms=snap_age_ms,
-                pax_text=pax_text,
-                exit_code=rc,
-                elapsed_ms=elapsed_ms,
-                api_duration_ms=final_info.get("duration_api_ms"),
-                total_cost_usd=final_info.get("total_cost_usd"),
-                input_tokens=final_info.get("input_tokens"),
-                output_tokens=final_info.get("output_tokens"),
-                cache_creation_tokens=final_info.get("cache_creation_input_tokens"),
-                cache_read_tokens=final_info.get("cache_read_input_tokens"),
-                aborted=bool(final_info.get("aborted", abort.is_set())),
-                error=final_info.get("error"),
-            )
-            feature_bus.record_ai_turn(rec)
-        except Exception as exc:
-            sys.stderr.write(f"[chat] feature_bus capture failed: {exc}\n")
-
-        # Pax AI -> chart marker bridge. Validates against the snapshot
-        # the digest was built from (NOT a fresh poll). Any failure is
-        # silent — chart plumbing is not allowed to break the chat path.
-        _capture_ai_chart_signal(pax_text, meta.get("_snapshot_for_capture"))
-
-        # Pax AI -> structured forecast capture for the self-training
-        # research loop. Same snapshot as the chart-signal capture. Same
-        # silent-failure contract; chat path must never break.
-        try:
-            _digest_sha = digest_sha if "digest_sha" in locals() else None
-            _snap_sha = snap_sha if "snap_sha" in locals() else None
-        except Exception:
-            _digest_sha = None
-            _snap_sha = None
-        _capture_pax_forecast(
-            pax_text,
-            meta.get("_snapshot_for_capture"),
-            ts_ms=int(time.time() * 1000),
-            chat_run_id=journal.current_run_id(),
-            digest_sha256=_digest_sha,
-            snapshot_sha256=_snap_sha,
+        _persist_turn(
+            pax_text=pax_text,
+            full_msg=full_msg,
+            meta=meta,
+            user_text=user_text,
+            model=model,
+            deep=deep,
+            rc=rc,
+            elapsed_ms=elapsed_ms,
+            final_info=final_info,
+            aborted=bool(final_info.get("aborted", abort.is_set())),
         )
     finally:
         _clear_abort_if_owned(abort)

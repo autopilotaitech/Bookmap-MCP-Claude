@@ -189,6 +189,21 @@ def _api_pax_whynow() -> Tuple[int, Dict[str, Any]]:
 
 def _api_pax_health() -> Tuple[int, Dict[str, Any]]:
     snap, as_of_ms, age_ms, fails, err = poller.latest()
+    # forecast capture + trigger engine status reported here so an
+    # operator can verify runtime gates without a Pax-AI restart.
+    try:
+        from . import forecast_store_writer
+        forecast_status = {
+            "enabled":    forecast_store_writer.is_enabled(),
+            "store_path": str(forecast_store_writer.resolved_store_path()),
+        }
+    except Exception:
+        forecast_status = {"enabled": False, "store_path": None}
+    try:
+        from . import trigger_engine
+        trigger_status = trigger_engine.stats()
+    except Exception:
+        trigger_status = {"enabled": False, "running": False}
     return 200, {
         "dashboardReachable":   snap is not None and snap.get("health") == "ok",
         "dashboardLastAtMs":    as_of_ms,
@@ -200,6 +215,8 @@ def _api_pax_health() -> Tuple[int, Dict[str, Any]]:
         "modelDeep":            config.get("models.deep"),
         "claudeAvailable":      claude_stream.claude_available(),
         "feature_bus":          feature_bus.status(),
+        "forecast":             forecast_status,
+        "trigger_engine":       trigger_status,
     }
 
 

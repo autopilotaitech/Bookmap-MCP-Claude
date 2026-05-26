@@ -97,6 +97,25 @@ DEFAULTS: Dict[str, Any] = {
         "enabled":    False,
         "store_path": "D:/BookmapLogs/pax-forecast.db",
     },
+    "trigger_engine": {
+        # Background daemon that auto-fires Pax AI on snapshot triggers
+        # (LEVEL_APPROACH / TREND_SIGNAL_FIRE / etc.) so the trader does
+        # not have to type at a chat box during the session. Each fire
+        # is one Claude call -- HARD caps prevent cost runaway.
+        # Default OFF; restart Pax-AI after flipping.
+        "enabled":                 False,
+        "min_global_interval_sec": 30,     # max ~120 fires / hr globally
+        "cooldown_per_kind_sec":   120,    # same (kind,label) fires <=1/2min
+        "tick_interval_sec":       1.0,    # how often we poll for triggers
+        "deep":                    False,  # haiku, not sonnet/opus
+        "fireable_kinds": [                # the rest are stand-down chips
+            "LEVEL_APPROACH",
+            "TREND_SIGNAL_FIRE",
+            "CONVICTION_FLIP",
+            "REGIME_CHANGE",
+            "MICRO_EVENT",
+        ],
+    },
 }
 
 
