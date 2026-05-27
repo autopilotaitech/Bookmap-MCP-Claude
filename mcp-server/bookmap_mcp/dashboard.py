@@ -1948,6 +1948,101 @@ def _chart_emit_micro(side: str, level_price: float,
     return out
 
 
+def _chart_emit_raw_micro_events(alias: str, me_obj: Optional[Dict[str, Any]],
+                                 levels: List[Dict[str, Any]],
+                                 now_ms: int) -> List[Dict[str, Any]]:
+    """Emit microstructure evidence at the event's own price.
+
+    Level-tied micro events stay in `_chart_emit_micro`; this path covers
+    sweeps / icebergs / spoofing that occur between OR/extension levels so the
+    chart still shows institutional evidence instead of dropping it.
+    """
+    if not me_obj or not isinstance(me_obj, dict) or "_error" in me_obj:
+        return []
+    band = _CHART_MICRO_WINDOW_TICKS * NQ_TICK
+    level_prices: List[float] = []
+    for lvl in levels:
+        if not isinstance(lvl, dict):
+            continue
+        try:
+            lp = float(lvl.get("price") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if lp > 0.0:
+            level_prices.append(lp)
+
+    out: List[Dict[str, Any]] = []
+    for ev in (me_obj.get("events") or [])[-30:]:
+        if not isinstance(ev, dict):
+            continue
+        kind = (ev.get("kind") or "").upper()
+        if kind not in ("STOP_SWEEP", "ICEBERG", "SPOOF"):
+            continue
+        try:
+            price = float(ev.get("price"))
+        except (TypeError, ValueError):
+            continue
+        if price <= 0.0:
+            continue
+        # Near-level micro events are already emitted with OR/extension label
+        # context. This raw lane is for the between-level evidence that was
+        # previously invisible.
+        if any(abs(price - lp) <= band for lp in level_prices):
+            continue
+
+        is_bid = ev.get("isBid")
+        side = "below" if is_bid is True else "above" if is_bid is False else "above"
+        ev_side = "BID" if is_bid is True else "ASK" if is_bid is False else "?"
+        ev_ms = int(ev.get("timeMs") or now_ms)
+        label = f"MICRO@{price:.2f}"
+        confidence = 0.35
+        try:
+            size = abs(float(ev.get("size") or 0.0))
+            confidence = round(max(0.35, min(0.95, _tanh(size / 100.0))), 3)
+        except (TypeError, ValueError):
+            pass
+
+        if kind == "STOP_SWEEP":
+            event_type = "LIQUIDITY_SWEEP"
+            marker_text = "SWP↓" if is_bid is True else "SWP↑"
+            color = _CHART_COLORS["LIQUIDITY_SWEEP"]
+            execution = "WAIT_FOR_CONFIRM"
+            reasons = [f"RAW_STOP_SWEEP@{price}/{ev_side}"]
+        elif kind == "ICEBERG":
+            event_type = "ICEBERG_DEFENSE"
+            marker_text = "ICE-B" if is_bid is True else "ICE-A"
+            color = _CHART_COLORS["ICEBERG_DEFENSE"]
+            execution = "STAND_DOWN"
+            reasons = [f"RAW_ICEBERG@{price}/{ev_side}"]
+        else:
+            event_type = "SPOOF_RISK"
+            marker_text = "SPD"
+            color = _CHART_COLORS["SPOOF_RISK"]
+            execution = "STAND_DOWN"
+            reasons = [f"RAW_SPOOF@{price}/{ev_side}"]
+
+        out.append({
+            "id":                 _chart_event_id(alias, label, event_type, ev_ms),
+            "alias":              alias,
+            "label":              label,
+            "price":              round(price, 2),
+            "side":               side,
+            "event_type":         event_type,
+            "direction":          "NONE",
+            "execution_read":     execution,
+            "marker_text":        marker_text,
+            "marker_color_hint":  color,
+            "severity":           "WARNING",
+            "timestamp_ms":       ev_ms,
+            "source":             "micro_events_raw",
+            "confidence":         confidence,
+            "reason_codes":       reasons,
+            "invalidation_price": None,
+            "payline_price":      None,
+        })
+    return out
+
+
 def _chart_emit_absorption(side: str, ith: Dict[str, Any],
                             tape_obj: Optional[Dict[str, Any]],
                             now_ms: int) -> Optional[Dict[str, Any]]:
@@ -2122,6 +2217,12 @@ def compute_institutional_chart_events(snap: Dict[str, Any]) -> List[Dict[str, A
     except (TypeError, ValueError):
         or_low_f = 0.0
     now_ms = int(time.time() * 1000)
+
+    # Raw microstructure evidence first: this is NOT constrained to OR /
+    # extension proximity. Level-tied micro events below are still emitted with
+    # their OR/extension label; this raw lane catches the between-level sweeps,
+    # icebergs, and spoofing that the operator needs to see on-chart.
+    out.extend(_chart_emit_raw_micro_events(alias, me_obj, levels, now_ms))
 
     for lvl in levels:
         if not isinstance(lvl, dict):

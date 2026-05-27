@@ -197,6 +197,32 @@ def test_iceberg_bid_at_or_l_emits_ice_b():
 
 # ─── 4. SPOOF_RISK ──────────────────────────────────────────────────────────
 
+def test_off_level_bid_iceberg_emits_raw_micro_event_at_event_price():
+    """Between-level iceberg evidence must not disappear just because it is
+    outside the OR/extension micro window."""
+    me = {"events": [{"kind": "ICEBERG", "isBid": True,
+                      "price": 19982.25, "size": 52, "timeMs": 123}]}
+    snap = _drive(19975.0, micro_events=me)
+    events = _events(snap)
+    raw = _find(events, "ICEBERG_DEFENSE", "MICRO@19982.25")
+    assert raw is not None
+    _assert_full_shape(raw)
+    assert raw["price"] == 19982.25
+    assert raw["side"] == "below"
+    assert raw["marker_text"] == "ICE-B"
+    assert raw["source"] == "micro_events_raw"
+    assert raw["direction"] == "NONE"
+
+
+def test_near_level_micro_event_does_not_duplicate_as_raw_micro():
+    me = {"events": [{"kind": "ICEBERG", "isBid": True,
+                      "price": 19950.0, "size": 52, "timeMs": 123}]}
+    snap = _drive(19975.0, micro_events=me)
+    events = _events(snap)
+    assert _find(events, "ICEBERG_DEFENSE", "OR-L") is not None
+    assert _find(events, "ICEBERG_DEFENSE", "MICRO@19950.00") is None
+
+
 def test_spoof_at_level_emits_spoof_risk():
     me = {"events": [{"kind": "SPOOF", "isBid": True,
                       "price": 20000.0, "size": 200, "timeMs": 1}]}
