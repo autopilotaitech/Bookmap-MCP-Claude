@@ -223,11 +223,111 @@ public class PaxOpeningRangeModule implements
     static final int CHART_EVENT_ICON_FONT = 9;
     static final int MAX_CHART_EVENTS_PER_COLLISION_BUCKET = 1;
     static final long CHART_EVENT_COLLISION_TIME_MS = 5_000L;
+    /** Layer B raw-event TTL applied at draw time. The history schema is
+     *  unchanged (events still accumulate in the durable deque for
+     *  audit/test); this only filters what the painter draws on the
+     *  chart so 90-second-old raw events don't read as fresh. */
+    static final long CHART_EVENT_RENDER_TTL_MS = 4_000L;
+    /** Layer C trade-read min-visible hold-over. Once an actionable row
+     *  renders for a given level label, the painter keeps drawing the
+     *  last-actionable variant for at least this long after the row
+     *  flips non-actionable on a later poll. Fixes the "glyph appears
+     *  but vanishes before I can read or screenshot" complaint. */
+    static final long LEVEL_EDGE_MIN_VISIBLE_MS = 15_000L;
     /** Chart-event labels collide visually when their prices are within a few
      *  ticks and their timestamps land on the same rendered chart column.
      *  Bucket by this many ticks so different marker texts at the same level
      *  stack instead of painting on top of each other. */
     static final int CHART_EVENT_COLLISION_PRICE_TICKS = 8;
+
+    /** Hold-over entry for the level-edge Layer C glyph. Carries the
+     *  last-actionable row variant + the wall-clock at which it was
+     *  most recently observed actionable. Pure data; package-private
+     *  so tests in the same package can pin the hold-over logic. */
+    static final class LevelEdgeHoldOver {
+        final PaxLevelEdgeModel.Row row;
+        final long lastActionableAtMs;
+
+        LevelEdgeHoldOver(PaxLevelEdgeModel.Row row, long lastActionableAtMs) {
+            this.row = row;
+            this.lastActionableAtMs = lastActionableAtMs;
+        }
+
+        boolean isVisible(long nowMs, long minVisibleMs) {
+            return nowMs - lastActionableAtMs <= minVisibleMs;
+        }
+    }
+
+    /** Pure helper that mirrors the price-lane gate inside
+     *  {@link PaxPainter#drawInstitutionalMarker}. Returns true iff the
+     *  given institutional-signal event should render as a price-lane
+     *  marker. After Phase 2, only confirmed entries (PAY_FOR_TRADE +
+     *  directional LONG/SHORT) draw in the price lane; status codes
+     *  (WAIT_FOR_CONFIRM, STAND_DOWN, SCRATCH_READY) are diagnostic and
+     *  do not get a price-lane label. */
+    static boolean shouldRenderInstitutionalSignalInPriceLane(PaxInstitutionalSignalEvent evt) {
+        if (evt == null || !evt.isRenderable()) return false;
+        if (!"PAY_FOR_TRADE".equals(evt.executionRead)) return false;
+        return "LONG".equals(evt.direction) || "SHORT".equals(evt.direction);
+    }
+
+    /** Pure helper for the chart-event TTL filter. Returns the subset of
+     *  the input list whose timestampMs lands within {@code ttlMs} of
+     *  {@code nowMs}. Null / empty / negative-ttl inputs return the
+     *  empty list. Used by tests to pin the Layer-B short-life rule
+     *  without spinning up the module. */
+    static java.util.List<PaxInstitutionalChartEvent> filterEventsByTtl(
+            java.util.List<PaxInstitutionalChartEvent> events, long nowMs, long ttlMs) {
+        if (events == null || events.isEmpty() || ttlMs <= 0L) {
+            return java.util.Collections.emptyList();
+        }
+        java.util.ArrayList<PaxInstitutionalChartEvent> out =
+                new java.util.ArrayList<>(events.size());
+        long cutoff = nowMs - ttlMs;
+        for (PaxInstitutionalChartEvent ev : events) {
+            if (ev == null) continue;
+            if (ev.timestampMs >= cutoff) out.add(ev);
+        }
+        return out;
+    }
+
+    /** Pure helper for the level-edge min-visible hold-over rule. Given the
+     *  current set of actionable rows (by label) and the previous hold-over
+     *  map, returns the rows that should render this cycle: every currently-
+     *  actionable row PLUS any previously-actionable row whose last sighting
+     *  is within {@code minVisibleMs}. The mutation of the hold-over map is
+     *  done by the caller; this helper is pure so it is unit-testable.
+     *
+     *  @param currentActionable rows that are actionable in the latest model
+     *  @param holdovers          previous hold-over map (label -> entry)
+     *  @param nowMs              wall-clock for visibility decisions
+     *  @param minVisibleMs       hold-over duration
+     *  @return ordered list of rows to render (current actionables first,
+     *          followed by held-over rows). Order is deterministic for tests. */
+    static java.util.List<PaxLevelEdgeModel.Row> selectLevelEdgeRowsToRender(
+            java.util.List<PaxLevelEdgeModel.Row> currentActionable,
+            java.util.Map<String, LevelEdgeHoldOver> holdovers,
+            long nowMs, long minVisibleMs) {
+        java.util.ArrayList<PaxLevelEdgeModel.Row> out = new java.util.ArrayList<>();
+        java.util.HashSet<String> seen = new java.util.HashSet<>();
+        if (currentActionable != null) {
+            for (PaxLevelEdgeModel.Row r : currentActionable) {
+                if (r == null || r.label == null || !r.actionable) continue;
+                if (seen.add(r.label)) out.add(r);
+            }
+        }
+        if (holdovers != null) {
+            for (java.util.Map.Entry<String, LevelEdgeHoldOver> e : holdovers.entrySet()) {
+                if (seen.contains(e.getKey())) continue;
+                LevelEdgeHoldOver h = e.getValue();
+                if (h == null || h.row == null) continue;
+                if (!h.isVisible(nowMs, minVisibleMs)) continue;
+                out.add(h.row);
+                seen.add(e.getKey());
+            }
+        }
+        return out;
+    }
 
     /** Immutable in-flight triangle event held by PaxPainter for redraw. */
     static final class TrendTriangleEvent {
@@ -288,6 +388,9 @@ public class PaxOpeningRangeModule implements
     private final AtomicBoolean heatwaveDirty = new AtomicBoolean(false);
     private final PaxTrendSignalFetcher trendSignals;
     private final AtomicBoolean trendSignalDirty = new AtomicBoolean(false);
+    /** Pax AI level-edge fetcher. Rides on the existing overlay bucket --
+     *  new data flips heatwaveDirty so updateOverlay re-renders. */
+    private final PaxLevelEdgeFetcher levelEdge;
     private volatile DataStructureInterface dataStructureInterface;
     private volatile SettingsAccess settingsAccess;
     private volatile PaxOpeningRangeUiSettings uiSettings = new PaxOpeningRangeUiSettings();
@@ -296,6 +399,7 @@ public class PaxOpeningRangeModule implements
         this.provider = provider;
         this.heatwave = new PaxHeatwaveFetcher(() -> heatwaveDirty.set(true));
         this.trendSignals = new PaxTrendSignalFetcher(() -> trendSignalDirty.set(true));
+        this.levelEdge = new PaxLevelEdgeFetcher(() -> heatwaveDirty.set(true));
         ListenableHelper.addListeners(provider, this);
     }
 
@@ -303,6 +407,7 @@ public class PaxOpeningRangeModule implements
     public void finish() {
         heatwave.stop();
         trendSignals.stop();
+        levelEdge.stop();
         synchronized (indicatorsFullNameToUserName) {
             for (String userName : indicatorsFullNameToUserName.values()) {
                 provider.sendUserMessage(Layer1ApiUserMessageModifyScreenSpacePainter
@@ -756,6 +861,10 @@ public class PaxOpeningRangeModule implements
                 trendFetcherShouldRun(uiSettings.showTrendTriangles,
                                        uiSettings.showInstitutionalChartEvents),
                 uiSettings.safeHeatwaveUrl(), uiSettings.clampedHeatwavePollMs());
+        // Pax AI level-edge fetcher. URL is hard-coded to the Pax AI
+        // server (port 18891), independent of dashboard URL/cadence. No
+        // settings checkbox -- runs whenever the module is attached.
+        levelEdge.start();
     }
 
     /** V3 migration. Bookmap deserializes user settings overwriting fields
@@ -1036,6 +1145,8 @@ public class PaxOpeningRangeModule implements
                 trendFetcherShouldRun(settings.showTrendTriangles,
                                        settings.showInstitutionalChartEvents),
                 settings.safeHeatwaveUrl(), settings.clampedHeatwavePollMs());
+        // Idempotent: re-asserts the level-edge fetcher is running.
+        levelEdge.start();
     }
 
     private String diagnosticsText(String alias) {
@@ -1182,6 +1293,16 @@ public class PaxOpeningRangeModule implements
          *  expire. */
         final PaxAiChartEventsActiveHistory paxAiChartEventMarkers =
                 new PaxAiChartEventsActiveHistory(MAX_LIVE_CHART_EVENT_MARKERS);
+        /** Per-label hold-over cache for the level-edge Layer C glyph.
+         *  Keyed by row.label. Each entry records the most-recently
+         *  actionable row + the wall-clock at which it was last seen
+         *  actionable. The painter holds the entry visible for
+         *  {@link #LEVEL_EDGE_MIN_VISIBLE_MS} after the upstream model
+         *  flips that label non-actionable, then drops it. Only mutated
+         *  from the Bookmap callback thread (PaxPainter.update is the
+         *  sole writer) so no separate synchronization is needed. */
+        final java.util.LinkedHashMap<String, LevelEdgeHoldOver> levelEdgeHoldovers =
+                new java.util.LinkedHashMap<>();
         String lastEmittedKind = "";
         long lastEmittedBucketEnteredMs = 0L;
         String lastNativeSignalMarkerKey = "";
@@ -1715,7 +1836,73 @@ public class PaxOpeningRangeModule implements
             } else {
                 addSignalStatus(state.featureCache.latest());
             }
+            // Pax AI per-level edge text. Draws only actionable rows;
+            // emits nothing when the model is null / empty / all WAIT.
+            addLevelEdges(state, ui);
             lastOverlayKey = overlayKey;
+        }
+
+        /** Render PaxLevelEdgeModel actionable rows as small monospaced
+         *  glyphs anchored at the row's price. Skips non-actionable rows;
+         *  draws nothing when the fetcher has no usable model. */
+        private void addLevelEdges(InstrumentState state,
+                                     PaxOpeningRangeUiSettings ui) {
+            long nowMs = System.currentTimeMillis();
+            PaxLevelEdgeModel model = levelEdge.effectiveModel(nowMs);
+            double pips = state.pips;
+            if (!Double.isFinite(pips) || pips <= 0.0) return;
+
+            // Phase 2 min-visible rule: keep showing the Layer C trade-read
+            // glyph for LEVEL_EDGE_MIN_VISIBLE_MS after the upstream model
+            // flips it non-actionable. Without this hold-over, the glyph
+            // can flash for one 1s poll and disappear before the operator
+            // can read or screenshot.
+            java.util.List<PaxLevelEdgeModel.Row> currentActionable = new java.util.ArrayList<>();
+            if (model != null) {
+                for (PaxLevelEdgeModel.Row row : model.rows) {
+                    if (row == null || !row.actionable) continue;
+                    if (row.price == null) continue;
+                    if (row.label == null) continue;
+                    currentActionable.add(row);
+                    state.levelEdgeHoldovers.put(row.label,
+                            new LevelEdgeHoldOver(row, nowMs));
+                }
+            }
+            // Evict hold-overs whose min-visible window has expired.
+            state.levelEdgeHoldovers.entrySet().removeIf(e ->
+                    e.getValue() == null
+                            || !e.getValue().isVisible(nowMs, LEVEL_EDGE_MIN_VISIBLE_MS));
+
+            java.util.List<PaxLevelEdgeModel.Row> toRender = selectLevelEdgeRowsToRender(
+                    currentActionable, state.levelEdgeHoldovers, nowMs,
+                    LEVEL_EDGE_MIN_VISIBLE_MS);
+            if (toRender.isEmpty()) return;
+
+            long xNanos = toNanos(LocalDateTime.now(EXCHANGE_ZONE));
+            int fontSize = ui.clampedHeatwaveFontSize();
+            for (PaxLevelEdgeModel.Row row : toRender) {
+                if (row == null || row.price == null) continue;
+                PreparedImage img = PaxLevelEdgePainter.render(row, fontSize);
+                if (img == null) continue;
+                int w = img.getReadOnlyImage().getWidth();
+                int h = img.getReadOnlyImage().getHeight();
+                double dataPrice = row.price / pips;
+                int xOffset = LABEL_X_OFFSET + 60;   // sit right of OR label
+                int yOffset = LABEL_Y_OFFSET;
+                addVolatileShape(img,
+                        new CompositeHorizontalCoordinate(
+                                CompositeCoordinateBase.DATA_ZERO,
+                                xOffset, xNanos),
+                        new CompositeVerticalCoordinate(
+                                CompositeCoordinateBase.DATA_ZERO,
+                                yOffset, dataPrice),
+                        new CompositeHorizontalCoordinate(
+                                CompositeCoordinateBase.DATA_ZERO,
+                                xOffset + w, xNanos),
+                        new CompositeVerticalCoordinate(
+                                CompositeCoordinateBase.DATA_ZERO,
+                                yOffset + h, dataPrice));
+            }
         }
 
         /** Stable key for the overlay bucket. Heatwave path: model semantic
@@ -1723,6 +1910,7 @@ public class PaxOpeningRangeModule implements
          *  the cache without rebuilding more often than that. Badge path:
          *  badge text + color state. */
         private String computeOverlayKey(PaxOpeningRangeUiSettings ui, InstrumentState state) {
+            String base;
             if (ui.showHeatwaveBox) {
                 long nowMs = System.currentTimeMillis();
                 PaxHeatwaveModel model = heatwave.effectiveModel(nowMs);
@@ -1730,13 +1918,20 @@ public class PaxOpeningRangeModule implements
                     model = PaxHeatwaveModel.noData(nowMs);
                 }
                 long ageBucket = (nowMs - model.fetchedAtMs) / 1000L;
-                return "HW|" + ui.clampedHeatwaveFontSize() + "|"
+                base = "HW|" + ui.clampedHeatwaveFontSize() + "|"
                         + ui.clampedHeatwaveBoxX() + "|" + ui.clampedHeatwaveBoxY() + "|"
                         + ageBucket + "|" + heatwaveModelKey(model);
+            } else {
+                PaxOpeningRangeFeatureSnapshot snap = state.featureCache.latest();
+                if (snap == null || snap.signal() == null) base = "BADGE|EMPTY";
+                else base = "BADGE|" + snap.colorState() + "|" + snap.badgeText();
             }
-            PaxOpeningRangeFeatureSnapshot snap = state.featureCache.latest();
-            if (snap == null || snap.signal() == null) return "BADGE|EMPTY";
-            return "BADGE|" + snap.colorState() + "|" + snap.badgeText();
+            return base + "|LE|" + levelEdgeKey(levelEdge.effectiveModel(
+                    System.currentTimeMillis()));
+        }
+
+        private String levelEdgeKey(PaxLevelEdgeModel model) {
+            return PaxOpeningRangeModule.levelEdgeKey(model);
         }
 
         private String heatwaveModelKey(PaxHeatwaveModel model) {
@@ -1925,8 +2120,16 @@ public class PaxOpeningRangeModule implements
                             + state.paxAiChartEventMarkers.size());
             all.addAll(state.chartEventMarkers.snapshot());
             all.addAll(state.paxAiChartEventMarkers.snapshot());
+            // Phase 2 Layer-B rule: raw events fade off the chart after
+            // CHART_EVENT_RENDER_TTL_MS. The durable history is unchanged
+            // (audit/test still see the full deque); this only filters
+            // what the painter draws so a 90s-old SWP marker doesn't read
+            // as fresh.
+            long nowMs = System.currentTimeMillis();
+            java.util.List<PaxInstitutionalChartEvent> fresh =
+                    filterEventsByTtl(all, nowMs, CHART_EVENT_RENDER_TTL_MS);
             java.util.List<ChartEventDisplay> display =
-                    collapseChartEventsForDisplay(all, state.pips, MAX_LIVE_CHART_EVENT_MARKERS);
+                    collapseChartEventsForDisplay(fresh, state.pips, MAX_LIVE_CHART_EVENT_MARKERS);
             // Sort by timestamp ascending so newer events draw on top of
             // older ones in nearby regions.
             display.sort((a, b) -> Long.compare(a.event.timestampMs, b.event.timestampMs));
@@ -2002,38 +2205,27 @@ public class PaxOpeningRangeModule implements
             if (evt == null || !evt.isRenderable()) return;
             double tickSize = state.pips;
             if (!Double.isFinite(tickSize) || tickSize <= 0.0) return;
+            // Phase 2 clutter rule: DIAGNOSTIC status codes (WATCH /
+            // STND / ICE / SPD / SCR) no longer render in the price
+            // lane. They are process state, not directional signals,
+            // and competing with INS-L / INS-S entry markers + level-
+            // edge glyphs at the same level made the lane unreadable.
+            // The institutional pipeline still emits them; downstream
+            // HUD surfaces (Heatwave STATUS row, future operator
+            // panel) can show them without lane competition. Only
+            // PAY_FOR_TRADE with a real LONG/SHORT direction draws.
+            if (!"PAY_FOR_TRADE".equals(evt.executionRead)) return;
             String text;
             Color color;
             boolean bullish;
-            switch (evt.executionRead) {
-                case "PAY_FOR_TRADE":
-                    if ("LONG".equals(evt.direction)) {
-                        text = "INS-L"; color = PaxHeatwaveColors.BULL; bullish = true;
-                    } else if ("SHORT".equals(evt.direction)) {
-                        text = "INS-S"; color = PaxHeatwaveColors.BEAR; bullish = false;
-                    } else {
-                        // PAY_FOR_TRADE with direction NONE shouldn't happen
-                        // per the Python contract; render as WATCH for safety.
-                        text = "WATCH"; color = new Color(220, 200, 80); bullish = true;
-                    }
-                    break;
-                case "STAND_DOWN":
-                    if ("ICEBERG_DEFENSE".equals(evt.signalType)) {
-                        text = "ICE";
-                    } else if ("SPOOF_STAND_DOWN".equals(evt.signalType)) {
-                        text = "SPD";
-                    } else {
-                        text = "STND";
-                    }
-                    color = new Color(255, 153, 0); bullish = true;
-                    break;
-                case "SCRATCH_READY":
-                    text = "SCR"; color = new Color(176, 176, 176); bullish = true;
-                    break;
-                case "WAIT_FOR_CONFIRM":
-                default:
-                    text = "WATCH"; color = new Color(220, 200, 80); bullish = true;
-                    break;
+            if ("LONG".equals(evt.direction)) {
+                text = "INS-L"; color = PaxChartPalette.BULL; bullish = true;
+            } else if ("SHORT".equals(evt.direction)) {
+                text = "INS-S"; color = PaxChartPalette.BEAR; bullish = false;
+            } else {
+                // PAY_FOR_TRADE with direction NONE shouldn't happen per the
+                // Python contract; suppress rather than mislabel.
+                return;
             }
             PreparedImage image = labelImage(text, color, TRIANGLE_FONT_WEAK);
             int w = image.getReadOnlyImage().getWidth();
@@ -2617,6 +2809,47 @@ public class PaxOpeningRangeModule implements
      *  (state, verdict, scoreText, all rows) is unchanged so the cached
      *  PreparedImage can be reused. Pure function of the model - no
      *  reads against instance fields - so it is directly unit-testable. */
+    /** Stable cache key for the level-edge model. Includes the count of
+     *  actionable rows plus per-row label / direction / colorHint /
+     *  quantized confidence / scoreR / stopPrice / sizeTier / setup /
+     *  topDrivers. Setup + topDrivers are part of the key (Slice 2) so a
+     *  reason change forces the overlay to redraw even when the numeric
+     *  fields are unchanged. Null model -> "NONE". */
+    static String levelEdgeKey(PaxLevelEdgeModel model) {
+        if (model == null) return "NONE";
+        StringBuilder sb = new StringBuilder(96);
+        int count = 0;
+        for (PaxLevelEdgeModel.Row row : model.rows) {
+            if (row == null || !row.actionable) continue;
+            count++;
+            sb.append('|').append(row.label)
+              .append(':').append(row.direction)
+              .append(':').append(row.colorHint)
+              .append(':').append(quantize2(row.confidence))
+              .append(':').append(quantize2(row.scoreR))
+              .append(':').append(quantize2(row.stopPrice))
+              .append(':').append(row.sizeTier)
+              .append(':').append(row.setup == null ? "-" : row.setup)
+              .append(':').append(joinDrivers(row.topDrivers));
+        }
+        return "n=" + count + sb;
+    }
+
+    private static String joinDrivers(java.util.List<String> drivers) {
+        if (drivers == null || drivers.isEmpty()) return "-";
+        StringBuilder sb = new StringBuilder(32);
+        for (int i = 0; i < drivers.size(); i++) {
+            if (i > 0) sb.append('+');
+            sb.append(drivers.get(i));
+        }
+        return sb.toString();
+    }
+
+    private static String quantize2(Double v) {
+        if (v == null) return "-";
+        return String.format(java.util.Locale.ROOT, "%.2f", v);
+    }
+
     static String heatwaveModelKey(PaxHeatwaveModel model) {
         if (model == null) return "NULL";
         StringBuilder sb = new StringBuilder(160);

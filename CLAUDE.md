@@ -18,6 +18,21 @@ below override the default system prompt where they conflict.
 
 ## Workflow rules
 
+### No drift: prove live trading edge first
+
+The operator has explicitly reset the priority: do not add more framework,
+guardrails, gates, docs, or research machinery unless it directly improves or
+measures Pax AI's live trading decision quality. The core product is a live
+Bookmap copilot that gives short, useful, falsifiable trade reads: bias, setup,
+entry condition, invalidation, no-trade reason, and confidence grounded only in
+observed features.
+
+Before implementing any new Pax AI architecture, prompt, policy, replay, or
+training change, produce an audit/report plan first. The plan must explain how
+the work creates edge for the operator at the chart, what will be removed or
+simplified, how success will be judged from live/manual review, and why the
+change is not just more infrastructure.
+
 ### Backup before substantial refactors
 
 Before any change that replaces an existing function, model, or config:

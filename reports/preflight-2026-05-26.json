@@ -1,0 +1,19 @@
+{
+  "errors": [],
+  "passed": false,
+  "promotion_gate": {
+    "accepted_reports": [
+      "..\\reports\\replay-2026-05-26.json"
+    ],
+    "active_policy_changes": [
+      "pax-ai/pax_ai/prompts.py"
+    ],
+    "candidate_statuses": [],
+    "passed": false,
+    "reason": "research_only_alone_is_insufficient_for_active_policy_change",
+    "rejected_reports": []
+  },
+  "reason": "promotion_gate:research_only_alone_is_insufficient_for_active_policy_change",
+  "schema_version": 1,
+  "turn_audit_summary": null
+}

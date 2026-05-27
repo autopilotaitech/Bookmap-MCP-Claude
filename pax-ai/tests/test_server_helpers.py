@@ -215,3 +215,179 @@ def test_api_pax_health_includes_feature_bus_block():
     assert "running" in fb
     assert "queueDepth" in fb
     assert "rowsToday" in fb
+
+
+# ---------------------------------------------------------------------------
+# parse_qs/urlparse scoping fix.
+#
+# Root cause: server.py:489 had `from urllib.parse import parse_qs` INSIDE
+# do_GET. Python's compiler treats every name assigned anywhere in a
+# function body as a local for the whole function, so the bus routes at
+# lines 470/475 saw `parse_qs` as an unbound local and raised
+# UnboundLocalError on every /api/pax/bus/summary and /api/pax/bus/recent
+# request. Fix: drop the local import; the module-level import on
+# server.py:30 already exposes parse_qs in the function's globals.
+#
+# Three guards below: AST static scan (no shadowing), bytecode introspection
+# (the names are globals, not locals), and live ThreadingHTTPServer fetches
+# of the previously-crashing endpoints.
+# ---------------------------------------------------------------------------
+
+import ast
+import http.client
+import json
+import threading
+import time
+from http.server import ThreadingHTTPServer
+
+
+def test_do_GET_does_not_shadow_parse_qs_or_urlparse():
+    """AST guard: a local Import / ImportFrom / Assign that introduces
+    parse_qs or urlparse anywhere inside do_GET would re-create the
+    bug. Catch it at parse time so a future regression fails the
+    test suite before any HTTP call."""
+    tree = ast.parse(SERVER_PY.read_text(encoding="utf-8"))
+    target = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "do_GET":
+            target = node
+            break
+    assert target is not None, "do_GET not found in server.py"
+
+    forbidden = {"parse_qs", "urlparse"}
+    for child in ast.walk(target):
+        if isinstance(child, ast.ImportFrom):
+            local = {n.asname or n.name for n in child.names}
+            bad = local & forbidden
+            assert not bad, (
+                f"do_GET locally imports {bad}; this shadows the module-"
+                f"level import and causes UnboundLocalError on any prior "
+                f"use of the name inside the function")
+        elif isinstance(child, ast.Import):
+            local = {alias.asname or alias.name for alias in child.names}
+            bad = local & forbidden
+            assert not bad, f"do_GET locally imports {bad}"
+        elif isinstance(child, ast.Assign):
+            for tgt in child.targets:
+                if isinstance(tgt, ast.Name) and tgt.id in forbidden:
+                    raise AssertionError(
+                        f"do_GET assigns to {tgt.id}; this shadows the "
+                        f"module-level import")
+
+
+def test_do_GET_bytecode_treats_parse_qs_and_urlparse_as_globals():
+    """Bytecode guard: the names must live in co_names (globals/attr
+    references) and NOT in co_varnames (function locals). This is the
+    exact distinction Python uses to decide LOAD_GLOBAL vs LOAD_FAST.
+    A regression that puts either name into the locals list reproduces
+    the UnboundLocalError without any HTTP call."""
+    do_get = server._Handler.do_GET
+    code = do_get.__code__
+    assert "parse_qs" not in code.co_varnames, (
+        "parse_qs must not be a local of do_GET; it is imported at module "
+        "scope and used as a global")
+    assert "urlparse" not in code.co_varnames, (
+        "urlparse must not be a local of do_GET")
+    # Belt: confirm they ARE referenced as globals.
+    assert "parse_qs" in code.co_names, "parse_qs is referenced in do_GET"
+    assert "urlparse" in code.co_names, "urlparse is referenced in do_GET"
+
+
+# -- Live-fire endpoint smokes ----------------------------------------------
+
+def _start_handler_server():
+    """Bind a ThreadingHTTPServer to an ephemeral port on 127.0.0.1 with
+    the real _Handler. Returns (httpd, port). Caller is responsible for
+    shutdown."""
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), server._Handler)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    return httpd, port, t
+
+
+def _get(port, path, timeout=3.0):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        raw = resp.read()
+        return resp.status, raw
+    finally:
+        conn.close()
+
+
+def test_bus_summary_routes_without_parse_qs_crash():
+    """Regression: /api/pax/bus/summary must not 500. Pre-fix it raised
+    UnboundLocalError inside do_GET. We don't enable feature_bus -- the
+    helper still returns 200 with the disabled-summary shape."""
+    httpd, port, _ = _start_handler_server()
+    try:
+        status, raw = _get(port, "/api/pax/bus/summary")
+        assert status == 200, f"expected 200, got {status} body={raw[:200]!r}"
+        body = json.loads(raw)
+        # Disabled-summary shape includes these keys regardless of state.
+        assert "enabled" in body
+    finally:
+        httpd.shutdown()
+
+
+def test_bus_recent_parses_query_params_without_crash():
+    """Regression: /api/pax/bus/recent?table=level_events&limit=10 must
+    not 500. The query-string parse runs inside do_GET via parse_qs;
+    pre-fix this raised UnboundLocalError."""
+    httpd, port, _ = _start_handler_server()
+    try:
+        status, raw = _get(
+            port, "/api/pax/bus/recent?table=level_events&limit=10")
+        assert status == 200, f"expected 200, got {status} body={raw[:200]!r}"
+        body = json.loads(raw)
+        assert body.get("table") == "level_events"
+        assert "rows" in body
+    finally:
+        httpd.shutdown()
+
+
+def test_bus_recent_rejects_unknown_table_via_query_param():
+    """The 400-path also runs through parse_qs. Confirms query-string
+    parsing is intact on the rejection branch."""
+    httpd, port, _ = _start_handler_server()
+    try:
+        status, raw = _get(port, "/api/pax/bus/recent?table=bogus")
+        assert status == 400, f"expected 400, got {status} body={raw[:200]!r}"
+        body = json.loads(raw)
+        assert "allowed" in body
+    finally:
+        httpd.shutdown()
+
+
+def test_health_endpoint_still_routes_via_do_GET():
+    """Sanity: a healthy non-bus endpoint still routes correctly via
+    the same do_GET that previously crashed on the bus paths. Pinned
+    so the fix can't accidentally break adjacent routes."""
+    httpd, port, _ = _start_handler_server()
+    try:
+        status, raw = _get(port, "/api/pax/health")
+        assert status == 200, f"expected 200, got {status} body={raw[:200]!r}"
+        body = json.loads(raw)
+        assert "feature_bus" in body
+    finally:
+        httpd.shutdown()
+
+
+def test_levels_edge_endpoint_still_routes_via_do_GET():
+    """Sanity: the chart's primary feed must keep returning 200 after the
+    fix. /api/pax/levels/edge takes no query params -- this also pins
+    that the do_GET path through the non-bus branches is intact."""
+    httpd, port, _ = _start_handler_server()
+    try:
+        status, raw = _get(port, "/api/pax/levels/edge")
+        # 200 with a payload, regardless of dashboard reachability;
+        # the helper returns an empty rows list when the dashboard is
+        # offline rather than crashing the route.
+        assert status in (200, 503), (
+            f"unexpected status {status} body={raw[:200]!r}")
+        body = json.loads(raw)
+        assert isinstance(body, dict)
+    finally:
+        httpd.shutdown()

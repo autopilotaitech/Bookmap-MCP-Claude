@@ -32,7 +32,9 @@ from urllib.parse import urlparse, unquote, parse_qs
 from . import DASHBOARD_URL, DEFAULT_PORT
 from . import poller, context as ctx_mod, edge_calculus, playbook, config
 from . import chat as chat_mod, claude_stream, triggers, journal, feature_bus
-from . import trigger_chart_signal
+from . import trigger_chart_signal, verdict as verdict_mod
+from . import level_edge as level_edge_mod
+from . import level_edge_log
 
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -173,6 +175,53 @@ def _api_pax_playbook() -> Tuple[int, Dict[str, Any]]:
     pb["ageMs"] = age_ms
     pb["stale"] = age_ms > int(config.get("stale_snapshot_ms", 5000))
     return 200, pb
+
+
+def _api_pax_verdict_instant() -> Tuple[int, Dict[str, Any]]:
+    """Deterministic six-field verdict. No Claude call.
+
+    Returns 503 if the poller has no cached snapshot yet, otherwise 200
+    with the verdict JSON. ageMs / asOfMs come from poller.latest() so the
+    caller can judge freshness consistently with the rest of /api/pax/*.
+    """
+    snap, as_of_ms, age_ms, _fails, err = poller.latest()
+    if snap is None:
+        return 503, {"error": "no_snapshot_yet", "lastError": err}
+    body = verdict_mod.compute_verdict(
+        snap,
+        as_of_ms=as_of_ms,
+        age_ms=age_ms,
+        stale_threshold_ms=int(config.get("stale_snapshot_ms",
+                                            verdict_mod.DEFAULT_STALE_MS)),
+    )
+    return 200, body
+
+
+def _api_pax_levels_edge() -> Tuple[int, Dict[str, Any]]:
+    """Aggregate per-level edge cards for the chart overlay. No Claude.
+
+    Composes edge_calculus.level_edge over every row in
+    snap["or_levels"]["levels"] and returns one compact card per level
+    plus a top-level `blocked` gate dict. The single derived number is
+    `score_R` (renamed from edge_calculus.expected_R) -- not measured EV;
+    see reports/pax-ai-level-edge-audit-2026-05-26.md.
+    """
+    snap, as_of_ms, age_ms, _fails, err = poller.latest()
+    if snap is None:
+        return 503, {"error": "no_snapshot_yet", "lastError": err}
+    body = level_edge_mod.compute_level_edge_payload(
+        snap,
+        as_of_ms=as_of_ms,
+        age_ms=age_ms,
+        stale_threshold_ms=int(config.get("stale_snapshot_ms",
+                                            level_edge_mod.DEFAULT_STALE_MS)),
+    )
+    # Slice 3: every actionable false->true transition becomes one row in
+    # %LOCALAPPDATA%\pax-ai\level-edge-log\YYYY-MM-DD.open.jsonl, and matured
+    # rows roll into the closed JSONL with realized R multiples. Logging
+    # NEVER breaks the endpoint -- record_payload_safe swallows + stderrs.
+    level_edge_log.record_payload_safe(body, snap)
+    return 200, body
 
 
 def _api_pax_whynow() -> Tuple[int, Dict[str, Any]]:
@@ -402,6 +451,12 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/pax/playbook":
                 status, body = _api_pax_playbook()
                 self._send_json(status, body); return
+            if path == "/api/pax/verdict/instant":
+                status, body = _api_pax_verdict_instant()
+                self._send_json(status, body); return
+            if path == "/api/pax/levels/edge":
+                status, body = _api_pax_levels_edge()
+                self._send_json(status, body); return
             if path == "/api/pax/skills":
                 status, body = _api_pax_skills()
                 self._send_json(status, body); return
@@ -431,7 +486,6 @@ class _Handler(BaseHTTPRequestHandler):
                 status, body = _api_pax_level(label)
                 self._send_json(status, body); return
             if path == "/api/pax/chat/history":
-                from urllib.parse import parse_qs
                 q = parse_qs(urlparse(self.path).query)
                 limit_raw = (q.get("limit") or [None])[0]
                 limit = _clamp_history_limit(limit_raw)
