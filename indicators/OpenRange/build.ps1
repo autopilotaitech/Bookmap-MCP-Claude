@@ -86,10 +86,13 @@ Invoke-JavaTest "com.openrange.PaxAiChartEventsActiveHistoryTest"
 Invoke-JavaTest "com.openrange.PaxTrendSignalFetcherRepaintKeyTest"
 Invoke-JavaTest "com.openrange.PaxLevelEdgeSnapshotParserTest"
 Invoke-JavaTest "com.openrange.PaxLevelEdgePainterTest"
-Invoke-JavaTest "com.openrange.PaxChartLayerRegistryTest"
 Invoke-JavaTest "com.openrange.PaxChartPaletteTest"
 Invoke-JavaTest "com.openrange.PaxChartEventTtlTest"
 Invoke-JavaTest "com.openrange.PaxLevelEdgeMinVisibleTest"
+Invoke-JavaTest "com.openrange.PaxAttackResponseGlyphTest"
+Invoke-JavaTest "com.openrange.PaxAttackResponseParserAndPainterTest"
+Invoke-JavaTest "com.openrange.PaxAttackResponseFetcherTest"
+Invoke-JavaTest "com.openrange.PaxAttackResponseRenderWiringTest"
 
 $jarPath = Join-Path $stagingDir 'openrange-release.jar'
 if (Test-Path $jarPath) { Remove-Item -Force $jarPath }

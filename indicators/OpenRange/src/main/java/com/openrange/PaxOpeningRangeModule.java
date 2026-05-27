@@ -234,6 +234,15 @@ public class PaxOpeningRangeModule implements
      *  flips non-actionable on a later poll. Fixes the "glyph appears
      *  but vanishes before I can read or screenshot" complaint. */
     static final long LEVEL_EDGE_MIN_VISIBLE_MS = 15_000L;
+    /** Attack-response WATCH label anchor offset in ticks. Sits at
+     *  ~30 ticks from the level so the small label is clear of the
+     *  chart-event glyph band (14-26 ticks) and the operator's OR
+     *  labels. */
+    static final int ATTACK_RESPONSE_OFFSET_TICKS = 30;
+    /** Hard cap on attack-response labels rendered per refresh. A bug
+     *  in the upstream classifier emitting hundreds of rows must not
+     *  paint a wall of WATCH labels. */
+    static final int MAX_ATTACK_RESPONSE_LABELS = 12;
     /** Chart-event labels collide visually when their prices are within a few
      *  ticks and their timestamps land on the same rendered chart column.
      *  Bucket by this many ticks so different marker texts at the same level
@@ -391,6 +400,12 @@ public class PaxOpeningRangeModule implements
     /** Pax AI level-edge fetcher. Rides on the existing overlay bucket --
      *  new data flips heatwaveDirty so updateOverlay re-renders. */
     private final PaxLevelEdgeFetcher levelEdge;
+    /** Pax AI attack-response fetcher. Polls
+     *  http://127.0.0.1:18891/api/pax/attack-response at 1 Hz. Shares
+     *  the heatwaveDirty repaint signal so the next Bookmap callback
+     *  picks up the new state set. Worker thread NEVER touches canvas.
+     *  Render path: PaxOpeningRangeModule.PaxPainter.addAttackResponseLabels. */
+    private final PaxAttackResponseFetcher attackResponse;
     private volatile DataStructureInterface dataStructureInterface;
     private volatile SettingsAccess settingsAccess;
     private volatile PaxOpeningRangeUiSettings uiSettings = new PaxOpeningRangeUiSettings();
@@ -400,6 +415,7 @@ public class PaxOpeningRangeModule implements
         this.heatwave = new PaxHeatwaveFetcher(() -> heatwaveDirty.set(true));
         this.trendSignals = new PaxTrendSignalFetcher(() -> trendSignalDirty.set(true));
         this.levelEdge = new PaxLevelEdgeFetcher(() -> heatwaveDirty.set(true));
+        this.attackResponse = new PaxAttackResponseFetcher(() -> heatwaveDirty.set(true));
         ListenableHelper.addListeners(provider, this);
     }
 
@@ -408,6 +424,7 @@ public class PaxOpeningRangeModule implements
         heatwave.stop();
         trendSignals.stop();
         levelEdge.stop();
+        attackResponse.stop();
         synchronized (indicatorsFullNameToUserName) {
             for (String userName : indicatorsFullNameToUserName.values()) {
                 provider.sendUserMessage(Layer1ApiUserMessageModifyScreenSpacePainter
@@ -865,6 +882,11 @@ public class PaxOpeningRangeModule implements
         // server (port 18891), independent of dashboard URL/cadence. No
         // settings checkbox -- runs whenever the module is attached.
         levelEdge.start();
+        // Pax AI attack-response fetcher. Same independence rule.
+        // showAttackResponseLabels gates the RENDER path, not the
+        // fetcher - keeping the fetcher always-on means a flip-on by the
+        // operator gets data immediately instead of after one poll delay.
+        attackResponse.start();
     }
 
     /** V3 migration. Bookmap deserializes user settings overwriting fields
@@ -1022,6 +1044,15 @@ public class PaxOpeningRangeModule implements
         panel.add(showInstitutionalChartEvents, c);
         c.gridwidth = 1;
 
+        JCheckBox showAttackResponseLabels = new JCheckBox(
+                "Show Attack-Response WATCH Labels",
+                settings.showAttackResponseLabels);
+        c.gridx = 0;
+        c.gridy = row++;
+        c.gridwidth = 4;
+        panel.add(showAttackResponseLabels, c);
+        c.gridwidth = 1;
+
         JCheckBox showTrendTriangles = new JCheckBox(
                 "Legacy Trend Triangles disabled (anchored chart only)",
                 false);
@@ -1081,6 +1112,7 @@ public class PaxOpeningRangeModule implements
             settings.heatwaveUrl = heatwaveUrl.getText();
             settings.showTrendTriangles = false;
             settings.showInstitutionalChartEvents = showInstitutionalChartEvents.isSelected();
+            settings.showAttackResponseLabels = showAttackResponseLabels.isSelected();
             saveSettings(null, settings);
             rebuildCalculators();
         };
@@ -1111,6 +1143,7 @@ public class PaxOpeningRangeModule implements
         showHeatwaveBox.addActionListener(e -> apply.run());
         showTrendTriangles.addActionListener(e -> apply.run());
         showInstitutionalChartEvents.addActionListener(e -> apply.run());
+        showAttackResponseLabels.addActionListener(e -> apply.run());
         heatwaveUrl.addActionListener(e -> apply.run());
 
         return new StrategyPanel[] {panel};
@@ -1147,6 +1180,8 @@ public class PaxOpeningRangeModule implements
                 settings.safeHeatwaveUrl(), settings.clampedHeatwavePollMs());
         // Idempotent: re-asserts the level-edge fetcher is running.
         levelEdge.start();
+        // Idempotent re-assert.
+        attackResponse.start();
     }
 
     private String diagnosticsText(String alias) {
@@ -1187,7 +1222,17 @@ public class PaxOpeningRangeModule implements
         sb.append("  latest pax_ai_chart count:   ").append(latestPaxAi).append('\n');
         sb.append("  durable pax_ai history:      ").append(historyPaxAi).append('\n');
         sb.append("  consecutive fetch failures:  ").append(trendSignals.consecutiveFailures()).append('\n');
-        sb.append("  last failure reason:         ").append(trendSignals.lastFailureReason());
+        sb.append("  last failure reason:         ").append(trendSignals.lastFailureReason()).append('\n');
+        // Attack-response fetcher diagnostics. Independent pipeline.
+        PaxAttackResponseModel arModel = attackResponse.snapshot();
+        int arRowCount = arModel == null ? 0 : arModel.rows.size();
+        sb.append('\n').append("Attack-response plumbing\n");
+        sb.append("  endpoint URL:                ").append(PaxAttackResponseFetcher.URL).append('\n');
+        sb.append("  fetcher running:             ").append(attackResponse.isRunning()).append('\n');
+        sb.append("  showAttackResponseLabels:    ").append(ui.showAttackResponseLabels).append('\n');
+        sb.append("  latest model row count:      ").append(arRowCount).append('\n');
+        sb.append("  consecutive fetch failures:  ").append(attackResponse.consecutiveFailures()).append('\n');
+        sb.append("  last failure reason:         ").append(attackResponse.lastFailureReason());
         return sb.toString();
     }
 
@@ -1753,6 +1798,7 @@ public class PaxOpeningRangeModule implements
             PaxOpeningRangeUiSettings ui = loadSettings();
             boolean showLegacy = false;
             boolean showChartEvents = ui.showInstitutionalChartEvents;
+            boolean showAttackResponseLabels = ui.showAttackResponseLabels;
             PaxTrendSignalModel signal = trendSignals.snapshot();
             // Merge unconditionally so new institutional ids land in history
             // even when the renderKey would otherwise short-circuit. New ids
@@ -1779,6 +1825,14 @@ public class PaxOpeningRangeModule implements
             // legitimate marker transitions.
             String paxAiSig = paxAiRenderSignature(
                     state.paxAiChartEventMarkers.snapshot());
+            // Attack-response signature - independent of CE so a state-set
+            // transition redraws even when raw-event glyphs haven't changed.
+            // Signature is "NONE" when the toggle is off so a toggle flip
+            // also forces a redraw.
+            String arSig = showAttackResponseLabels
+                    ? attackResponseRenderSignature(attackResponse.effectiveModel(
+                            System.currentTimeMillis()), state.alias)
+                    : "OFF";
             String renderKey = triangleRenderKey(showLegacy, signal,
                     state.lastEmittedKind, state.lastEmittedBucketEnteredMs,
                     state.liveTriangles.size())
@@ -1787,7 +1841,8 @@ public class PaxOpeningRangeModule implements
                     + (newInst > 0 ? "|+" + newInst : "")
                     + "|CHE=" + chartSize
                     + (newChart > 0 ? "|+" + newChart : "")
-                    + "|AI=" + paxAiSig;
+                    + "|AI=" + paxAiSig
+                    + "|AR=" + arSig;
             if (!force && renderKey.equals(lastTriangleRenderKey)) {
                 return;
             }
@@ -1802,6 +1857,13 @@ public class PaxOpeningRangeModule implements
             }
             if (showChartEvents) {
                 addAllChartEvents(state);
+            }
+            // Attack-response WATCH labels draw INDEPENDENTLY of the raw
+            // chart-event glyph layer. They share the same updateTriangles
+            // path so the canvas mutation stays on the Bookmap callback
+            // thread (the fetcher only flips heatwaveDirty).
+            if (showAttackResponseLabels) {
+                addAttackResponseLabels(state, ui);
             }
             lastTriangleRenderKey = renderKey;
         }
@@ -2159,7 +2221,12 @@ public class PaxOpeningRangeModule implements
             double tickSize = state.pips;
             if (!Double.isFinite(tickSize) || tickSize <= 0.0) return;
 
-            java.awt.Color color = evt.colorFromHint();
+            // Stage 2 palette: bullish evidence (BI/BA/BS/RL/AL) -> BULL,
+            // bearish (AI/AA/AS/RS/AC-S) -> BEAR, sweep -> amber outline,
+            // watch/touch/pull/spoof/scratch -> gray. Unknown event_type
+            // (legacy AI_ACCEPTANCE etc.) falls through to colorFromHint.
+            java.awt.Color attackAccent = attackResponseAccentColor(evt);
+            java.awt.Color color = attackAccent != null ? attackAccent : evt.colorFromHint();
             PreparedImage image = chartEventIconImage(evt, color, clusterSize);
             int w = image.getReadOnlyImage().getWidth();
             int h = image.getReadOnlyImage().getHeight();
@@ -2188,6 +2255,87 @@ public class PaxOpeningRangeModule implements
                     new CompositeVerticalCoordinate(CompositeCoordinateBase.DATA_ZERO, yPxTop, anchorPrice),
                     new CompositeHorizontalCoordinate(CompositeCoordinateBase.DATA_ZERO, 10 + w, xNanos),
                     new CompositeVerticalCoordinate(CompositeCoordinateBase.DATA_ZERO, yPxBottom, anchorPrice));
+        }
+
+        /** Render the small WATCH labels from
+         *  {@link PaxAttackResponseFetcher#effectiveModel}.
+         *
+         *  <p>Anchored at row.levelPrice + row.timestampMs in chart space.
+         *  BULL_WATCH labels sit BELOW the level (support hugs from below);
+         *  BEAR_WATCH labels sit ABOVE (resistance caps from above).
+         *  Offset is larger than the chart-event glyph band (30 vs 14-26
+         *  ticks) so the WATCH label sits CLEAR of raw-event markers AND
+         *  the operator's OR labels.</p>
+         *
+         *  <p>Per-bias ordinal stagger prevents two same-side labels at
+         *  the same level from overlapping. Hard-capped at
+         *  MAX_ATTACK_RESPONSE_LABELS so a Pax-AI bug emitting hundreds
+         *  of rows can't paint a wall of labels.</p>
+         */
+        private void addAttackResponseLabels(InstrumentState state,
+                                              PaxOpeningRangeUiSettings ui) {
+            PaxAttackResponseModel model = attackResponse.effectiveModel(
+                    System.currentTimeMillis());
+            if (model == null) return;
+            if (model.rows.isEmpty()) return;
+            double tickSize = state.pips;
+            if (!Double.isFinite(tickSize) || tickSize <= 0.0) return;
+
+            java.util.List<PaxAttackResponseModel.Row> renderable =
+                    new java.util.ArrayList<>(model.rows.size());
+            for (PaxAttackResponseModel.Row row : model.rows) {
+                if (row == null || !row.isRenderable()) continue;
+                // Alias filter: when the fetcher's payload alias matches
+                // (or is empty), accept. Otherwise drop - a future
+                // multi-symbol session must not paint rows from the
+                // wrong instrument.
+                if (!modelAliasMatches(model.alias, state.alias)) continue;
+                renderable.add(row);
+                if (renderable.size() >= MAX_ATTACK_RESPONSE_LABELS) break;
+            }
+            if (renderable.isEmpty()) return;
+
+            // Sort by time desc so the newest sits closest to the level
+            // when stacking.
+            renderable.sort((a, b) -> Long.compare(b.timestampMs, a.timestampMs));
+
+            java.util.HashMap<String, Integer> staggerByBucket = new java.util.HashMap<>();
+            for (PaxAttackResponseModel.Row row : renderable) {
+                PreparedImage img = PaxAttackResponseLabelPainter.render(row);
+                if (img == null) continue;
+                int w = img.getReadOnlyImage().getWidth();
+                int h = img.getReadOnlyImage().getHeight();
+                long xNanos = PaxChartTimeCoords.epochMsToChartNanos(row.timestampMs);
+
+                boolean placeBelow =
+                        (row.bias == PaxAttackResponseModel.Bias.BULL_WATCH);
+                String bucketKey = row.location + "|" + (placeBelow ? "B" : "A");
+                int stagger = staggerByBucket.getOrDefault(bucketKey, 0);
+                staggerByBucket.put(bucketKey, stagger + 1);
+
+                int offsetTicks = ATTACK_RESPONSE_OFFSET_TICKS;
+                double anchorPrice;
+                int yPxTop, yPxBottom;
+                int verticalOffset = stagger * (h + 2);
+                if (placeBelow) {
+                    anchorPrice = (row.levelPrice - offsetTicks * tickSize) / tickSize;
+                    yPxTop = verticalOffset;
+                    yPxBottom = h + verticalOffset;
+                } else {
+                    anchorPrice = (row.levelPrice + offsetTicks * tickSize) / tickSize;
+                    yPxTop = -h - verticalOffset;
+                    yPxBottom = -verticalOffset;
+                }
+                addTriangleShape(img,
+                        new CompositeHorizontalCoordinate(
+                                CompositeCoordinateBase.DATA_ZERO, 12, xNanos),
+                        new CompositeVerticalCoordinate(
+                                CompositeCoordinateBase.DATA_ZERO, yPxTop, anchorPrice),
+                        new CompositeHorizontalCoordinate(
+                                CompositeCoordinateBase.DATA_ZERO, 12 + w, xNanos),
+                        new CompositeVerticalCoordinate(
+                                CompositeCoordinateBase.DATA_ZERO, yPxBottom, anchorPrice));
+            }
         }
 
         /** Bull-side levels (above mid) get markers below the level by
@@ -2606,6 +2754,47 @@ public class PaxOpeningRangeModule implements
         return "CTX";
     }
 
+    /** Stable signature of the renderable attack-response state set.
+     *  Encodes per-row id/state/bias/quantized-confidence/proven-edge
+     *  flag plus the model-level alias so a one-for-one row swap (a
+     *  different state at the same level) still bumps the render key.
+     *  Pure static so it is unit-testable.
+     *
+     *  @param model the effective attack-response model (may be null)
+     *  @param paintAlias the painter's alias - mismatched rows are
+     *         excluded from the signature so a future cross-alias
+     *         payload cannot poison this painter's render-key
+     */
+    static String attackResponseRenderSignature(
+            PaxAttackResponseModel model, String paintAlias) {
+        if (model == null) return "NONE";
+        StringBuilder sb = new StringBuilder(64);
+        int count = 0;
+        for (PaxAttackResponseModel.Row row : model.rows) {
+            if (row == null || !row.isRenderable()) continue;
+            if (!modelAliasMatches(model.alias, paintAlias)) continue;
+            count++;
+            int confQuant = Double.isFinite(row.confidence)
+                    ? (int) Math.round(row.confidence * 100.0) : 0;
+            sb.append('|').append(row.id)
+              .append(':').append(row.state.name())
+              .append(':').append(row.bias.name())
+              .append(':').append(confQuant)
+              .append(':').append(row.provenEdge ? 'E' : 'W');
+        }
+        return "n=" + count + sb;
+    }
+
+    /** Alias gate for attack-response rows. Empty payload alias means
+     *  "no opinion - pass through". Empty paint alias means the painter
+     *  doesn't have an instrument yet; we don't filter in that case
+     *  either (matches {@link #filterByAlias}). */
+    static boolean modelAliasMatches(String modelAlias, String paintAlias) {
+        if (modelAlias == null || modelAlias.isEmpty()) return true;
+        if (paintAlias == null || paintAlias.isEmpty()) return true;
+        return modelAlias.equals(paintAlias);
+    }
+
     /** Source-aware badge text. AI markers keep the Python-side prefix
      *  verbatim (Python composes "AI <arrow> <label> <conf>"); LOC and
      *  CTX markers get a Java-side prefix + direction arrow + confidence
@@ -2636,8 +2825,43 @@ public class PaxOpeningRangeModule implements
         return source + dir + compactChartEventCode(evt) + conf;
     }
 
+    /** Stage 2 attack-response glyph vocabulary. Dispatches on event_type:
+     *  sweep/iceberg/absorption/stacking/pulling/acceptance/rejection/watch/
+     *  touched/spoof/scratch -> 2-3 letter code with bid/ask side inference.
+     *  Unknown event_type (e.g. legacy AI_ACCEPTANCE used in older tests)
+     *  falls back to the legacy marker_text scan so the chart still draws.
+     *
+     *  Disambiguation: ACCEPTANCE SHORT renders as "AC-S" so it does not
+     *  collide with ASK_STACK ("AS").
+     *
+     *  Plan reference: reports/pax-ai-attack-response-plan-2026-05-27.md
+     *  section 6.
+     */
     static String compactChartEventCode(PaxInstitutionalChartEvent evt) {
         if (evt == null) return "?";
+        String et = evt.eventType == null ? "" : evt.eventType;
+        String dir = evt.direction == null ? "" : evt.direction;
+        boolean above = isAboveContext(evt);
+        switch (et) {
+            case "LIQUIDITY_SWEEP":   return above ? "SH"   : "SL";
+            case "ICEBERG_DEFENSE":   return above ? "AI"   : "BI";
+            case "ABSORPTION":        return above ? "AA"   : "BA";
+            case "STACKING":          return above ? "AS"   : "BS";
+            case "PULLING":           return above ? "AP"   : "BP";
+            case "ACCEPTANCE":
+                if ("LONG".equals(dir))  return "AL";
+                if ("SHORT".equals(dir)) return "AC-S";
+                return "AC";
+            case "REJECTION":
+                if ("LONG".equals(dir))  return "RL";
+                if ("SHORT".equals(dir)) return "RS";
+                return "REJ";
+            case "WATCH_LEVEL":       return "W";
+            case "TOUCHED_LEVEL":     return "T";
+            case "SPOOF_RISK":        return "SP";
+            case "SCRATCH":           return "X";
+            default: /* fall through to legacy scan */ break;
+        }
         String text = evt.markerText == null ? "" : evt.markerText;
         String label = evt.label == null ? "" : evt.label;
         String raw = text.isEmpty() ? label : text;
@@ -2667,6 +2891,69 @@ public class PaxOpeningRangeModule implements
         cleaned = cleaned.replaceAll("[^A-Z0-9+]", "");
         if (cleaned.isEmpty()) return "?";
         return cleaned.length() > 3 ? cleaned.substring(0, 3) : cleaned;
+    }
+
+    /** Bid/ask side classifier for the new glyph vocabulary.
+     *
+     *  Marker_text suffix is authoritative when present ("ICE-A", "ABS-A"
+     *  -> ask/upper; "ICE-B", "ABS-B" -> bid/lower) because the Python
+     *  emitter already encoded that context. Otherwise falls back to
+     *  {@code evt.side} ("above" -> upper, "below" -> lower).
+     *
+     *  Returns true when the event sits on the UPPER side of the chart
+     *  (above OR-H, ask iceberg, ask stack, etc.).
+     */
+    static boolean isAboveContext(PaxInstitutionalChartEvent evt) {
+        if (evt == null) return false;
+        String mt = evt.markerText == null
+                ? ""
+                : evt.markerText.toUpperCase(java.util.Locale.US);
+        if (mt.contains("ICE-A") || mt.contains("ABS-A")) return true;
+        if (mt.contains("ICE-B") || mt.contains("ABS-B")) return false;
+        return "above".equals(evt.side);
+    }
+
+    /** Stage 2 closed-palette accent color for the new glyph vocabulary.
+     *
+     *  <ul>
+     *    <li>LIQUIDITY_SWEEP -> {@link PaxChartPalette#SEVERITY_OUTLINE}
+     *        (amber) - sweep is evidence, not a direction.</li>
+     *    <li>ICEBERG_DEFENSE / ABSORPTION / STACKING - upper context
+     *        (ask) -> {@link PaxChartPalette#BEAR}, lower (bid) ->
+     *        {@link PaxChartPalette#BULL}.</li>
+     *    <li>ACCEPTANCE / REJECTION - direction LONG -> BULL, SHORT ->
+     *        BEAR, NONE -> STAND_DOWN.</li>
+     *    <li>PULLING / WATCH_LEVEL / TOUCHED_LEVEL / SPOOF_RISK /
+     *        SCRATCH -> {@link PaxChartPalette#STAND_DOWN} (gray).</li>
+     *    <li>Unknown event_type -> null. Caller (the painter) MUST fall
+     *        back to {@code evt.colorFromHint()} so legacy event payloads
+     *        still render in their original color.</li>
+     *  </ul>
+     */
+    static java.awt.Color attackResponseAccentColor(PaxInstitutionalChartEvent evt) {
+        if (evt == null) return null;
+        String et = evt.eventType == null ? "" : evt.eventType;
+        switch (et) {
+            case "LIQUIDITY_SWEEP":
+                return PaxChartPalette.SEVERITY_OUTLINE;
+            case "ICEBERG_DEFENSE":
+            case "ABSORPTION":
+            case "STACKING":
+                return isAboveContext(evt) ? PaxChartPalette.BEAR : PaxChartPalette.BULL;
+            case "ACCEPTANCE":
+            case "REJECTION":
+                if ("LONG".equals(evt.direction))  return PaxChartPalette.BULL;
+                if ("SHORT".equals(evt.direction)) return PaxChartPalette.BEAR;
+                return PaxChartPalette.STAND_DOWN;
+            case "PULLING":
+            case "WATCH_LEVEL":
+            case "TOUCHED_LEVEL":
+            case "SPOOF_RISK":
+            case "SCRATCH":
+                return PaxChartPalette.STAND_DOWN;
+            default:
+                return null;
+        }
     }
 
     private static String asciiOnly(String text) {

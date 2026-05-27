@@ -35,6 +35,8 @@ from . import chat as chat_mod, claude_stream, triggers, journal, feature_bus
 from . import trigger_chart_signal, verdict as verdict_mod
 from . import level_edge as level_edge_mod
 from . import level_edge_log
+from . import attack_response as attack_response_mod
+from . import attack_response_log
 
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -221,6 +223,33 @@ def _api_pax_levels_edge() -> Tuple[int, Dict[str, Any]]:
     # rows roll into the closed JSONL with realized R multiples. Logging
     # NEVER breaks the endpoint -- record_payload_safe swallows + stderrs.
     level_edge_log.record_payload_safe(body, snap)
+    return 200, body
+
+
+def _api_pax_attack_response() -> Tuple[int, Dict[str, Any]]:
+    """Stage 4 attack-response endpoint. Pure compute over poller.latest().
+
+    Returns 503 when the poller has no snapshot. Otherwise composes
+    attack_response.compute_attack_response over the snapshot and the
+    age/stale gates. Never calls Claude. Never mutates the snapshot.
+    Logging side-effects (Stage 5) are wrapped in their own safe
+    callsite and cannot break this endpoint.
+    """
+    snap, as_of_ms, age_ms, _fails, err = poller.latest()
+    if snap is None:
+        return 503, {"error": "no_snapshot_yet", "lastError": err}
+    body = attack_response_mod.compute_attack_response(
+        snap,
+        as_of_ms=as_of_ms,
+        age_ms=age_ms,
+        stale_threshold_ms=int(config.get(
+            "stale_snapshot_ms",
+            attack_response_mod.DEFAULT_STALE_MS)),
+    )
+    # Stage 5: log every rising-edge WATCH state. Stop is not required.
+    # The safe wrapper swallows OS errors so a disk hiccup never 500s
+    # this endpoint.
+    attack_response_log.record_payload_safe(body, snap)
     return 200, body
 
 
@@ -456,6 +485,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(status, body); return
             if path == "/api/pax/levels/edge":
                 status, body = _api_pax_levels_edge()
+                self._send_json(status, body); return
+            if path == "/api/pax/attack-response":
+                status, body = _api_pax_attack_response()
                 self._send_json(status, body); return
             if path == "/api/pax/skills":
                 status, body = _api_pax_skills()

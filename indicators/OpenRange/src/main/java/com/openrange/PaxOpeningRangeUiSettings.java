@@ -72,6 +72,16 @@ public class PaxOpeningRangeUiSettings {
      * spec: docs/superpowers/specs/institutional-chart-markers.md. */
     public boolean showInstitutionalChartEvents = true;
 
+    /** Show small attack-response WATCH labels anchored at each
+     * qualifying OR / extension level. Driven by Pax AI server's
+     * {@code /api/pax/attack-response} endpoint (PaxAttackResponseFetcher
+     * -> PaxAttackResponseSnapshotParser -> PaxAttackResponseLabelPainter).
+     * INDEPENDENT of {@link #showInstitutionalChartEvents}: raw-event
+     * glyphs and these state labels are toggled separately.
+     * WATCH-only - never auto-promotes to EDGE styling without explicit
+     * {@code proven_edge=true} from the endpoint. Default ON. */
+    public boolean showAttackResponseLabels = true;
+
     public PaxOpeningRangeSettings toCalculatorSettings() {
         return new PaxOpeningRangeSettings(
                 LocalTime.of(clamp(startHour, 0, 23), clamp(startMinute, 0, 59), clamp(startSecond, 0, 59)),
