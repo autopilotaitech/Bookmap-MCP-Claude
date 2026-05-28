@@ -162,7 +162,12 @@ def run_daemon(args: argparse.Namespace) -> int:
             #   - bracket compute (FOLLOW=STOP-LIMIT, FADE=LIMIT) + TPs
             #   - eng.place_bracket() call
             # use_claude=False so the daemon never spawns Claude subprocesses.
-            decision_action = decide_and_act(snap, sim, use_claude=False)
+            # --no-auto-decide skips this entirely so an external operator
+            # (pax_manual CLI) can drive trades against the same sim-db.
+            if args.no_auto_decide:
+                decision_action = {"action": "skipped_no_auto_decide"}
+            else:
+                decision_action = decide_and_act(snap, sim, use_claude=False)
             n_placed = 0
             if decision_action.get("action") == "placed_bracket":
                 n_placed = 1
@@ -261,6 +266,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Compute decisions but do not write to the journal.")
     p.add_argument("--once", action="store_true",
                     help="Process a single snapshot and exit.")
+    p.add_argument("--no-auto-decide", action="store_true",
+                    help="Skip decide_and_act(); keep sim.tick(), fills, and "
+                         "journaling. Use when an external operator drives "
+                         "trades via the pax_manual CLI against the same "
+                         "sim-db. SimEngine still ticks every snapshot so "
+                         "fills + brackets work normally.")
     return p
 
 
