@@ -357,3 +357,136 @@ def test_classify_tape_flow_thresholds():
     assert ar._classify_tape_flow({"deltaScore": 0.6, "prints30s": 2}) == ar.TAPE_THIN
     assert ar._classify_tape_flow(None) == ar.TAPE_THIN
     assert ar._classify_tape_flow({"_error": "down"}) == ar.TAPE_THIN
+
+
+# --- regime veto (operator request 2026-05-28: chart labels should match
+#     what institutional_flow is seeing) ----------------------------------
+
+def _bearish_or_h_snap(institutional_flow=None):
+    """Build a snap that would normally produce BEAR_WATCH on OR-H."""
+    snap = _base_snap(
+        levels=[_lvl("OR-H", 30192.0, "above")],
+        events=[
+            _ev("LIQUIDITY_SWEEP", "OR-H", "above"),
+            _ev("ICEBERG_DEFENSE", "OR-H", "above", marker_text="ICE-A"),
+        ],
+        tape_delta=-0.4, tape_n30=15,
+    )
+    if institutional_flow is not None:
+        snap["institutional_flow"] = institutional_flow
+    return snap
+
+
+def test_regime_accumulation_high_conviction_vetoes_bear_watch():
+    snap = _bearish_or_h_snap(institutional_flow={
+        "regime": "ACCUMULATION",
+        "conviction": 0.65,
+    })
+    out = ar.compute_attack_response(snap)
+    # The label that WOULD have been BEAR_WATCH at OR-H is now suppressed.
+    biases = [r["bias"] for r in out["states"]]
+    assert ar.BIAS_BEAR not in biases
+    # Veto reason recorded on the suppressed row
+    for r in out["states"]:
+        if r.get("veto_reason"):
+            assert "ACCUMULATION" in r["veto_reason"]
+            assert r["state"] == ar.STATE_NO_EDGE
+            assert r["bias"] == ar.BIAS_NEUTRAL
+
+
+def test_regime_distribution_high_conviction_vetoes_bull_watch():
+    snap = _base_snap(
+        levels=[_lvl("OR-L", 30145.0, "below")],
+        events=[
+            _ev("LIQUIDITY_SWEEP", "OR-L", "below"),
+            _ev("ICEBERG_DEFENSE", "OR-L", "below", marker_text="ICE-B"),
+            _ev("STACKING", "OR-L", "below"),
+        ],
+        tape_delta=0.6, tape_n30=20,
+    )
+    snap["institutional_flow"] = {"regime": "DISTRIBUTION", "conviction": 0.55}
+    out = ar.compute_attack_response(snap)
+    biases = [r["bias"] for r in out["states"]]
+    # BULL_WATCH that would normally fire is now suppressed
+    assert ar.BIAS_BULL not in biases
+
+
+def test_regime_veto_blocked_below_min_conviction():
+    """Conviction below 0.30 does NOT trigger the veto -- the regime is
+    too weak to confidently override the classifier."""
+    snap = _bearish_or_h_snap(institutional_flow={
+        "regime": "ACCUMULATION",
+        "conviction": 0.20,  # below 0.30 threshold
+    })
+    out = ar.compute_attack_response(snap)
+    biases = [r["bias"] for r in out["states"]]
+    # Veto did not fire -> BEAR_WATCH still present
+    assert ar.BIAS_BEAR in biases
+
+
+def test_regime_balanced_does_not_veto():
+    """When institutional_flow is BALANCED, attack_response classifier is
+    trusted as-is. No veto, no suppression."""
+    snap = _bearish_or_h_snap(institutional_flow={
+        "regime": "BALANCED",
+        "conviction": 0.5,
+    })
+    out = ar.compute_attack_response(snap)
+    biases = [r["bias"] for r in out["states"]]
+    assert ar.BIAS_BEAR in biases
+
+
+def test_regime_transition_does_not_veto():
+    """TRANSITION regime also does not trigger veto -- direction is
+    ambiguous so don't suppress."""
+    snap = _bearish_or_h_snap(institutional_flow={
+        "regime": "TRANSITION",
+        "conviction": 0.7,
+    })
+    out = ar.compute_attack_response(snap)
+    biases = [r["bias"] for r in out["states"]]
+    assert ar.BIAS_BEAR in biases
+
+
+def test_proximity_false_suppresses_label_even_with_events():
+    """Operator bug 2026-05-28: chart showed BEAR_WATCH at +2 when mid
+    was already 40pts past +2. The dashboard sets proximity=False when
+    mid is too far from the level; classifier must respect this and
+    not emit states for stale levels."""
+    snap = _base_snap(
+        levels=[{"label": "+2", "price": 30235.75, "side": "above",
+                 "proximity": False, "distance": -40.0}],
+        events=[
+            _ev("ICEBERG_DEFENSE", "+2", "above", marker_text="ICE-A"),
+        ],
+        tape_delta=-0.4, tape_n30=15,
+    )
+    out = ar.compute_attack_response(snap)
+    # No state should fire because the level is not in proximity
+    assert out["states"] == []
+
+
+def test_proximity_true_still_emits_normally():
+    """Sanity: when proximity=True, classifier emits states as before."""
+    snap = _base_snap(
+        levels=[{"label": "OR-L", "price": 30145.0, "side": "below",
+                 "proximity": True, "distance": -1.0}],
+        events=[
+            _ev("LIQUIDITY_SWEEP", "OR-L", "below"),
+            _ev("ICEBERG_DEFENSE", "OR-L", "below", marker_text="ICE-B"),
+            _ev("STACKING", "OR-L", "below"),
+        ],
+        tape_delta=0.6, tape_n30=20,
+    )
+    out = ar.compute_attack_response(snap)
+    biases = [r["bias"] for r in out["states"]]
+    assert ar.BIAS_BULL in biases
+
+
+def test_no_institutional_flow_field_does_not_break():
+    """When snap has no institutional_flow at all (old contract),
+    classifier behaves the same as before."""
+    snap = _bearish_or_h_snap(institutional_flow=None)
+    out = ar.compute_attack_response(snap)
+    biases = [r["bias"] for r in out["states"]]
+    assert ar.BIAS_BEAR in biases

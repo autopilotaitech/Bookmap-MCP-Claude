@@ -43,6 +43,11 @@ BIAS_BULL    = "BULL_WATCH"
 BIAS_BEAR    = "BEAR_WATCH"
 BIAS_NEUTRAL = "NEUTRAL"
 
+# Minimum institutional_flow conviction required to override the
+# attack-response classifier. Below this conviction the regime is too
+# weak to confidently veto a label.
+_REGIME_VETO_MIN_CONVICTION = 0.30
+
 # Allowed enumerations (exposed for tests + endpoint contract).
 ALLOWED_STATES = frozenset([
     STATE_OR_L_SWEEP_RECLAIM, STATE_OR_H_SWEEP_FAIL,
@@ -251,6 +256,15 @@ def _classify_level(level: Dict[str, Any],
     label = (level.get("label") or "").strip()
     if not label:
         return None
+    # Proximity gate: the dashboard sets level.proximity=False when mid
+    # has moved far enough from this level that it's no longer being
+    # "watched" (in production this is the same proximity flag that
+    # gates per-rung composite scoring). Without this gate, stale events
+    # in the 60s window keep firing states at levels price moved past
+    # long ago (operator caught this 2026-05-28: chart showed
+    # BEAR_WATCH at +2 when mid was already 40 pts above +2).
+    if level.get("proximity") is False:
+        return None
     side = level.get("side") or ("above" if _label_is_above_side(label) else "below")
 
     attack = _attack_from_events(events, side)
@@ -304,10 +318,19 @@ def _classify_level(level: Dict[str, Any],
             drivers.append("sweep_low")
             drivers.append(TAPE_SELL if tape == TAPE_SELL else BOOK_ASK_STACK)
             response = RESPONSE_ACCEPTED
-            state = STATE_OR_L_BREAK_ACCEPT
-            bias = BIAS_BEAR
-            needed = "second push lower with sustained sell tape"
-            invalid = "reclaim of OR-L + buy tape absorbs"
+            if is_ext:
+                # OR_L_BREAK_ACCEPT is semantically an OR-boundary state.
+                # At an extension level the break has already happened by
+                # definition (price reached the extension). Suppress.
+                state = STATE_NO_EDGE
+                bias = BIAS_NEUTRAL
+                needed = "extension already broken; watch next rung"
+                invalid = "n/a"
+            else:
+                state = STATE_OR_L_BREAK_ACCEPT
+                bias = BIAS_BEAR
+                needed = "second push lower with sustained sell tape"
+                invalid = "reclaim of OR-L + buy tape absorbs"
         else:
             drivers.append("sweep_low")
             if bull_passive: drivers.append("conflicting_bid_evidence")
@@ -347,10 +370,16 @@ def _classify_level(level: Dict[str, Any],
             drivers.append("sweep_high")
             drivers.append(TAPE_BUY if tape == TAPE_BUY else BOOK_BID_STACK)
             response = RESPONSE_ACCEPTED
-            state = STATE_OR_H_BREAK_ACCEPT
-            bias = BIAS_BULL
-            needed = "second push higher with sustained buy tape"
-            invalid = "reclaim of OR-H + sell tape absorbs"
+            if is_ext:
+                state = STATE_NO_EDGE
+                bias = BIAS_NEUTRAL
+                needed = "extension already broken; watch next rung"
+                invalid = "n/a"
+            else:
+                state = STATE_OR_H_BREAK_ACCEPT
+                bias = BIAS_BULL
+                needed = "second push higher with sustained buy tape"
+                invalid = "reclaim of OR-H + sell tape absorbs"
         else:
             drivers.append("sweep_high")
             if bear_passive: drivers.append("conflicting_ask_evidence")
@@ -367,10 +396,16 @@ def _classify_level(level: Dict[str, Any],
             drivers.append(TAPE_BUY)
             if bid_stack: drivers.append(BOOK_BID_STACK)
             response = RESPONSE_ACCEPTED
-            state = STATE_OR_H_BREAK_ACCEPT
-            bias = BIAS_BULL
-            needed = "hold above the level on retest with buy tape"
-            invalid = "lose level + sell tape"
+            if is_ext:
+                state = STATE_NO_EDGE
+                bias = BIAS_NEUTRAL
+                needed = "extension already broken; watch next rung"
+                invalid = "n/a"
+            else:
+                state = STATE_OR_H_BREAK_ACCEPT
+                bias = BIAS_BULL
+                needed = "hold above the level on retest with buy tape"
+                invalid = "lose level + sell tape"
         elif bear_passive or tape == TAPE_SELL:
             drivers.append(ATTACK_BREAK_UP.lower())
             if bear_passive:
@@ -378,10 +413,19 @@ def _classify_level(level: Dict[str, Any],
                                else PASSIVE_ASK_ABSORB)
             if tape == TAPE_SELL: drivers.append(TAPE_SELL)
             response = RESPONSE_REJECTED
-            state = STATE_OR_H_SWEEP_FAIL
-            bias = BIAS_BEAR
-            needed = "lose the level and reject"
-            invalid = "new high + buy tape continues"
+            if is_ext:
+                # Rejection at an extension = EXT_HIGH_EXHAUST in the
+                # closed vocab.
+                state = STATE_EXT_HIGH_EXHAUST
+                bias = BIAS_BEAR
+                needed = (f"reclaim toward OR-H; reject above the {label} "
+                          f"rung")
+                invalid = "new high through the level + buy tape continues"
+            else:
+                state = STATE_OR_H_SWEEP_FAIL
+                bias = BIAS_BEAR
+                needed = "lose the level and reject"
+                invalid = "new high + buy tape continues"
         else:
             drivers.append(ATTACK_BREAK_UP.lower())
             state = STATE_NO_EDGE
@@ -396,10 +440,16 @@ def _classify_level(level: Dict[str, Any],
             drivers.append(TAPE_SELL)
             if ask_stack: drivers.append(BOOK_ASK_STACK)
             response = RESPONSE_ACCEPTED
-            state = STATE_OR_L_BREAK_ACCEPT
-            bias = BIAS_BEAR
-            needed = "hold below the level on retest with sell tape"
-            invalid = "reclaim + buy tape"
+            if is_ext:
+                state = STATE_NO_EDGE
+                bias = BIAS_NEUTRAL
+                needed = "extension already broken; watch next rung"
+                invalid = "n/a"
+            else:
+                state = STATE_OR_L_BREAK_ACCEPT
+                bias = BIAS_BEAR
+                needed = "hold below the level on retest with sell tape"
+                invalid = "reclaim + buy tape"
         elif bull_passive or tape == TAPE_BUY:
             drivers.append(ATTACK_BREAK_DOWN.lower())
             if bull_passive:
@@ -407,10 +457,19 @@ def _classify_level(level: Dict[str, Any],
                                else PASSIVE_BID_ABSORB)
             if tape == TAPE_BUY: drivers.append(TAPE_BUY)
             response = RESPONSE_RECLAIMED
-            state = STATE_OR_L_SWEEP_RECLAIM
-            bias = BIAS_BULL
-            needed = "reclaim and hold above the level"
-            invalid = "new low + sell tape continues"
+            if is_ext:
+                # Reclaim at low-extension = EXT_LOW_EXHAUST (selling
+                # exhausted at the rung, expect reversal up).
+                state = STATE_EXT_LOW_EXHAUST
+                bias = BIAS_BULL
+                needed = (f"reclaim toward OR-L; hold above the {label} "
+                          f"rung")
+                invalid = "new low through the level + sell tape continues"
+            else:
+                state = STATE_OR_L_SWEEP_RECLAIM
+                bias = BIAS_BULL
+                needed = "reclaim and hold above the level"
+                invalid = "new low + sell tape continues"
         else:
             drivers.append(ATTACK_BREAK_DOWN.lower())
             state = STATE_NO_EDGE
@@ -585,6 +644,21 @@ def compute_attack_response(snap: Optional[Dict[str, Any]],
 
     tape = _classify_tape_flow(snap.get("tape_flow"))
 
+    # Read institutional_flow regime + conviction so we can veto labels
+    # that contradict a clear regime call. Operator stated 2026-05-28
+    # that chart labels should match what institutional_flow is seeing.
+    inst_flow = snap.get("institutional_flow") or {}
+    if isinstance(inst_flow, dict) and not inst_flow.get("_error"):
+        regime_label = (inst_flow.get("regime") or "").upper()
+        try:
+            regime_conv = float(inst_flow.get("conviction") or 0.0)
+        except (TypeError, ValueError):
+            regime_conv = 0.0
+    else:
+        regime_label = ""
+        regime_conv = 0.0
+    regime_strong = regime_conv >= _REGIME_VETO_MIN_CONVICTION
+
     out: List[Dict[str, Any]] = []
     seen_ids: Set[str] = set()
     for level in levels:
@@ -607,6 +681,25 @@ def compute_attack_response(snap: Optional[Dict[str, Any]],
         # Closed-vocab guard (defense in depth).
         if row["state"] not in ALLOWED_STATES or row["bias"] not in ALLOWED_BIASES:
             continue
+        # Regime veto: if institutional_flow has a strong-conviction regime
+        # that contradicts this row's bias, suppress the row by collapsing
+        # it to NO_EDGE/NEUTRAL. The Java painter drops these defensively
+        # so the contradicting label never renders on chart.
+        if regime_strong:
+            if regime_label == "ACCUMULATION" and row["bias"] == BIAS_BEAR:
+                row["state"] = STATE_NO_EDGE
+                row["bias"] = BIAS_NEUTRAL
+                row["veto_reason"] = (
+                    f"institutional_flow=ACCUMULATION conv={regime_conv:.2f} "
+                    f"contradicts {row.get('state','')}/BEAR_WATCH"
+                )
+            elif regime_label == "DISTRIBUTION" and row["bias"] == BIAS_BULL:
+                row["state"] = STATE_NO_EDGE
+                row["bias"] = BIAS_NEUTRAL
+                row["veto_reason"] = (
+                    f"institutional_flow=DISTRIBUTION conv={regime_conv:.2f} "
+                    f"contradicts {row.get('state','')}/BULL_WATCH"
+                )
         out.append(row)
 
     return {
