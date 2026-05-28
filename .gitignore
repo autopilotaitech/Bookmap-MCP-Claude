@@ -46,6 +46,16 @@ Thumbs.db
 
 # Claude Code per-user permission grants (machine-local)
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# Live session snapshots + diagnostic logs (regenerated). Only commit the
+# capture/diagnostic scripts; the per-poll JSON dumps and build logs are noise.
+_session_snapshots/*
+!_session_snapshots/*.ps1
+!_session_snapshots/README.md
+
+# Ad-hoc one-shot snapshot dumps written by quick PowerShell checks.
+_snapshot_now.json
 
 # Phase 4B/5A bus-tools report outputs (generated; not source)
 reports/bus-eod-*.md

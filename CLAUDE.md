@@ -236,6 +236,24 @@ the launcher defaults to the Rithmic NQ alias.
   re-exports every signal helper from dashboard.py with no bridge
   dependency. Non-dashboard consumers (pax_daemon, replay tools,
   research notebooks) import from here.
+- `mcp-server/bookmap_mcp/institutional_flow.py` — continuous regime
+  aggregator (ACCUMULATION / DISTRIBUTION / BALANCED / TRANSITION) over
+  pull_stack / lt_liquidity / flow.* / micro_events with research-grounded
+  weights (Cont/Kukanov OFI). Tracks rotation_state per OR commit using
+  NQ=65pt / ES=15pt stride. Emits chart triangles into
+  `snap["institutional_chart_events"]` (label `IFL`, green up = LONG,
+  red down = SHORT, deduped per 60s bucket). Pure deterministic, no LLM.
+  Spec: `docs/superpowers/specs/2026-05-27-institutional-flow-tracker-design.md`.
+- `mcp-server/bookmap_mcp/or_day_ledger.py` — per-session OR + extension
+  audit log. Tracks anchor metadata, first commit time/direction, max
+  rotations above/below, peak extremes, whipsaw count, final_status
+  (HELD / BROKE_UP / BROKE_DOWN / TWO_SIDED / WHIPSAW). Classifies session
+  type from anchor: 17:00 CT -> ETH, 08:30 CT -> RTH, 02:00 CT -> EU.
+  Writes append-only `D:/BookmapLogs/or-day-ledger.csv` on session
+  boundary; overwrites `D:/BookmapLogs/or-day-ledger-current.json` every
+  tick with in-progress state. **In-memory state resets on dashboard
+  restart** -- tonight's row will only cover the post-restart portion of
+  the session unless you backfill from captured snapshots.
 - `mcp-server/bookmap_mcp/sim_engine.py` — local SQLite-backed paper
   broker. Bracket children gated by `armed_after_parent_fill` (Phase 0
   fix). EOD auto-flatten at 15:00 CT; pass `eod_close_hour_ct=None`
