@@ -99,6 +99,29 @@ class InstrumentStateTest {
         assertEquals(28885.0, s.recentTradesSnapshot(1).get(0).price(), 1e-9);
     }
 
+    @Test
+    void zeroSizeTradesDoNotEnterRecentTradesDeque() {
+        // J1 fix (2026-05-28): Bookmap onTrade delivers many size=0 events
+        // (~39% of stream per live diagnostic 2026-05-28 1372/3523). These are
+        // MBO metadata markers, not trades. They polluted recent_trades and
+        // tape_buckets and broke the institutional-presence reads on the
+        // operator's dial-in dashboard. Verify size=0 events are filtered
+        // out of recentTrades while size>0 events still land normally.
+        InstrumentState s = newState();
+        s.onTrade(100.0, 1, true);
+        s.onTrade(100.0, 0, true);   // noise - must not enter deque
+        s.onTrade(100.0, 0, false);  // noise - must not enter deque
+        s.onTrade(101.0, 25, true);  // real institutional print
+
+        List<TradeRecord> recent = s.recentTradesSnapshot(10);
+        assertEquals(2, recent.size(),
+                "size=0 events must be filtered out of recentTrades");
+        assertEquals(25.25, recent.get(0).price(), 1e-9);
+        assertEquals(25, recent.get(0).size());
+        assertEquals(25.0, recent.get(1).price(), 1e-9);
+        assertEquals(1, recent.get(1).size());
+    }
+
     // --- VWAP ---
 
     private static long nanosAt(ZonedDateTime t) {

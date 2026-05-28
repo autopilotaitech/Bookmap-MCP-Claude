@@ -547,9 +547,22 @@ public final class InstrumentState {
         this.lastTradePrice = price;
         long nowMs = nowMs();
         TradeRecord record = new TradeRecord(price, size, bidAggressor, lastSeenNanos);
-        synchronized (tradesLock) {
-            if (recentTrades.size() == TRADES_CAPACITY) recentTrades.pollFirst();
-            recentTrades.addLast(record);
+        // J1 fix (2026-05-28 dial-in): Bookmap's onTrade callback delivers
+        // size=0 events as ~39% of the stream (live-confirmed via
+        // tape_fragmentation_log.jsonl, 1372/3523 events). These are not
+        // real trades - they're MBO-level metadata markers (order add/cancel
+        // bookkeeping) that polluted recent_trades + tape_buckets and caused
+        // false "no institutional flow" reads on the dial-in dashboard.
+        // Conservative filter: skip the recentTrades / tape_buckets path
+        // only. Other downstream feeds (CVD, VWAP, FlowRegime, etc.) below
+        // are unchanged because (a) they multiply by size so size=0 has no
+        // numeric impact, and (b) we do not yet know if any of them rely on
+        // the zero-size event as a state marker.
+        if (size > 0) {
+            synchronized (tradesLock) {
+                if (recentTrades.size() == TRADES_CAPACITY) recentTrades.pollFirst();
+                recentTrades.addLast(record);
+            }
         }
         // VWAP — OR-session accumulator. Anchor is the most-recent OR open
         // (set via /config rth_open from the OpenRange indicator). Trades
