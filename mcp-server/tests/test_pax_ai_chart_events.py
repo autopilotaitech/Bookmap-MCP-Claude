@@ -25,6 +25,7 @@ from pathlib import Path
 from bookmap_mcp.pax_ai_chart_events import (
     read_pax_ai_chart_events,
     pax_ai_row_to_chart_event,
+    compute_pax_ai_chart_events_status,
     AI_BULL_COLOR,
     AI_BEAR_COLOR,
     AI_NEUTRAL_COLOR,
@@ -373,3 +374,42 @@ def test_expired_rows_dropped_end_to_end(tmp_path, monkeypatch):
                                         alias="NQM6.CME@RITHMIC",
                                         now_ms=(mod.DEFAULT_TTL_SEC + 60) * 1000)
     assert out == []
+
+
+def test_status_exposes_expired_valid_rows(tmp_path, monkeypatch):
+    from bookmap_mcp import pax_ai_chart_events as mod
+    p = tmp_path / "store.jsonl"
+    monkeypatch.setattr(mod, "DEFAULT_STORE_PATH", p)
+    _write_signal(p, id="pax_ai|old", alias="NQM6.CME@RITHMIC",
+                  action="WAIT_FOR_CONFIRM", direction="NONE",
+                  timestamp_ms=1_000)
+
+    status = compute_pax_ai_chart_events_status({
+        "alias": "NQM6.CME@RITHMIC", "health": "ok",
+    })
+
+    assert status["store_exists"] is True
+    assert status["rows_total"] == 1
+    assert status["rows_expired"] == 1
+    assert status["rows_mapped"] == 0
+    assert status["newest_action"] == "WAIT_FOR_CONFIRM"
+    assert status["newest_age_ms"] is not None
+
+
+def test_status_exposes_unknown_action_rows(tmp_path, monkeypatch):
+    from bookmap_mcp import pax_ai_chart_events as mod
+    p = tmp_path / "store.jsonl"
+    monkeypatch.setattr(mod, "DEFAULT_STORE_PATH", p)
+    row = _direct_event("BIAS_SIGNAL", "SHORT")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row) + "\n")
+
+    status = compute_pax_ai_chart_events_status({
+        "alias": "NQM6.CME@RITHMIC", "health": "ok",
+    })
+
+    assert status["rows_total"] == 1
+    assert status["rows_unknown_action"] == 1
+    assert status["rows_mapped"] == 0
+    assert status["newest_action"] == "BIAS_SIGNAL"

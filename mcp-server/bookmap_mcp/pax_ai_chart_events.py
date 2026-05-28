@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 DEFAULT_STORE_PATH = Path(r"D:\BookmapLogs\pax-ai-chart-signals.jsonl")
@@ -137,6 +137,111 @@ def pax_ai_row_to_chart_event(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def _row_timestamp_ms(row: Dict[str, Any]) -> Optional[int]:
+    ts = row.get("timestamp_ms")
+    if isinstance(ts, (int, float)):
+        return int(ts)
+    return None
+
+
+def _scan_store(store_path: Optional[Path],
+                now_ms: Optional[int],
+                ttl_sec: int,
+                alias: Optional[str]) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    """Scan the JSONL store once and return diagnostics + active rows by id.
+
+    This is the shared source of truth for ``read_pax_ai_chart_events`` and
+    the operator-facing status payload. Keeping the count path and render path
+    together prevents the dashboard from saying "active" for rows that the
+    chart reader would later reject.
+    """
+    path = Path(store_path) if store_path else DEFAULT_STORE_PATH
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    cutoff = now - (ttl_sec * 1000)
+    alias_filter = alias if isinstance(alias, str) and alias else None
+    diag: Dict[str, Any] = {
+        "store_path": str(path),
+        "store_exists": path.exists(),
+        "ttl_sec": ttl_sec,
+        "alias_filter": alias_filter or "",
+        "rows_total": 0,
+        "rows_malformed": 0,
+        "rows_missing_id": 0,
+        "rows_alias_mismatch": 0,
+        "rows_expired": 0,
+        "rows_unknown_action": 0,
+        "rows_bad_combo": 0,
+        "rows_candidate": 0,
+        "rows_active_deduped": 0,
+        "rows_mapped": 0,
+        "newest_timestamp_ms": 0,
+        "newest_age_ms": None,
+        "newest_action": "",
+        "newest_accepted_timestamp_ms": 0,
+        "newest_accepted_age_ms": None,
+        "newest_accepted_action": "",
+        "last_error": "",
+    }
+    by_id: Dict[str, Dict[str, Any]] = {}
+    if not path.exists():
+        return diag, by_id
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                diag["rows_total"] += 1
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    diag["rows_malformed"] += 1
+                    continue
+                if not isinstance(row, dict):
+                    diag["rows_malformed"] += 1
+                    continue
+                ts = _row_timestamp_ms(row)
+                if ts is not None and ts >= int(diag["newest_timestamp_ms"] or 0):
+                    diag["newest_timestamp_ms"] = ts
+                    diag["newest_action"] = str(row.get("action") or "")
+                rid = row.get("id")
+                if not rid:
+                    diag["rows_missing_id"] += 1
+                    continue
+                if alias_filter is not None and row.get("alias") != alias_filter:
+                    diag["rows_alias_mismatch"] += 1
+                    continue
+                if ts is None or ts < cutoff:
+                    diag["rows_expired"] += 1
+                    continue
+                action = row.get("action")
+                direction = row.get("direction") or "NONE"
+                if action not in _ACTION_TO_EVENT_TYPE:
+                    diag["rows_unknown_action"] += 1
+                    continue
+                if not _combo_ok(action, direction):
+                    diag["rows_bad_combo"] += 1
+                    continue
+                diag["rows_candidate"] += 1
+                if ts >= int(diag["newest_accepted_timestamp_ms"] or 0):
+                    diag["newest_accepted_timestamp_ms"] = ts
+                    diag["newest_accepted_action"] = str(action or "")
+                prev = by_id.get(str(rid))
+                if prev is None or row.get("timestamp_ms", 0) >= prev.get("timestamp_ms", 0):
+                    by_id[str(rid)] = row
+    except OSError as exc:
+        diag["last_error"] = exc.__class__.__name__
+        return diag, {}
+    diag["rows_active_deduped"] = len(by_id)
+    newest = int(diag["newest_timestamp_ms"] or 0)
+    if newest > 0:
+        diag["newest_age_ms"] = max(0, now - newest)
+    newest_acc = int(diag["newest_accepted_timestamp_ms"] or 0)
+    if newest_acc > 0:
+        diag["newest_accepted_age_ms"] = max(0, now - newest_acc)
+    return diag, by_id
+
+
 def read_pax_ai_chart_events(store_path: Optional[Path] = None,
                               now_ms: Optional[int] = None,
                               ttl_sec: int = DEFAULT_TTL_SEC,
@@ -151,40 +256,7 @@ def read_pax_ai_chart_events(store_path: Optional[Path] = None,
     When ``alias`` is None or empty, all rows pass through. The composer
     always supplies an alias; the unfiltered path is for ad-hoc tooling.
     """
-    path = Path(store_path) if store_path else DEFAULT_STORE_PATH
-    if not path.exists():
-        return []
-    now = now_ms if now_ms is not None else int(time.time() * 1000)
-    cutoff = now - (ttl_sec * 1000)
-    by_id: Dict[str, Dict[str, Any]] = {}
-    alias_filter = alias if isinstance(alias, str) and alias else None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for raw in f:
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    # Partial / malformed line. Skip; do NOT raise into
-                    # the snapshot path.
-                    continue
-                if not isinstance(row, dict):
-                    continue
-                ts = row.get("timestamp_ms")
-                if not isinstance(ts, (int, float)) or ts < cutoff:
-                    continue
-                rid = row.get("id")
-                if not rid:
-                    continue
-                if alias_filter is not None and row.get("alias") != alias_filter:
-                    continue
-                prev = by_id.get(rid)
-                if prev is None or row.get("timestamp_ms", 0) >= prev.get("timestamp_ms", 0):
-                    by_id[rid] = row
-    except OSError:
-        return []
+    _, by_id = _scan_store(store_path, now_ms, ttl_sec, alias)
     out: List[Dict[str, Any]] = []
     for row in sorted(by_id.values(), key=lambda r: r.get("timestamp_ms", 0)):
         ev = pax_ai_row_to_chart_event(row)
@@ -208,3 +280,26 @@ def compute_pax_ai_chart_events(snap: Dict[str, Any]) -> List[Dict[str, Any]]:
             alias = a
     return read_pax_ai_chart_events(now_ms=int(time.time() * 1000),
                                      alias=alias)
+
+
+def compute_pax_ai_chart_events_status(snap: Dict[str, Any]) -> Dict[str, Any]:
+    """Return operator-facing diagnostics for why AI chart events are empty.
+
+    The status uses the same filters as ``compute_pax_ai_chart_events``:
+    store path, TTL, alias, action enum, and action/direction combo. It is
+    intentionally cheap and side-effect free so the snapshot composer can
+    publish it on every tick.
+    """
+    alias = None
+    if isinstance(snap, dict):
+        a = snap.get("alias")
+        if isinstance(a, str) and a:
+            alias = a
+    diag, by_id = _scan_store(None, int(time.time() * 1000),
+                              DEFAULT_TTL_SEC, alias)
+    mapped = 0
+    for row in by_id.values():
+        if pax_ai_row_to_chart_event(row) is not None:
+            mapped += 1
+    diag["rows_mapped"] = mapped
+    return diag

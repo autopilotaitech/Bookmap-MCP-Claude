@@ -27,7 +27,18 @@ from . import settings as _settings
 from . import or_session as _or_session
 from .bridge_client import BridgeClient, BridgeError
 from .config import BridgeConfig, MissingTokenError, _config_path as _bridge_config_path
-from .pax_ai_chart_events import compute_pax_ai_chart_events
+from .ifl_outcomes import update_ifl_outcomes
+from .institutional_flow import (
+    compute_institutional_flow,
+    build_flow_chart_events,
+)
+from .or_day_ledger import update_or_day_ledger
+from .or_level_crossings import update_or_level_crossings
+from .ifl_rich_signals import emit_rich_signals
+from .pax_ai_chart_events import (
+    compute_pax_ai_chart_events,
+    compute_pax_ai_chart_events_status,
+)
 
 # Set by main() at startup so /api/snapshot offline payloads can report
 # which port the operator hit. None until the HTTP server has bound.
@@ -5271,12 +5282,37 @@ def _compose_alias_snapshot(c, cfg, alias: str,
     snap["pax"]       = _safe_call(pax_decision,      "pax_decision")
     snap["institutional_signals"] = _safe_call(
         compute_institutional_signals, "compute_institutional_signals")
+    snap["institutional_flow"] = _safe_call(
+        compute_institutional_flow, "compute_institutional_flow")
+    snap["ifl_outcomes"] = _safe_call(
+        update_ifl_outcomes, "update_ifl_outcomes")
+    snap["or_day_ledger"] = _safe_call(
+        update_or_day_ledger, "update_or_day_ledger")
+    snap["or_level_crossings"] = _safe_call(
+        update_or_level_crossings, "update_or_level_crossings")
+    # Deterministic rich chart-signal emitter -> pax-ai-chart-signals.jsonl
+    # (replaces LLM hallucinations with deterministic content; operator
+    # directive 2026-05-28 "use that box ... you are now in control").
+    snap["ifl_rich_signals"] = _safe_call(emit_rich_signals, "emit_rich_signals")
     snap["institutional_chart_events"] = _safe_call(
         compute_institutional_chart_events, "compute_institutional_chart_events")
+    try:
+        _flow_obj = snap.get("institutional_flow")
+        _base_events = snap.get("institutional_chart_events")
+        if isinstance(_flow_obj, dict) and not _flow_obj.get("_error") and isinstance(_base_events, list):
+            _flow_events = build_flow_chart_events(_flow_obj, snap)
+            if _flow_events:
+                _base_events.extend(_flow_events)
+    except Exception as _flow_err:
+        sys.stderr.write(f"[dashboard] build_flow_chart_events({alias}) crashed: "
+                         f"{type(_flow_err).__name__}: {_flow_err}\n")
     # Pax AI -> chart bridge. Reads the cross-process JSONL store; never
     # raises into snapshot composition.
     snap["pax_ai_chart_events"] = _safe_call(
         compute_pax_ai_chart_events, "compute_pax_ai_chart_events") or []
+    snap["pax_ai_chart_events_status"] = _safe_call(
+        compute_pax_ai_chart_events_status,
+        "compute_pax_ai_chart_events_status") or {}
     # SIM trades from local sim engine (read-only — agent process owns writes)
     try:
         from .sim_engine import SimEngine
