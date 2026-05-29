@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import subprocess
 import sqlite3
 import sys
 import time
@@ -35,9 +36,12 @@ class OverviewQueries:
     the daemon's audit trail."""
 
     def __init__(self, journal_path: Path,
-                  sim_db_path: Optional[Path] = None) -> None:
+                  sim_db_path: Optional[Path] = None,
+                  learn_dir: Optional[Path] = None) -> None:
         self.journal_path = Path(journal_path)
         self.sim_db_path = Path(sim_db_path) if sim_db_path else None
+        self.learn_dir = Path(learn_dir) if learn_dir \
+            else Path(r"D:\BookmapLogs\pax-agent")
 
     def _journal(self) -> sqlite3.Connection:
         c = sqlite3.connect(
@@ -186,6 +190,131 @@ class OverviewQueries:
         except sqlite3.OperationalError:
             return []
 
+    # ─── agentic sim trader (learning store + sim P&L) ──────────────
+
+    def agent_feed(self, limit: int = 80) -> List[Dict[str, Any]]:
+        # Tail only the last `limit` lines (the log grows every heartbeat;
+        # slurping the whole file on each :18890 poll was a needless read).
+        try:
+            from .pax_sim_tools import tail_lines
+            lines = tail_lines(self.learn_dir / "agent-loop.jsonl", limit)
+        except Exception:
+            return []
+        out: List[Dict[str, Any]] = []
+        for ln in lines:
+            try:
+                out.append(json.loads(ln))
+            except json.JSONDecodeError:
+                pass
+        return out
+
+    def calibration(self) -> Dict[str, Any]:
+        try:
+            return json.loads((self.learn_dir / "calibration.json").read_text(
+                encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def lessons(self, limit: int = 40) -> List[str]:
+        try:
+            ls = [l.strip() for l in (self.learn_dir / "sim_lessons.md").read_text(
+                encoding="utf-8").splitlines() if l.strip()]
+            return ls[-limit:]
+        except OSError:
+            return []
+
+    def equity_curve(self, limit: int = 1000) -> Dict[str, Any]:
+        c = self._sim()
+        if c is None:
+            return {"points": [], "realized": 0.0}
+        try:
+            rows = c.execute(
+                "SELECT ts_ms, json_extract(payload,'$.realized_delta') AS rd "
+                "FROM events WHERE kind='POSITION_UPDATE' ORDER BY ts_ms LIMIT ?",
+                (limit,)).fetchall()
+            cum = 0.0
+            pts: List[Dict[str, Any]] = []
+            wins = losses = 0
+            for r in rows:
+                rd = float(r["rd"] or 0.0)
+                if rd > 0: wins += 1
+                elif rd < 0: losses += 1
+                cum += rd
+                pts.append({"ts": r["ts_ms"], "eq": round(cum, 2)})
+            return {"points": pts, "realized": round(cum, 2),
+                    "wins": wins, "losses": losses}
+        except sqlite3.OperationalError:
+            return {"points": [], "realized": 0.0}
+        finally:
+            c.close()
+
+    def recent_fills(self, limit: int = 30) -> List[Dict[str, Any]]:
+        c = self._sim()
+        if c is None:
+            return []
+        try:
+            rows = c.execute(
+                "SELECT id, side, type, qty, filled_price, filled_ms, role, "
+                "reason, decision_tag FROM orders WHERE status='FILLED' "
+                "ORDER BY filled_ms DESC LIMIT ?", (limit,)).fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.OperationalError:
+            return []
+        finally:
+            c.close()
+
+    def agent_summary(self) -> Dict[str, Any]:
+        from collections import Counter
+        feed = self.agent_feed(limit=500)
+        acts: Counter = Counter(f.get("action") or "?" for f in feed)
+        executed = sum(1 for f in feed if f.get("executed"))
+        vetoes = sum(1 for f in feed if str(f.get("governor") or "").startswith("VETO"))
+        deviations = sum(1 for f in feed if f.get("deviates"))
+        eq = self.equity_curve()
+        pos = self.current_position()
+        last = feed[-1] if feed else None
+        armed = bool(last.get("armed")) if last else False
+        wins, losses = eq.get("wins", 0), eq.get("losses", 0)
+        wr = round(100.0 * wins / (wins + losses), 1) if (wins + losses) else None
+        return {
+            "cycles": len(feed), "executed": executed, "vetoes": vetoes,
+            "deviations": deviations, "actions": dict(acts),
+            "realized": eq["realized"], "wins": wins, "losses": losses,
+            "win_rate": wr, "armed": armed, "last": last,
+            "position": pos,
+        }
+
+    def cron_status(self, task_name: str = "PaxAgentCron") -> Dict[str, Any]:
+        """Best-effort read of Windows Task Scheduler state for cron agent."""
+        if sys.platform != "win32":
+            return {"available": False, "reason": "not_windows"}
+        ps = (
+            "$t=Get-ScheduledTask -TaskName '%s' -ErrorAction SilentlyContinue; "
+            "if($null -eq $t){'{\"installed\":false}'; exit 0}; "
+            "$i=Get-ScheduledTaskInfo -TaskName '%s'; "
+            "$a=$t.Actions | Select-Object -First 1; "
+            "[pscustomobject]@{installed=$true;taskName=$t.TaskName;state=$t.State.ToString();"
+            "execute=$a.Execute;arguments=$a.Arguments;workingDirectory=$a.WorkingDirectory;"
+            "lastRunTime=$i.LastRunTime;lastTaskResult=$i.LastTaskResult;nextRunTime=$i.NextRunTime;"
+            "missedRuns=$i.NumberOfMissedRuns} | ConvertTo-Json -Compress"
+        ) % (task_name, task_name)
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-Command", ps],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=3.0)
+        except Exception as exc:
+            return {"available": False, "error": str(exc)}
+        if r.returncode != 0:
+            return {"available": False, "error": (r.stderr or r.stdout)[:500]}
+        try:
+            out = json.loads((r.stdout or "").strip() or "{}")
+        except json.JSONDecodeError:
+            return {"available": False, "error": (r.stdout or "")[:500]}
+        out["available"] = True
+        return out
+
 
 # ─── HTTP handler ───────────────────────────────────────────────────────
 
@@ -243,6 +372,20 @@ def _build_handler(queries: OverviewQueries) -> type:
                     return _json_response(self, queries.setup_winrates())
                 if path == "/api/errors":
                     return _json_response(self, queries.errors())
+                if path == "/api/agent_summary":
+                    return _json_response(self, queries.agent_summary())
+                if path == "/api/agent_feed":
+                    return _json_response(self, queries.agent_feed())
+                if path == "/api/cron_status":
+                    return _json_response(self, queries.cron_status())
+                if path == "/api/calibration":
+                    return _json_response(self, queries.calibration())
+                if path == "/api/equity":
+                    return _json_response(self, queries.equity_curve())
+                if path == "/api/fills":
+                    return _json_response(self, queries.recent_fills())
+                if path == "/api/lessons":
+                    return _json_response(self, queries.lessons())
                 return self.send_error(404, f"unknown path: {path}")
             except Exception as exc:   # pragma: no cover — defensive
                 return _json_response(self,
@@ -259,215 +402,232 @@ _PAGE_HTML = """<!doctype html>
 <meta charset="utf-8">
 <title>Pax Overview</title>
 <style>
-  body { font-family: ui-monospace, monospace; background: #1a1b26;
-          color: #c0caf5; margin: 10px; }
-  details { background: #24283b; border: 1px solid #414868;
-             border-radius: 6px; margin-bottom: 8px; padding: 6px 10px; }
-  details > summary { cursor: pointer; font-weight: 600; padding: 4px 0;
-                       list-style: revert; }
-  details[open] > summary { color: #7aa2f7; }
-  .kv { display: flex; justify-content: space-between; padding: 2px 0; }
-  .kv .k { color: #9aa5ce; }
-  .kv .v { color: #c0caf5; }
-  table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  th, td { padding: 4px 6px; text-align: left;
-            border-bottom: 1px solid #2f334d; }
-  th { color: #9aa5ce; }
-  .ok { color: #9ece6a; } .warn { color: #e0af68; } .err { color: #f7768e; }
-  .muted { color: #565f89; }
-  #refresh-status { float: right; color: #565f89; font-size: 11px; }
+  :root{
+    --bg:#070a10; --txt:#dbe4f3; --muted:#6b7891; --line:rgba(255,255,255,0.07);
+    --glass:rgba(255,255,255,0.035); --glass2:rgba(255,255,255,0.05);
+    --grn:#34d399; --red:#fb7185; --cyan:#38bdf8; --amber:#fbbf24; --violet:#a78bfa;
+  }
+  *{box-sizing:border-box}
+  body{font-family:'Inter',system-ui,-apple-system,Segoe UI,sans-serif;
+    background:radial-gradient(120% 90% at 15% -10%,#13203a 0%,#0a1018 45%,var(--bg) 100%) fixed;
+    color:var(--txt); margin:0; padding:18px; min-height:100vh; font-size:13px;}
+  .head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+  .head h1{font-size:16px;font-weight:700;letter-spacing:.14em;margin:0;
+    background:linear-gradient(90deg,#7dd3fc,#a78bfa);-webkit-background-clip:text;
+    -webkit-text-fill-color:transparent}
+  .head .meta{font-size:11px;color:var(--muted);font-family:ui-monospace,monospace}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#445;margin-right:6px;vertical-align:middle}
+  .dot.on{background:var(--grn);box-shadow:0 0 8px var(--grn)}
+  .dot.armed{background:var(--red);box-shadow:0 0 8px var(--red)}
+  .card{background:var(--glass);border:1px solid var(--line);border-radius:14px;
+    padding:14px 16px;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+    box-shadow:0 8px 30px rgba(0,0,0,.35)}
+  .grid{display:grid;gap:12px}
+  .stats{grid-template-columns:repeat(6,1fr);margin-bottom:12px}
+  .stat .lbl{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+  .stat .val{font-size:22px;font-weight:700;font-family:ui-monospace,monospace;margin-top:4px}
+  .stat .sub{font-size:10px;color:var(--muted);margin-top:2px}
+  .cols{grid-template-columns:1.3fr 1fr;align-items:start}
+  .ttl{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#93a3bd;
+    margin:0 0 10px;font-weight:600}
+  .pos{color:var(--grn)} .neg{color:var(--red)} .mut{color:var(--muted)}
+  .feed{font-family:ui-monospace,monospace;font-size:11.5px;max-height:340px;overflow:auto}
+  .feed .row{padding:3px 0;border-left:2px solid #1d2738;padding-left:9px;margin-bottom:2px;color:#9fb0c8}
+  .feed .row.long{color:var(--grn);border-left-color:#2a7a55}
+  .feed .row.short{color:var(--red);border-left-color:#7a2a40}
+  .feed .row.wait{color:#6f7c92}
+  .feed .row .t{color:#566;margin-right:8px}
+  .feed .row .why{color:#7d8aa0}
+  table{width:100%;border-collapse:collapse;font-size:11.5px;font-family:ui-monospace,monospace}
+  th,td{padding:5px 6px;text-align:left;border-bottom:1px solid rgba(255,255,255,.05)}
+  th{color:var(--muted);font-weight:600;text-transform:uppercase;font-size:9.5px;letter-spacing:.08em}
+  .bar{display:flex;align-items:center;gap:8px;margin:5px 0;font-family:ui-monospace,monospace;font-size:11px}
+  .bar .name{width:78px;color:#9fb0c8}
+  .bar .track{flex:1;height:8px;background:rgba(255,255,255,.05);border-radius:4px;overflow:hidden}
+  .bar .fill{height:100%;border-radius:4px;background:linear-gradient(90deg,#38bdf8,#a78bfa)}
+  .bar .n{width:34px;text-align:right;color:var(--muted)}
+  .lessons{max-height:200px;overflow:auto;font-size:11.5px}
+  .lessons div{padding:3px 0;color:#9fb0c8;border-bottom:1px solid rgba(255,255,255,.04)}
+  .gap{margin-top:12px}
+  .pill{display:inline-block;padding:2px 8px;border-radius:20px;font-size:10px;
+    font-family:ui-monospace,monospace;border:1px solid var(--line)}
+  .mono{font-family:ui-monospace,monospace;font-size:11px;color:#9fb0c8;line-height:1.45}
+  ::-webkit-scrollbar{width:7px;height:7px}
+  ::-webkit-scrollbar-thumb{background:#223;border-radius:4px}
 </style></head>
 <body>
-<h2>Pax Overview <span id="refresh-status">loading...</span></h2>
+  <div class="head">
+    <h1>PAX&nbsp;QUANT&nbsp;DESK</h1>
+    <div class="meta"><span id="agdot" class="dot"></span><span id="agstate">connecting</span> &middot; <span id="rfsh">--</span></div>
+  </div>
 
-<details id="sec-status" open>
-  <summary>Status / heartbeat</summary>
-  <div id="status-box"></div></details>
+  <div class="grid stats" id="stats"></div>
 
-<details id="sec-pnl" open>
-  <summary>P&amp;L summary</summary>
-  <div id="pnl-box"></div></details>
+  <div class="card">
+    <div class="ttl">Equity curve &middot; realized P&amp;L (sim)</div>
+    <div id="equity"></div>
+  </div>
 
-<details id="sec-position" open>
-  <summary>Current position</summary>
-  <div id="position-box"></div></details>
-
-<details id="sec-working" open>
-  <summary>Working sim orders</summary>
-  <div id="working-box"></div></details>
-
-<details id="sec-signals" open>
-  <summary>Latest signals</summary>
-  <div id="signals-box"></div></details>
-
-<details id="sec-setups">
-  <summary>Setup counts</summary>
-  <div id="setups-box"></div></details>
-
-<details id="sec-daily">
-  <summary>Daily stats (30d)</summary>
-  <div id="daily-box"></div></details>
-
-<details id="sec-errors">
-  <summary>Errors / warnings</summary>
-  <div id="errors-box"></div></details>
-
-<details id="sec-freshness">
-  <summary>Data freshness</summary>
-  <div id="freshness-box"></div></details>
+  <div class="grid cols gap">
+    <div>
+      <div class="card">
+        <div class="ttl">Agent decision feed</div>
+        <div class="feed" id="feed"></div>
+      </div>
+      <div class="card gap">
+        <div class="ttl">Lessons learned (self-written)</div>
+        <div class="lessons" id="lessons"></div>
+      </div>
+    </div>
+    <div>
+      <div class="card">
+        <div class="ttl">Calibration &middot; tuning data</div>
+        <div id="calib"></div>
+      </div>
+      <div class="card gap">
+        <div class="ttl">Settings</div>
+        <div id="settings" class="mono">loading...</div>
+      </div>
+      <div class="card gap">
+        <div class="ttl">Position &amp; working orders</div>
+        <div id="posbox"></div>
+        <div id="working" class="gap"></div>
+      </div>
+      <div class="card gap">
+        <div class="ttl">Recent fills</div>
+        <div id="fills"></div>
+      </div>
+    </div>
+  </div>
 
 <script>
-// Persist collapse state across reload.
-document.querySelectorAll('details').forEach(el => {
-  const key = 'pax-overview:' + el.id;
-  const saved = localStorage.getItem(key);
-  if (saved === 'closed') el.open = false;
-  else if (saved === 'open') el.open = true;
-  el.addEventListener('toggle', () => {
-    localStorage.setItem(key, el.open ? 'open' : 'closed');
-  });
-});
-
 const $ = id => document.getElementById(id);
+const esc = s => String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const money = n => (n<0?'-$':'$') + Math.abs(Number(n||0)).toFixed(2);
+const fmtMs = ms => ms ? new Date(Number(ms)).toLocaleTimeString() : '--';
+async function J(p){const r=await fetch(p,{cache:'no-store'});if(!r.ok)throw new Error(p+' '+r.status);return r.json();}
 
-function kv(k, v, klass) {
-  return '<div class="kv"><span class="k">' + k + '</span>' +
-          '<span class="v ' + (klass || '') + '">' + (v == null ? '—' : v) + '</span></div>';
+function statCard(lbl,val,sub,cls){
+  return '<div class="card stat"><div class="lbl">'+lbl+'</div><div class="val '+(cls||'')+'">'+
+    val+'</div><div class="sub">'+(sub||'')+'</div></div>';
 }
 
-function tableHtml(rows, cols) {
-  if (!rows || !rows.length) return '<span class="muted">none</span>';
-  let h = '<table><tr>';
-  cols.forEach(c => h += '<th>' + c.h + '</th>');
-  h += '</tr>';
-  rows.forEach(r => {
-    h += '<tr>';
-    cols.forEach(c => {
-      const v = c.f ? c.f(r) : r[c.k];
-      h += '<td>' + (v == null ? '—' : v) + '</td>';
-    });
-    h += '</tr>';
-  });
-  return h + '</table>';
+// Hand-drawn SVG area+line chart (no external deps).
+function equityChart(pts){
+  if(!pts || pts.length<2) return '<div class="mut" style="font-family:ui-monospace;font-size:12px">no closed trades yet - equity flat at $0</div>';
+  const eq=pts.map(p=>p.eq); let mn=Math.min(...eq,0), mx=Math.max(...eq,0);
+  if(mx===mn){mx+=1;mn-=1;}
+  const W=1000,H=160,pad=4;
+  const X=i=>pad+i*(W-2*pad)/(pts.length-1);
+  const Y=v=>pad+(H-2*pad)*(1-(v-mn)/(mx-mn));
+  let line='',area='';
+  pts.forEach((p,i)=>{const x=X(i).toFixed(1),y=Y(p.eq).toFixed(1);line+=(i?'L':'M')+x+' '+y+' ';});
+  area='M'+X(0).toFixed(1)+' '+Y(0).toFixed(1)+' '+line.replace(/^M/,'L')+'L'+X(pts.length-1).toFixed(1)+' '+Y(0).toFixed(1)+' Z';
+  const up=eq[eq.length-1]>=0; const col=up?'#34d399':'#fb7185';
+  const zeroY=Y(0).toFixed(1);
+  return '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" style="width:100%;height:170px;display:block">'+
+    '<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">'+
+    '<stop offset="0" stop-color="'+col+'" stop-opacity="0.28"/>'+
+    '<stop offset="1" stop-color="'+col+'" stop-opacity="0"/></linearGradient></defs>'+
+    '<line x1="0" y1="'+zeroY+'" x2="'+W+'" y2="'+zeroY+'" stroke="rgba(255,255,255,.12)" stroke-dasharray="4 4"/>'+
+    '<path d="'+area+'" fill="url(#g)"/>'+
+    '<path d="'+line+'" fill="none" stroke="'+col+'" stroke-width="2"/></svg>';
 }
 
-function fmtMs(ms) {
-  if (!ms) return '—';
-  const d = new Date(ms);
-  return d.toLocaleTimeString();
+function bars(actions){
+  const ents=Object.entries(actions||{}).sort((a,b)=>b[1]-a[1]);
+  if(!ents.length) return '<div class="mut">no decisions yet</div>';
+  const mx=Math.max(...ents.map(e=>e[1]));
+  return ents.map(([k,v])=>'<div class="bar"><span class="name">'+esc(k)+'</span>'+
+    '<span class="track"><span class="fill" style="width:'+(100*v/mx)+'%"></span></span>'+
+    '<span class="n">'+v+'</span></div>').join('');
 }
 
-async function fetchJson(path) {
-  const r = await fetch(path, {cache: 'no-store'});
-  if (!r.ok) throw new Error(path + ' -> ' + r.status);
-  return r.json();
+function table(rows,cols){
+  if(!rows||!rows.length) return '<div class="mut" style="font-size:11px">none</div>';
+  let h='<table><tr>'+cols.map(c=>'<th>'+c.h+'</th>').join('')+'</tr>';
+  rows.forEach(r=>{h+='<tr>'+cols.map(c=>{const v=c.f?c.f(r):r[c.k];return '<td>'+(v==null?'--':v)+'</td>';}).join('')+'</tr>';});
+  return h+'</table>';
 }
 
-async function refresh() {
-  $('refresh-status').textContent = 'updating...';
-  try {
-    const [status, pnl, pos, working, signals, setups, daily, errors] = await Promise.all([
-      fetchJson('/api/status'),
-      fetchJson('/api/pnl_summary'),
-      fetchJson('/api/position'),
-      fetchJson('/api/working'),
-      fetchJson('/api/signals'),
-      fetchJson('/api/setup_winrates'),
-      fetchJson('/api/daily_stats'),
-      fetchJson('/api/errors')
-    ]);
+function feedRow(r){
+  const a=String(r.action||(r.error?'ERR':'?'));
+  const cls=a.indexOf('LONG')>=0?'long':a.indexOf('SHORT')>=0?'short':(a==='WAIT'||a==='HOLD')?'wait':'';
+  const why=esc(r.rationale||r.reason||r.governor||r.error||'');
+  return '<div class="row '+cls+'"><span class="t">'+fmtMs(r.ts_ms)+'</span>'+
+    (r.armed?'<b>['+'ARMED'+']</b> ':'')+esc(a)+(why?' <span class="why">'+why+'</span>':'')+'</div>';
+}
 
-    // Status
-    const run = status.run || {};
-    const health = status.health || {};
-    const ageSec = status.last_snapshot_age_sec;
-    const ageClass = ageSec == null ? 'muted' : ageSec < 30 ? 'ok' : ageSec < 120 ? 'warn' : 'err';
-    $('status-box').innerHTML =
-      kv('Run ID', run.run_id ? run.run_id.substring(0, 8) + '…' : '—') +
-      kv('Adapter', run.adapter_name) +
-      kv('Signal ver', run.signal_version) +
-      kv('Health', health.status, health.status === 'ok' ? 'ok' : 'warn') +
-      kv('Snapshots', status.snapshot_count) +
-      kv('Signals', status.signal_count) +
-      kv('Uptime', status.uptime_sec ? (status.uptime_sec).toFixed(0) + 's' : '—') +
-      kv('Last snap', ageSec == null ? '—' : ageSec.toFixed(1) + 's ago', ageClass);
+async function refresh(){
+  try{
+    const [sum,feed,calib,eq,fills,pos,working,cron]=await Promise.all([
+      J('/api/agent_summary'),J('/api/agent_feed'),J('/api/calibration'),
+      J('/api/equity'),J('/api/fills'),J('/api/position'),J('/api/working'),
+      J('/api/cron_status')]);
 
-    // PnL
-    $('pnl-box').innerHTML =
-      kv('Gross P&L', '$' + Number(pnl.total || 0).toFixed(2)) +
-      kv('Wins',  pnl.wins) + kv('Losses', pnl.losses) +
-      kv('Max DD', '$' + Number(pnl.max_dd || 0).toFixed(2));
+    const armed=sum.armed, running=(sum.cycles||0)>0;
+    $('agdot').className='dot '+(armed?'armed':running?'on':'');
+    $('agstate').textContent='AGENT '+(armed?'ARMED (sim)':running?'observing':'idle');
+    $('rfsh').textContent=new Date().toLocaleTimeString();
 
-    // Position
-    if (!pos) {
-      $('position-box').innerHTML = '<span class="muted">no position data</span>';
-    } else {
-      $('position-box').innerHTML =
-        kv('Alias', pos.alias) + kv('Size', pos.size,
-           pos.size > 0 ? 'ok' : pos.size < 0 ? 'err' : 'muted') +
-        kv('Avg', pos.avg_price ? pos.avg_price.toFixed(2) : '—') +
-        kv('Realized', '$' + Number(pos.realized_pnl || 0).toFixed(2));
+    const rz=Number(sum.realized||0);
+    const pz=(sum.position&&sum.position.size)||0;
+    $('stats').innerHTML=
+      statCard('Realized P&L',money(rz),'sim paper',rz>=0?'pos':'neg')+
+      statCard('Win rate',sum.win_rate==null?'--':sum.win_rate+'%',(sum.wins||0)+'W / '+(sum.losses||0)+'L')+
+      statCard('Agent cycles',sum.cycles||0,(sum.executed||0)+' executed')+
+      statCard('Vetoed',sum.vetoes||0,'governor blocks',(sum.vetoes?'neg':'mut'))+
+      statCard('Deviations',sum.deviations||0,'vs baseline rule','')+
+      statCard('Open pos',pz,pz>0?'long':pz<0?'short':'flat',pz>0?'pos':pz<0?'neg':'mut');
+
+    $('equity').innerHTML=equityChart(eq.points);
+    $('feed').innerHTML=(feed||[]).slice().reverse().map(feedRow).join('')||'<div class="mut">waiting for agent...</div>';
+    if(cron && cron.installed){
+      const hidden = String(cron.execute||'').toLowerCase().indexOf('pythonw.exe')>=0;
+      const mode = String(cron.arguments||'').indexOf('--armed')>=0 ? 'ARMED' : 'observe';
+      $('settings').innerHTML =
+        '<div><span class="dot '+(cron.state==='Running'?'on':'')+'"></span>'+
+        'cron '+esc(cron.state)+' &middot; '+mode+'</div>'+
+        '<div>next: '+esc(cron.nextRunTime||'--')+' &middot; last result: '+esc(cron.lastTaskResult)+'</div>'+
+        '<div>runner: '+(hidden?'hidden pythonw':'visible python')+'</div>'+
+        '<div class="mut">'+esc(cron.arguments||'')+'</div>';
+    }else{
+      $('settings').innerHTML='<div class="mut">PaxAgentCron not installed</div>';
     }
 
-    // Working orders
-    $('working-box').innerHTML = tableHtml(working, [
-      {h: 'Side', k: 'side'}, {h: 'Type', k: 'type'},
-      {h: 'Qty', k: 'qty'},
-      {h: 'Limit', f: r => r.limit_price ? r.limit_price.toFixed(2) : '—'},
-      {h: 'Stop', f: r => r.stop_price ? r.stop_price.toFixed(2) : '—'},
-      {h: 'Role', k: 'role'}, {h: 'Status', k: 'status'},
-      {h: 'Armed?', f: r => r.armed_after_parent_fill ?
-                              '<span class="warn">pending parent</span>' :
-                              '<span class="ok">armed</span>'},
-    ]);
+    $('calib').innerHTML=
+      '<div style="display:flex;gap:8px;margin-bottom:10px">'+
+      '<span class="pill">veto '+Math.round(100*(calib.veto_rate||0))+'%</span>'+
+      '<span class="pill">deviate '+Math.round(100*(calib.deviation_rate||0))+'%</span>'+
+      '<span class="pill">'+(calib.decisions||0)+' decisions</span></div>'+
+      bars((calib.by_action)||sum.actions);
 
-    // Signals
-    $('signals-box').innerHTML = tableHtml(signals, [
-      {h: 'Time', f: r => fmtMs(r.ts_ms)},
-      {h: 'Decision', k: 'decision'},
-      {h: 'Size', k: 'size_tier'},
-      {h: 'Conf', f: r => r.confidence ? r.confidence.toFixed(2) : '—'},
-      {h: 'Level', k: 'level_label'},
-      {h: 'Comp', f: r => r.composite_score ? r.composite_score.toFixed(2) : '—'},
-      {h: 'Dir', k: 'composite_dir'},
-      {h: 'Conv traj', k: 'conviction_trajectory'},
-    ]);
+    if(!pos){$('posbox').innerHTML='<div class="mut">flat</div>';}
+    else{const s=pos.size||0;
+      $('posbox').innerHTML='<div style="font-family:ui-monospace;font-size:13px">'+
+        '<span class="'+(s>0?'pos':s<0?'neg':'mut')+'">'+(s>0?'LONG ':s<0?'SHORT ':'FLAT ')+s+'</span>'+
+        (pos.avg_price?(' @ '+Number(pos.avg_price).toFixed(2)):'')+
+        '  &middot; realized '+money(pos.realized_pnl)+'</div>';}
 
-    // Setup counts
-    $('setups-box').innerHTML = tableHtml(setups, [
-      {h: 'Decision', k: 'decision'}, {h: 'Level', k: 'level_label'},
-      {h: 'N', k: 'n'},
-      {h: 'Avg conf', f: r => r.avg_conf ? r.avg_conf.toFixed(2) : '—'},
-    ]);
+    $('working').innerHTML=table(working,[
+      {h:'Side',k:'side'},{h:'Type',k:'type'},{h:'Qty',k:'qty'},
+      {h:'Limit',f:r=>r.limit_price?Number(r.limit_price).toFixed(2):'--'},
+      {h:'Stop',f:r=>r.stop_price?Number(r.stop_price).toFixed(2):'--'},
+      {h:'Role',k:'role'},{h:'Status',k:'status'}]);
 
-    // Daily stats
-    $('daily-box').innerHTML = tableHtml(daily, [
-      {h: 'Date', k: 'session_date'}, {h: 'Alias', k: 'alias'},
-      {h: 'Trades', k: 'trades_count'},
-      {h: 'W', k: 'wins'}, {h: 'L', k: 'losses'},
-      {h: 'P&L', f: r => '$' + Number(r.gross_pnl).toFixed(2)},
-      {h: 'Max DD', f: r => '$' + Number(r.max_drawdown).toFixed(2)},
-    ]);
+    $('fills').innerHTML=table(fills,[
+      {h:'Time',f:r=>fmtMs(r.filled_ms)},{h:'Side',k:'side'},{h:'Qty',k:'qty'},
+      {h:'Price',f:r=>r.filled_price?Number(r.filled_price).toFixed(2):'--'},
+      {h:'Role',k:'role'},{h:'Tag',k:'decision_tag'}]);
 
-    // Errors
-    $('errors-box').innerHTML = tableHtml(errors, [
-      {h: 'Time', f: r => fmtMs(r.ts_ms)}, {h: 'Kind', k: 'kind'},
-      {h: 'Source', k: 'source'}, {h: 'Message', k: 'message'},
-    ]);
-
-    // Freshness
-    $('freshness-box').innerHTML =
-      kv('Last snapshot', ageSec == null ? '—' :
-                            ageSec.toFixed(1) + 's ago', ageClass) +
-      kv('Heartbeat', health.ts_ms ? fmtMs(health.ts_ms) : '—');
-
-    $('refresh-status').textContent = 'ok ' + new Date().toLocaleTimeString();
-  } catch (err) {
-    $('refresh-status').textContent = 'error: ' + err.message;
-  }
+    // lessons
+    try{const ls=await J('/api/lessons');
+      $('lessons').innerHTML=(ls&&ls.length)?ls.slice().reverse().map(l=>'<div>'+esc(l)+'</div>').join(''):'<div class="mut">none yet - the agent writes these as it learns</div>';
+    }catch(e){}
+  }catch(err){ $('rfsh').textContent='error: '+err.message; }
 }
 refresh();
-setInterval(refresh, 5000);
+setInterval(refresh,4000);
 </script>
 </body></html>
 """

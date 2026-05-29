@@ -100,7 +100,7 @@ def test_handle_chat_stream_clears_abort_after_normal_exit(monkeypatch):
     # Force claude_stream to act as if the binary is missing so we don't
     # actually spawn anything in the test process.
     monkeypatch.setattr(chat.claude_stream, "_build_argv",
-                          lambda u, m, p: ["this_binary_does_not_exist_xyz.exe"])
+                          lambda u, m, p, has_image=False: ["this_binary_does_not_exist_xyz.exe"])
     buf = io.BytesIO()
     chat.handle_chat_stream(buf, "test message")
     assert _current_abort_cleared(), (
@@ -176,7 +176,7 @@ def _capture_argv(monkeypatch):
     to subprocess.Popen without actually spawning the binary. Returns a
     list that will hold the captured argv after handle_chat_stream runs."""
     captured: list = []
-    def fake_build_argv(user_message, model, system_prompt_path):
+    def fake_build_argv(user_message, model, system_prompt_path, has_image=False):
         argv = ["fake_claude_stub", "--model", model,
                 "--tools", "",
                 "--max-turns", "1"]
@@ -224,7 +224,7 @@ def test_handle_chat_stream_deep_keeps_tools_empty_and_max_turns_one(monkeypatch
     with chat._ABORT_LOCK: chat._CURRENT_ABORT = None
     captured: list = []
     real_build = chat.claude_stream._build_argv
-    def spy_build(user_message, model, system_prompt_path):
+    def spy_build(user_message, model, system_prompt_path, has_image=False):
         argv = real_build(user_message, model, system_prompt_path)
         captured.append(list(argv))
         # Redirect to a missing binary so Popen returns 127 fast.
@@ -264,7 +264,7 @@ def test_chat_path_unchanged_when_bus_disabled(monkeypatch):
         def flush(self): pass
 
     def _fake_stream_chat(user_message, model, system_prompt_path,
-                          on_token, on_done, abort, timeout_sec):
+                          on_token, on_done, abort, timeout_sec, image=None):
         on_token("hello")
         on_done({"exit_code": 0, "elapsed_ms": 5, "tokens_emitted": 1,
                  "aborted": False, "error": None,
@@ -418,7 +418,7 @@ def test_chat_sse_bytes_identical_when_feature_bus_disabled(monkeypatch):
         def flush(self): pass
 
     def _fake_stream_chat(user_message, model, system_prompt_path,
-                          on_token, on_done, abort, timeout_sec):
+                          on_token, on_done, abort, timeout_sec, image=None):
         on_token("hello")
         on_done({"exit_code": 0, "elapsed_ms": 5, "tokens_emitted": 1,
                  "aborted": False, "error": None,
@@ -533,7 +533,7 @@ def test_flag_false_keeps_legacy_full_msg(monkeypatch, tmp_path):
 
     captured = {}
     def _fake_stream_chat(user_message, model, system_prompt_path,
-                          on_token, on_done, abort, timeout_sec):
+                          on_token, on_done, abort, timeout_sec, image=None):
         captured["user_message"] = user_message
         on_done({"exit_code": 0})
         return 0
@@ -574,7 +574,7 @@ def test_flag_true_uses_bus_full_msg_only_when_feature_bus_enabled(monkeypatch, 
 
     captured = {}
     def _fake_stream_chat(user_message, model, system_prompt_path,
-                          on_token, on_done, abort, timeout_sec):
+                          on_token, on_done, abort, timeout_sec, image=None):
         captured["user_message"] = user_message
         on_done({"exit_code": 0})
         return 0
@@ -699,7 +699,7 @@ def test_router_hint_does_not_leak_into_sse_done_payload(monkeypatch):
         def flush(self): pass
 
     def _fake_stream_chat(user_message, model, system_prompt_path,
-                          on_token, on_done, abort, timeout_sec):
+                          on_token, on_done, abort, timeout_sec, image=None):
         on_token("hello")
         on_done({"exit_code": 0, "elapsed_ms": 5, "tokens_emitted": 1,
                  "aborted": False, "error": None,

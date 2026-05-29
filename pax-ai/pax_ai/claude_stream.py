@@ -72,12 +72,19 @@ def _use_bare() -> bool:
     return bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
 
 
-def _build_argv(user_message: str, model: str, system_prompt_path: Path) -> list:
+def _build_argv(user_message: str, model: str, system_prompt_path: Path,
+                has_image: bool = False) -> list:
     argv: list = [CLAUDE_BIN]
     if _use_bare():
         argv.append("--bare")
+    if has_image:
+        # Multimodal turn: the message (text + image content block) is piped
+        # to stdin as a stream-json user event, not passed via -p. Tools stay
+        # disabled and turns capped at 1 -- vision needs neither.
+        argv += ["-p", "--input-format", "stream-json"]
+    else:
+        argv += ["-p", user_message]
     argv += [
-        "-p", user_message,
         "--model", model,
         "--output-format", "stream-json",
         "--verbose",
@@ -87,6 +94,24 @@ def _build_argv(user_message: str, model: str, system_prompt_path: Path) -> list
         "--append-system-prompt-file", str(system_prompt_path),
     ]
     return argv
+
+
+def _stdin_payload(user_message: str, image: Optional[dict]) -> Optional[str]:
+    """Build a stream-json user event carrying text + an image content block.
+    `image` = {"media_type": "image/png", "data": "<base64>"}. Returns None
+    when there is no image (caller uses the plain -p path + DEVNULL stdin)."""
+    if not image or not image.get("data"):
+        return None
+    content = [
+        {"type": "text", "text": user_message},
+        {"type": "image", "source": {
+            "type": "base64",
+            "media_type": image.get("media_type") or "image/png",
+            "data": image["data"],
+        }},
+    ]
+    return json.dumps({"type": "user",
+                       "message": {"role": "user", "content": content}}) + "\n"
 
 
 def _extract_text_delta(line: str) -> Optional[str]:
@@ -177,6 +202,7 @@ def stream_chat(
     on_done: Callable[[dict], None],
     abort: Optional[threading.Event] = None,
     timeout_sec: Optional[float] = None,
+    image: Optional[dict] = None,
 ) -> int:
     """Run one Claude CLI call. Returns the process exit code.
 
@@ -196,14 +222,16 @@ def stream_chat(
     abort = abort or threading.Event()
     effective_timeout = (CHAT_TIMEOUT_SEC if timeout_sec is None
                           else float(timeout_sec))
-    argv = _build_argv(user_message, model, system_prompt_path)
+    stdin_payload = _stdin_payload(user_message, image)
+    argv = _build_argv(user_message, model, system_prompt_path,
+                       has_image=stdin_payload is not None)
     start = time.monotonic()
     try:
         proc = subprocess.Popen(
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
+            stdin=(subprocess.PIPE if stdin_payload else subprocess.DEVNULL),
             text=True,
             bufsize=1,         # line-buffered
             encoding="utf-8",
@@ -216,6 +244,14 @@ def stream_chat(
         on_done({"error": f"subprocess spawn failed: {exc}",
                   "exit_code": 1, "elapsed_ms": 0})
         return 1
+
+    # Multimodal turn: feed the stream-json user event (text + image) to stdin.
+    if stdin_payload and proc.stdin is not None:
+        try:
+            proc.stdin.write(stdin_payload)
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
 
     # Watchdog: abort thread terminates the process on timeout or abort flag.
     def _watchdog() -> None:

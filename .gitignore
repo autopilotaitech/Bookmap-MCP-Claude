@@ -56,6 +56,7 @@ _session_snapshots/*
 
 # Ad-hoc one-shot snapshot dumps written by quick PowerShell checks.
 _snapshot_now.json
+_snapshot_probe.json
 
 # Phase 4B/5A bus-tools report outputs (generated; not source)
 reports/bus-eod-*.md

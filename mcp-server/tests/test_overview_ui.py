@@ -141,17 +141,17 @@ def _get(host, port, path, method="GET"):
         conn.close()
 
 
-def test_get_root_serves_html_with_details_sections(live_server):
+def test_get_root_serves_html_dashboard(live_server):
     host, port = live_server
     status, body = _get(host, port, "/")
     assert status == 200
     assert "<!doctype html>" in body.lower()
-    # Native <details>/<summary> = the user's drop-down arrow requirement.
-    assert body.count("<details") >= 9, (
-        f"expected at least 9 collapsible sections, got {body.count('<details')}")
-    assert "<summary>" in body
-    # localStorage persistence wire-up.
-    assert "localStorage" in body
+    # Modern quant-desk dashboard (2026-05-28 redesign): glass cards, equity
+    # chart, agent feed, calibration -- replaced the old <details> sections.
+    assert "PAX" in body and "QUANT" in body
+    for marker in ('id="stats"', 'id="equity"', 'id="feed"',
+                   'id="calib"', 'id="settings"', 'function equityChart'):
+        assert marker in body, f"dashboard marker missing: {marker}"
 
 
 def test_api_status_returns_json(live_server):
@@ -199,13 +199,14 @@ def test_unknown_path_returns_404(live_server):
     assert status == 404
 
 
-def test_html_page_constant_has_details_arrows():
-    """Independent check on the page template — chevrons + summary elements
-    are present for every section the daemon writes."""
-    sections = ["sec-status", "sec-pnl", "sec-position", "sec-working",
-                 "sec-signals", "sec-setups", "sec-daily", "sec-errors",
-                 "sec-freshness"]
-    for sec in sections:
-        assert f'id="{sec}"' in _PAGE_HTML, f"missing section {sec}"
-    # Each section uses <details>/<summary> — native HTML chevron + collapse.
-    assert _PAGE_HTML.count("<summary>") == len(sections)
+def test_html_page_constant_has_dashboard_panels():
+    """Independent check on the page template — the quant-desk panels and the
+    self-contained SVG equity chart renderer are present."""
+    for marker in ('id="stats"', 'id="equity"', 'id="feed"', 'id="calib"',
+                   'id="settings"', '/api/cron_status',
+                   'id="lessons"', 'id="working"', 'id="fills"',
+                   'function equityChart', 'function bars('):
+        assert marker in _PAGE_HTML, f"missing dashboard panel: {marker}"
+    # Charts are hand-drawn SVG -- no external chart library dependency.
+    assert "<svg" in _PAGE_HTML
+    assert "<script src=" not in _PAGE_HTML, "must stay self-contained (no CDN)"

@@ -426,6 +426,11 @@ class _Handler(BaseHTTPRequestHandler):
                     "new_run_id": journal.current_run_id(),
                 })
                 return
+            if path in ("/api/pax/agent/start", "/api/pax/agent/stop",
+                        "/api/pax/agent/arm"):
+                kind = path.rsplit("/", 1)[1]
+                self._send_json(200, _agent_action(kind, payload))
+                return
             self._send_json(404, {"error": "not found", "path": path})
         except (BrokenPipeError, ConnectionResetError):
             return
@@ -436,9 +441,17 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _handle_chat_stream(self, payload: Dict[str, Any]) -> None:
         user_text = (payload.get("message") or "").strip()
-        if not user_text:
+        # Optional attached image: {"media_type": "image/png", "data": "<b64>"}.
+        img = payload.get("image")
+        image = None
+        if isinstance(img, dict) and img.get("data"):
+            image = {"media_type": img.get("media_type") or "image/png",
+                     "data": img["data"]}
+        if not user_text and image is None:
             self._send_json(400, {"error": "missing 'message'"})
             return
+        if not user_text:
+            user_text = "(image attached - read / describe it)"
         # Strict /deep parsing: only an honest JSON `true` escalates the
         # model. `bool(...)` would treat the string "false" (truthy) or
         # integer 1 as deep, which can silently turn a normal chat into
@@ -456,7 +469,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         # SSE body written by chat_mod
         try:
-            chat_mod.handle_chat_stream(self.wfile, user_text, deep=deep)
+            chat_mod.handle_chat_stream(self.wfile, user_text, deep=deep, image=image)
         except (BrokenPipeError, ConnectionResetError):
             return
         # Tell BaseHTTPRequestHandler not to try to reuse this connection.
@@ -517,6 +530,9 @@ class _Handler(BaseHTTPRequestHandler):
                 label = unquote(path[len("/api/pax/level/"):])
                 status, body = _api_pax_level(label)
                 self._send_json(status, body); return
+            if path == "/api/pax/agent/status":
+                self._send_json(200, _agent_action("status", {}))
+                return
             if path == "/api/pax/chat/history":
                 q = parse_qs(urlparse(self.path).query)
                 limit_raw = (q.get("limit") or [None])[0]
@@ -538,6 +554,30 @@ class _Handler(BaseHTTPRequestHandler):
             sys.stderr.write("[pax_ai] handler crash:\n" + traceback.format_exc() + "\n")
             try: self._send_json(500, {"error": "internal error"})
             except Exception: pass
+
+
+# ---------------------------------------------------------------------------
+# Agentic sim trader control (loop lives in bookmap_mcp.pax_sim_agent).
+# Lazy-imported + guarded so pax_ai still serves if bookmap_mcp is unavailable.
+# The loop is sim-only by construction; arming only toggles sim execution.
+# ---------------------------------------------------------------------------
+
+def _agent_action(kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        from bookmap_mcp.pax_sim_agent import get_loop
+    except Exception as exc:
+        return {"ok": False, "error": f"agent unavailable: {exc}"}
+    loop = get_loop()
+    try:
+        if kind == "start":
+            return {"ok": True, **loop.start(armed=payload.get("armed"))}
+        if kind == "stop":
+            return {"ok": True, **loop.stop()}
+        if kind == "arm":
+            return {"ok": True, **loop.set_armed(bool(payload.get("armed")))}
+        return {"ok": True, **loop.status()}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 # ---------------------------------------------------------------------------

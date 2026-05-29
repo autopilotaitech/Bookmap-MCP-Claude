@@ -68,6 +68,7 @@ def _cmd_bracket(args: argparse.Namespace, *, side: str) -> int:
     _ensure_safe_environment()
     entry = float(args.entry)
     stop = float(args.stop)
+    entry_stop = float(args.entry_stop) if args.entry_stop is not None else None
     tps: List[float] = [float(p) for p in args.take_profits]
     if not tps:
         sys.stderr.write("at least one take-profit price required\n")
@@ -76,7 +77,9 @@ def _cmd_bracket(args: argparse.Namespace, *, side: str) -> int:
     result = eng.place_bracket(
         side=side,
         qty=int(args.qty),
-        entry_stop=None,
+        # --entry-stop makes the entry a resting STOP-LIMIT (trigger=entry_stop,
+        # limit=entry). Without it the entry is a plain limit (legacy behavior).
+        entry_stop=entry_stop,
         entry_limit=entry,
         stop_loss=stop,
         take_profits=tps,
@@ -87,6 +90,8 @@ def _cmd_bracket(args: argparse.Namespace, *, side: str) -> int:
         "action": "bracket_placed",
         "side": side,
         "qty": int(args.qty),
+        "entry_type": "stop_limit" if entry_stop is not None else "limit",
+        "entry_stop": entry_stop,
         "entry_limit": entry,
         "stop_loss": stop,
         "take_profits": tps,
@@ -140,6 +145,10 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("stop", type=float)
         sp.add_argument("take_profits", nargs="+", type=float,
                         help="One or more TP prices, ordered by priority.")
+        sp.add_argument("--entry-stop", dest="entry_stop", default=None, type=float,
+                        help="Trigger price for a resting STOP-LIMIT entry "
+                             "(entry positional becomes the limit). Omit for a "
+                             "plain limit entry.")
         sp.add_argument("--reason", default="")
         sp.add_argument("--tag", default=None,
                         help="decision_tag stored on each order.")

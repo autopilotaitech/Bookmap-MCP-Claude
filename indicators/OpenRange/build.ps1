@@ -93,6 +93,7 @@ Invoke-JavaTest "com.openrange.PaxAttackResponseGlyphTest"
 Invoke-JavaTest "com.openrange.PaxAttackResponseParserAndPainterTest"
 Invoke-JavaTest "com.openrange.PaxAttackResponseFetcherTest"
 Invoke-JavaTest "com.openrange.PaxAttackResponseRenderWiringTest"
+Invoke-JavaTest "com.openrange.DashboardLauncherTest"
 
 $jarPath = Join-Path $stagingDir 'openrange-release.jar'
 if (Test-Path $jarPath) { Remove-Item -Force $jarPath }

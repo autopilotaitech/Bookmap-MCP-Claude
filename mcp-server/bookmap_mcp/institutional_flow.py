@@ -100,7 +100,8 @@ _WEIGHTS: Tuple[Tuple[str, float], ...] = (
 assert abs(sum(w for _, w in _WEIGHTS) - 1.0) < 1e-9, "weights must sum to 1.0"
 
 
-_MICRO_EVENT_WINDOW_SEC = 180.0  # 3-min window for institutional fingerprints (was 60s — too narrow)
+_MICRO_EVENT_WINDOW_SEC = 60.0   # hard cutoff (was 180s — micro lagged ~3 min behind reversals)
+_MICRO_EVENT_HALFLIFE_SEC = 30.0  # exp-decay half-life; pairs with freshness scaling below
 _MICRO_EVENT_SIGN_MAP: Dict[Tuple[str, bool], float] = {
     # (kind, isBid) -> signed contribution
     ("ICEBERG",    True):  +1.0,  # bid iceberg defending support -> bullish
@@ -285,8 +286,13 @@ def _extract_micro_events_signal(
     """Aggregate recent ICEBERG/ABSORPTION/STACK/PULL events into a signed
     [-1, +1] value with reliability {0, 1}.
 
-    Recency-decayed over a 60-second window. SPOOF and SWEEP events
-    intentionally NOT consumed in v1 (weak / context-dependent).
+    Exponential recency decay (30s half-life) inside a 60s hard cutoff,
+    then freshness-scaled: the magnitude is multiplied by the freshest
+    contributing event's recency. Without that scaling a lone stale
+    fingerprint normalizes back to +-1 and pins the signal until the hard
+    cutoff -- the live failure where micro stayed +0.85 for ~3 min after
+    the last fingerprint while trend had already flipped. SPOOF and SWEEP
+    events intentionally NOT consumed in v1 (weak / context-dependent).
     """
     micro = snap.get("micro_events") or snap.get("microstructure_events") or {}
     events = micro.get("events") or []
@@ -298,6 +304,7 @@ def _extract_micro_events_signal(
 
     signed_total = 0.0
     weight_total = 0.0
+    max_recency = 0.0
     for ev in events:
         if not isinstance(ev, dict):
             continue
@@ -310,15 +317,17 @@ def _extract_micro_events_signal(
         if sign is None:
             continue
         age_sec = max(0.0, (now_ms - ts) / 1000.0)
-        recency = max(0.0, 1.0 - age_sec / _MICRO_EVENT_WINDOW_SEC)
+        recency = 0.5 ** (age_sec / _MICRO_EVENT_HALFLIFE_SEC)
         signed_total += sign * recency
         weight_total += recency
+        if recency > max_recency:
+            max_recency = recency
 
     if weight_total == 0.0:
         return (0.0, 0.0)
     avg = signed_total / weight_total
     avg = max(-1.0, min(1.0, avg))
-    return (avg, 1.0)
+    return (avg * max_recency, 1.0)
 
 
 def _compute_vote(
@@ -746,6 +755,35 @@ def _compute_lt_signal_quality(
     return "RELIABLE"
 
 
+def _compute_trade_eligibility(
+    lt_quality: str,
+    chop: Optional[str],
+    lockout_active: bool,
+) -> Tuple[str, str]:
+    """Deterministic stand-aside gate, mirroring lt_signal_quality's shape.
+
+    Encodes the operator's discipline rule (2026-05-28): when conditions are
+    "bullshit" -- dead tape, a whipsaw lockout, or spoof-heavy chop -- the
+    answer is NO_TRADE. Marginal conditions are DIAL_IN_ONLY (observe / paper
+    only). Otherwise LIVE_OK. Most-restrictive class wins.
+
+    Pure function of already-computed signals; no LLM, no new inputs.
+    """
+    if lt_quality == "DEAD":
+        return ("NO_TRADE", "tape below noise floor (DEAD lt_signal_quality)")
+    if lockout_active:
+        return ("NO_TRADE", "whipsaw lockout active")
+    if chop and lt_quality == "LIKELY_SPOOFED":
+        return ("NO_TRADE",
+                f"{chop} chop window + likely-spoofed LT "
+                "(low-edge time + manipulation)")
+    if lt_quality == "LIKELY_SPOOFED":
+        return ("DIAL_IN_ONLY", "LT bias likely spoofed")
+    if chop:
+        return ("DIAL_IN_ONLY", f"{chop} chop window (low-edge time-of-day)")
+    return ("LIVE_OK", "")
+
+
 def _track_episode_for_whipsaw(
     state: Dict[str, Any],
     regime: str,
@@ -962,6 +1000,9 @@ def compute_institutional_flow(
 
     duration_sec = _compute_regime_duration(state, regime, now_ms)
 
+    trade_eligibility, trade_eligibility_reason = _compute_trade_eligibility(
+        lt_signal_quality, chop, lockout_active)
+
     return {
         "alias": alias,
         "asOfMs": now_ms,
@@ -980,6 +1021,8 @@ def compute_institutional_flow(
         "whipsaw_lockout_until_ms": int(state.get("whipsaw_lockout_until_ms", 0) or 0),
         "whipsaw_lockout_reason": state.get("whipsaw_lockout_reason", "") or "",
         "lt_signal_quality": lt_signal_quality,
+        "trade_eligibility": trade_eligibility,
+        "trade_eligibility_reason": trade_eligibility_reason,
     }
 
 

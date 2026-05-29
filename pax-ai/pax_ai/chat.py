@@ -105,7 +105,9 @@ def _digest_lines(snap: Dict[str, Any]) -> list:
     me_types = []
     seen = set()
     for ev in reversed(me_events[-10:]):
-        t = ev.get("type") if isinstance(ev, dict) else None
+        # micro_events items carry "kind" (not "type") per the bridge handler;
+        # reading "type" made the digest always show "(none recent)".
+        t = ev.get("kind") if isinstance(ev, dict) else None
         if t and t not in seen:
             me_types.append(t); seen.add(t)
         if len(me_types) >= 5:
@@ -448,7 +450,8 @@ def _clear_abort_if_owned(abort: threading.Event) -> None:
             _CURRENT_ABORT = None
 
 
-def handle_chat_stream(wfile, user_text: str, deep: bool = False) -> None:
+def handle_chat_stream(wfile, user_text: str, deep: bool = False,
+                       image: Optional[Dict[str, Any]] = None) -> None:
     """SSE handler. Called by server.py after sending the status + headers.
 
     Writes a sequence of SSE events to wfile and flushes after each.
@@ -569,6 +572,7 @@ def handle_chat_stream(wfile, user_text: str, deep: bool = False) -> None:
             on_done=on_done,
             abort=abort,
             timeout_sec=chat_timeout,
+            image=image,
         )
         elapsed_ms = int((time.monotonic() - t0) * 1000)
 

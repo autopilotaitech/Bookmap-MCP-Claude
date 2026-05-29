@@ -454,8 +454,10 @@ or_levels = {
 
 1. **`middleLock == true` → STAND DOWN.** No entry, no add, no decision other
    than flat or scratch-out. Pax canon: no position in the middle.
-2. **Entry signals are only legal at levels where `proximity == true`.** A
-   `decision != WAIT` at a far level is for context only.
+2. **Level-reaction entries are only legal at levels where `proximity == true`.**
+   A `decision != WAIT` at a far level is level context only. Exception:
+   off-level TREND_FOLLOW is valid when price is outside the OR, not in
+   `middleLock`, and tape plus trend/conviction/flow agree in one direction.
 3. **`FOLLOW` = continuation, `FADE` = rotation.** FOLLOW above OR-H or +N
    means break-and-go long; FADE above OR-H or +N means rotation against the
    level → short. Mirror below.
@@ -476,10 +478,17 @@ or_levels = {
 
 **Reading order for the agent every poll:**
 
+Off-level TREND_FOLLOW exception: if `inProximity == false` but price is
+outside the OR, `middleLock == false`, and tape + trend/conviction/flow agree,
+do not force STAND_DOWN. The correct read is trend-follow in the aligned
+direction.
+
 ```
 1. snap.or_levels.middleLock?           → STAND_DOWN if true. Return.
 2. snap.or_levels.inProximity?          → If false, STAND_DOWN. Return.
 3. Find the level with proximity == true (usually exactly one).
+   Exception to step 2: off-level TREND_FOLLOW may fire outside OR when tape,
+   trend/conviction, and flow align.
 4. Read its decision + confidence + reasons.
 5. Apply rules 4–7 above.
 6. If decision survives, run §6 regime gates (session, news, OR-width).

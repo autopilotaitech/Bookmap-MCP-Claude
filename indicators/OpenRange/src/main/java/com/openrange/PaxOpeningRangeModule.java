@@ -425,6 +425,7 @@ public class PaxOpeningRangeModule implements
         trendSignals.stop();
         levelEdge.stop();
         attackResponse.stop();
+        DashboardLauncher.stop();   // tear down the auto-launched HUD dashboard
         synchronized (indicatorsFullNameToUserName) {
             for (String userName : indicatorsFullNameToUserName.values()) {
                 provider.sendUserMessage(Layer1ApiUserMessageModifyScreenSpacePainter
@@ -457,6 +458,9 @@ public class PaxOpeningRangeModule implements
         }
         if (isEnabled) {
             enabledAliases.add(alias);
+            // Auto-launch the Python HUD dashboard so the operator doesn't run a
+            // terminal command. Idempotent + skips if :18888 is already serving.
+            DashboardLauncher.start();
             InstrumentInfo info = knownInstruments.get(alias);
             if (info != null) {
                 attachInstrumentIfEnabled(alias, info);

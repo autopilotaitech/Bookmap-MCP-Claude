@@ -69,5 +69,5 @@ for ($i = 0; $i -lt $max; $i++) {
         $errLine = '{"err":"' + ($_.Exception.Message -replace '"', "'") + '","iter":' + $i + '}'
         Add-Content -Encoding utf8 -Path $logPath -Value $errLine
     }
-    Start-Sleep -Seconds 30
+    Start-Sleep -Seconds 60
 }

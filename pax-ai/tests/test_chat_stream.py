@@ -32,8 +32,8 @@ FAKE_CLAUDE_PY = Path(__file__).parent / "fake_claude.py"
 def patch_argv(monkeypatch):
     """Swap _build_argv so it invokes fake_claude.py via the current python."""
     real_build = claude_stream._build_argv
-    def fake_build(user_message, model, system_prompt_path):
-        original = real_build(user_message, model, system_prompt_path)
+    def fake_build(user_message, model, system_prompt_path, has_image=False):
+        original = real_build(user_message, model, system_prompt_path, has_image)
         # Replace original[0] (the binary) with [sys.executable, fake_claude.py];
         # keep all flags afterwards so the parser exercises real flag parsing.
         return [sys.executable, str(FAKE_CLAUDE_PY)] + original[1:]
@@ -126,7 +126,7 @@ def test_stream_chat_missing_binary_reports_error(tmp_path, monkeypatch):
     sp = tmp_path / "sp.txt"; sp.write_text("sp", encoding="utf-8")
     # Force claude_stream to invoke a non-existent binary by patching _build_argv.
     monkeypatch.setattr(claude_stream, "_build_argv",
-                          lambda u, m, p: ["this_binary_does_not_exist_xyz_12345.exe"])
+                          lambda u, m, p, has_image=False: ["this_binary_does_not_exist_xyz_12345.exe"])
     done_info = {}
     rc = claude_stream.stream_chat(
         user_message="q", model="m", system_prompt_path=sp,

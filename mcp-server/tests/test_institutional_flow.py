@@ -877,7 +877,7 @@ def test_regime_hold_time_allows_opposite_after_60s():
 
 
 def test_micro_events_aged_out_after_window():
-    """Events older than the micro-event window (180s) should not contribute."""
+    """Events older than the micro-event window should not contribute."""
     ts = _ts_outside_chop()
     snap = _make_snap(
         ts_ms=ts,
@@ -888,6 +888,50 @@ def test_micro_events_aged_out_after_window():
     )
     flow = iflow.compute_institutional_flow(snap, _ALIAS)
     assert flow["raw_vote_pre_trend_filter"] == 0.0
+
+
+def _micro_snap(ts_ms: int, events) -> dict:
+    return {"ts_ms": ts_ms, "micro_events": {"events": list(events)}}
+
+
+def test_micro_signal_full_strength_when_fresh():
+    """M2: a just-fired strong fingerprint still reads near full magnitude."""
+    ts = 1_700_000_000_000
+    ev = {"kind": "ICEBERG", "timeMs": ts, "isBid": True,
+          "price": 30050.0, "size": 100}
+    signed, reliability = iflow._extract_micro_events_signal(
+        _micro_snap(ts + 1_000, [ev]))
+    assert signed > 0.8, signed
+    assert reliability == 1.0
+
+
+def test_micro_signal_decays_toward_zero_when_stale_no_new_events():
+    """M2 regression: a lone fingerprint must FADE as it ages, not pin at
+    full magnitude until a hard window cutoff. Reproduces the live bug where
+    micro stayed +0.85 for ~3 min after the last fingerprint while trend had
+    already flipped down."""
+    ts = 1_700_000_000_000
+    ev = {"kind": "ICEBERG", "timeMs": ts, "isBid": True,
+          "price": 30050.0, "size": 100}
+    # 60s later, still inside the cutoff window: must already be decaying hard.
+    signed_60, _ = iflow._extract_micro_events_signal(
+        _micro_snap(ts + 60_000, [ev]))
+    assert signed_60 < 0.3, signed_60
+    # 90s later (no new events): effectively gone.
+    signed_90, _ = iflow._extract_micro_events_signal(
+        _micro_snap(ts + 90_000, [ev]))
+    assert abs(signed_90) < 0.15, signed_90
+
+
+def test_micro_signal_exp_decay_half_life():
+    """One half-life after firing, a lone fingerprint reads ~half strength."""
+    ts = 1_700_000_000_000
+    ev = {"kind": "ICEBERG", "timeMs": ts, "isBid": True,
+          "price": 30050.0, "size": 100}
+    half_life_ms = int(iflow._MICRO_EVENT_HALFLIFE_SEC * 1000)
+    signed, _ = iflow._extract_micro_events_signal(
+        _micro_snap(ts + half_life_ms, [ev]))
+    assert 0.4 < signed < 0.6, signed
 
 
 def test_micro_events_multiple_aggregate_signed():

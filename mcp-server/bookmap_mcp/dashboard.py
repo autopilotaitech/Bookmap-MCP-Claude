@@ -4540,8 +4540,52 @@ def _pax_boost(regime: str, decision: str) -> float:
     return 1.0
 
 
+_PAX_TRIGGER_SINCE_MS: Dict[str, Tuple[str, int]] = {}
+
+
+def _pax_now_ms(snap: Dict[str, Any]) -> int:
+    ts = snap.get("ts_ms")
+    try:
+        if ts is not None:
+            return int(ts)
+    except (TypeError, ValueError):
+        pass
+    return int(time.time() * 1000)
+
+
+def _attach_entry_trigger_age(snap: Dict[str, Any], decision: Dict[str, Any]) -> None:
+    """M4: stamp how long the actionable ENTER decision has been live.
+
+    This is the data-driven trigger age -- the elapsed time since the
+    decision first became actionable -- so a large value at entry quantifies
+    lateness. None when not actionable; resets when the decision label
+    changes or lapses. Pure cache bookkeeping; no effect on the decision.
+    """
+    alias = snap.get("alias") or "unknown"
+    dec = decision.get("decision") or ""
+    actionable = dec.startswith("ENTER") and (decision.get("size") or 0) > 0
+    if not actionable:
+        _PAX_TRIGGER_SINCE_MS.pop(alias, None)
+        decision["entry_trigger_age_ms"] = None
+        return
+    now_ms = _pax_now_ms(snap)
+    prev = _PAX_TRIGGER_SINCE_MS.get(alias)
+    if prev is None or prev[0] != dec:
+        _PAX_TRIGGER_SINCE_MS[alias] = (dec, now_ms)
+        since_ms = now_ms
+    else:
+        since_ms = prev[1]
+    decision["entry_trigger_age_ms"] = max(0, now_ms - since_ms)
+
+
 def pax_decision(snap: Dict[str, Any]) -> Dict[str, Any]:
     """In-process Pax agent. Identical logic to pax_agent.decide() — sim only."""
+    decision = _pax_decision_core(snap)
+    _attach_entry_trigger_age(snap, decision)
+    return decision
+
+
+def _pax_decision_core(snap: Dict[str, Any]) -> Dict[str, Any]:
     reasons: List[str] = []
     components: Dict[str, Any] = {}
 
@@ -5621,7 +5665,12 @@ tr.row-heat { background: var(--row-bg, transparent) !important; }
   <div class="card">
     <h2 style="display:flex;justify-content:space-between;align-items:center;">
       Tape — institutional flow
-      <span id="tape-prints-bias" style="font-size:11px;font-weight:400;letter-spacing:0;text-transform:none;"></span>
+      <span style="font-size:11px;font-weight:400;letter-spacing:0;text-transform:none;display:flex;align-items:center;gap:6px;">
+        <span id="tape-prints-bias"></span>
+        <span style="opacity:0.6;">min</span>
+        <input id="tape-min-size" type="number" min="1" step="1" value="1" title="show only prints &gt;= this size (like Bookmap Time&amp;Sales min size)"
+               style="width:48px;background:#11161f;color:#cfe0f5;border:1px solid #28344a;border-radius:4px;font-size:11px;padding:1px 4px;text-align:right;">
+      </span>
     </h2>
     <div id="tape-box"></div>
   </div>
@@ -6936,7 +6985,15 @@ async function refresh() {
   // 30s + 5m windows, computed server-side). The print table below it
   // is display-only — it is NOT the model signal.
   const VISIBLE_RECENT_PRINTS = 25;
-  const prints25 = (s.trades || []).slice(0, VISIBLE_RECENT_PRINTS);
+  // Min-size filter (like Bookmap Time&Sales min size): the size-10+ prints
+  // are already in s.trades, just buried under size-1 noise. Filter the full
+  // tape (up to 200) by size >= min, THEN take the most recent 25.
+  const _tapeMinEl = document.getElementById('tape-min-size');
+  let tapeMin = _tapeMinEl ? (parseInt(_tapeMinEl.value, 10) || 1) : 1;
+  if (tapeMin < 1) tapeMin = 1;
+  const prints25 = (s.trades || [])
+      .filter(t => (Number(t.size) || 0) >= tapeMin)
+      .slice(0, VISIBLE_RECENT_PRINTS);
   const tapeBox = document.getElementById('tape-box');
   const tapeBiasBox = document.getElementById('tape-prints-bias');
   const tf = s.tape_flow;
@@ -6994,7 +7051,8 @@ async function refresh() {
     let maxSize = 0;
     prints25.forEach(t => { const sz = Number(t.size) || 0; if (sz > maxSize) maxSize = sz; });
     tableHtml += '<div class="muted" style="font-size:10px;margin-top:6px;">' +
-                 `Recent prints (display only — model signal is the 30s/5m delta above)` +
+                 `Recent prints` + (tapeMin > 1 ? ` (size ≥ ${tapeMin})` : '') +
+                 ` (display only — model signal is the 30s/5m delta above)` +
                  '</div>';
     tableHtml += '<table style="font-size:11px;"><tr><th>#</th><th>Price</th><th>Size</th><th>Side</th></tr>';
     prints25.forEach((t, i) => {
@@ -7049,6 +7107,15 @@ async function refresh() {
 }
 
 }
+
+// Tape min-size: restore from localStorage + persist on change.
+(function(){
+  const el = document.getElementById('tape-min-size');
+  if (!el) return;
+  const saved = localStorage.getItem('pax-tape-min-size');
+  if (saved) el.value = saved;
+  el.addEventListener('input', () => localStorage.setItem('pax-tape-min-size', el.value));
+})();
 
 setInterval(refresh, 1000);
 refresh();

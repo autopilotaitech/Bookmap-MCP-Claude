@@ -63,22 +63,11 @@ def test_no_unsafe_innerhtml_pattern(html_body, pat):
 # Positive assertions: known dynamic fields are routed through _esc.
 # ---------------------------------------------------------------------------
 
+# Only the strip survives the 2026-05-28 overhaul; the edge/playbook/whynow
+# drawers (b.*, j.*, t.*, row v, reasons x) were removed as bloat.
 EXPECTED_ESCAPED_CALLS = [
     r"_esc\(s\.nearest\.label\)",
     r"_esc\(anchor\)",
-    r"_esc\(b\.name\)",
-    r"_esc\(b\.if\)",
-    r"_esc\(b\.then\)",
-    r"_esc\(j\.current_state",
-    r"_esc\(j\.active_level\)",
-    r"_esc\(t\.kind\)",
-    r"_esc\(t\.label\)",
-    r"_esc\(t\.headline\)",
-    r"_esc\(t\.details\)",
-    # row()'s v argument escaped
-    r"_esc\(v\)",
-    # reasons list items escaped
-    r"_esc\(x\)",
 ]
 
 
@@ -168,7 +157,7 @@ def test_send_chat_intercepts_deep_prefix(html_body):
 def test_stream_chat_message_posts_deep_flag(html_body):
     """The fetch body must include both message and deep keys."""
     assert re.search(
-        r"body:\s*JSON\.stringify\(\{message:\s*msg,\s*deep:\s*deep\}\)",
+        r"\{message:\s*msg,\s*deep:\s*deep\}",
         html_body), (
         "POST body must be {message: msg, deep: deep}")
 
@@ -182,10 +171,11 @@ def test_deep_prefix_strip_is_exactly_six_chars(html_body):
 
 def test_deep_empty_message_after_strip_is_noop(html_body):
     """An empty message after stripping `/deep ` must not send."""
-    # Match the conservative pattern: msg = ... .trim(); if (!msg) return;
-    assert re.search(r"msg = raw\.slice\(6\)\.trim\(\);\s+if \(!msg\) return;",
+    # Match the conservative pattern: msg = ... .trim(); if empty (and no
+    # attached image) return without POSTing.
+    assert re.search(r"msg = raw\.slice\(6\)\.trim\(\);\s+if \(!msg && !_pendingImage\) return;",
                        html_body), (
-        "empty-after-strip must return without POSTing")
+        "empty-after-strip (no image) must return without POSTing")
 
 
 def test_machine_blocks_are_hidden_from_pax_chat_transcript(html_body):
@@ -205,18 +195,6 @@ def test_machine_blocks_are_hidden_from_pax_chat_transcript(html_body):
         r"replace\(/<<PAX_FORECAST>>\[\\s\\S\]\*\$/g",
         html_body,
     ) is not None
-
-
-def test_playbook_render_holds_meaningful_state_for_30_seconds(html_body):
-    """Playbook panel must not flash every 1s during level churn."""
-    assert "const PLAYBOOK_HOLD_MS = 30000;" in html_body
-    assert "let _playbookHold" in html_body
-    assert "function renderPlaybook(j)" in html_body
-    assert "function playbookKey(j)" in html_body
-    assert "function isMeaningfulPlaybook(j)" in html_body
-    assert "now < _playbookHold.until" in html_body
-    assert "target.innerHTML = _playbookHold.html;" in html_body
-    assert "until: now + PLAYBOOK_HOLD_MS" in html_body
 
 
 def test_deep_tag_dom_node_built_via_textcontent(html_body):
@@ -324,9 +302,9 @@ def test_deep_request_via_regenerate_keeps_deep(html_body):
     # 1. Regenerate passes deep through.
     assert re.search(r"regenerateLastPax[\s\S]*?deep:\s*_lastRequest\.deep",
                        html_body)
-    # 2. _streamChatMessage posts deep on the wire.
-    assert re.search(r"body:\s*JSON\.stringify\(\{message:\s*msg,\s*deep:\s*deep\}\)",
-                       html_body)
+    # 2. _streamChatMessage posts deep on the wire (body is now conditional on
+    #    an attached image, but the message+deep object literal is still there).
+    assert re.search(r"\{message:\s*msg,\s*deep:\s*deep\}", html_body)
 
 
 # ---------------------------------------------------------------------------

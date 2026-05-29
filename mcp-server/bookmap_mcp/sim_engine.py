@@ -580,12 +580,19 @@ class SimEngine:
             n_today = c.execute(
                 "SELECT COUNT(*) AS n FROM orders WHERE alias=? AND status=? AND filled_ms>=?",
                 (self.alias, ST_FILLED, today_anchor)).fetchone()["n"]
+            # Losing closes today: each position-reducing fill that realized a
+            # negative delta. Sources the daily-stop circuit breaker.
+            n_losers = c.execute(
+                "SELECT COUNT(*) AS n FROM events WHERE alias=? AND kind='POSITION_UPDATE' "
+                "AND ts_ms>=? AND json_extract(payload,'$.realized_delta') < 0",
+                (self.alias, today_anchor)).fetchone()["n"]
         return {
             "alias": self.alias,
             "position": pos,
             "working": working,
             "fills_today": fills,
             "n_fills_today": n_today,
+            "losers_today": n_losers,
             "realized_today_usd": round(day_real or 0.0, 2),
         }
 

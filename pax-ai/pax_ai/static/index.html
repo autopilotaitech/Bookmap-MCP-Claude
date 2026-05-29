@@ -26,7 +26,8 @@
     -webkit-font-smoothing: antialiased;
   }
   .root {
-    display: grid; grid-template-rows: 30px 36px 1fr auto; height: 100vh;
+    /* rows: titlebar, strip, agentbar, agent-last, body(fills), input/footer */
+    display: grid; grid-template-rows: 30px 36px auto auto 1fr; height: 100vh;
     background:
       radial-gradient(120% 80% at 50% 0%, #131a25 0%, #0a0e15 55%, var(--bg-0) 100%);
     border: 1px solid rgba(54,214,255,0.10);
@@ -316,156 +317,42 @@
       <div id="conv">--</div>
     </div>
 
+    <style>
+      .agentbar{display:flex;align-items:center;justify-content:space-between;
+        gap:8px;padding:5px 10px;border-bottom:1px solid #1c2230;
+        background:#0c1018;font-size:11px}
+      .agentbar .st{display:flex;align-items:center;gap:6px;color:#9fb0c8}
+      .agentbar .adot{width:8px;height:8px;border-radius:50%;background:#445}
+      .agentbar .adot.on{background:#39d98a}
+      .agentbar .adot.armed{background:#ff5d5d;box-shadow:0 0 6px #ff5d5d}
+      .agentbar button{background:#162033;color:#cfe0f5;border:1px solid #28344a;
+        border-radius:5px;padding:3px 9px;font-size:11px;cursor:pointer}
+      .agentbar button:hover{background:#1d2942}
+      .agentbar button.armed{background:#3a1414;border-color:#7a2a2a;color:#ffb3b3}
+      .agentlast{padding:4px 10px;font-size:11px;color:#7d8aa0;
+        border-bottom:1px solid #141a26;min-height:14px;white-space:nowrap;
+        overflow:hidden;text-overflow:ellipsis}
+      .tick{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;
+        line-height:1.5;padding:1px 10px;white-space:pre-wrap;color:#8fa1bb;
+        border-left:2px solid #222b3a}
+      .tick.tk-long{color:#39d98a;border-left-color:#2a7a55}
+      .tick.tk-short{color:#ff6b6b;border-left-color:#7a2a2a}
+      .tick.tk-wait{color:#6f7c92;border-left-color:#222b3a}
+      .tick.tk-act{color:#cfe0f5;border-left-color:#3a4a66}
+      .tick.tk-err{color:#ffb35c;border-left-color:#7a5a2a}
+    </style>
+    <div class="agentbar" id="agentbar">
+      <div class="st"><span class="adot" id="agent-dot"></span>
+        <span id="agent-label">AGENT off</span></div>
+      <div>
+        <button id="agent-toggle" onclick="agentToggle()">Start</button>
+        <button id="agent-arm" onclick="agentArm()"
+                title="Observe = think + log only. Armed = place SIM orders (never live).">Observe</button>
+      </div>
+    </div>
+    <div class="agentlast" id="agent-last">agent idle</div>
+
     <div class="body" id="body">
-      <div class="whynow-area" id="whynow-area"></div>
-
-      <div class="drawer cyan open" id="drawer-edge">
-        <div class="drawer-head" onclick="toggleDrawer('drawer-edge')">
-          <span class="ttl">EDGE CALCULUS</span>
-          <span class="chev">&#9662;</span>
-        </div>
-        <div class="drawer-body">
-          <div class="inner edge-card" id="edge"><div id="edge-content">loading...</div></div>
-        </div>
-      </div>
-
-      <div class="drawer" id="drawer-playbook">
-        <div class="drawer-head" onclick="toggleDrawer('drawer-playbook')">
-          <span class="ttl">PLAYBOOK</span>
-          <span class="chev">&#9662;</span>
-        </div>
-        <div class="drawer-body">
-          <div class="inner playbook" id="playbook"><div id="playbook-content">loading...</div></div>
-        </div>
-      </div>
-
-    <details id="todays-bus">
-      <summary>Today's Bus <span id="todays-bus-state-dot" title="status">o</span></summary>
-      <div id="todays-bus-body">
-        <div id="todays-bus-summary">UTC day -- (loading)</div>
-        <div id="todays-bus-recent-levels" style="white-space: pre-line">Recent level events: (loading)</div>
-        <div id="todays-bus-recent-triggers" style="white-space: pre-line">Recent triggers: (loading)</div>
-        <div id="todays-bus-disabled" style="display:none">
-          <p>Capture disabled. Set <code>feature_bus.enabled=true</code> in
-             <code>pax_ai_config.json</code> and restart Pax AI to enable
-             passive capture.</p>
-        </div>
-      </div>
-    </details>
-    <script>
-    (function() {
-      const det = document.getElementById("todays-bus");
-      const dot = document.getElementById("todays-bus-state-dot");
-      const sum = document.getElementById("todays-bus-summary");
-      const lvl = document.getElementById("todays-bus-recent-levels");
-      const trg = document.getElementById("todays-bus-recent-triggers");
-      const dis = document.getElementById("todays-bus-disabled");
-      let timers = [];
-
-      function clearTimers() {
-        timers.forEach(clearInterval);
-        timers = [];
-      }
-
-      function setDot(color, tip) {
-        if (!dot) return;
-        dot.textContent = "o";
-        dot.style.color = color;
-        dot.title = tip || "";
-      }
-
-      function setDisabled(yes) {
-        if (!dis || !sum || !lvl || !trg) return;
-        dis.style.display = yes ? "" : "none";
-        sum.style.display = yes ? "none" : "";
-        lvl.style.display = yes ? "none" : "";
-        trg.style.display = yes ? "none" : "";
-      }
-
-      async function pollStatusAndSummary() {
-        try {
-          const [statusR, sumR] = await Promise.all([
-            fetch("/api/pax/bus/status").then(r => r.json()),
-            fetch("/api/pax/bus/summary").then(r => r.json()),
-          ]);
-          if (!statusR.enabled) {
-            setDot("#888", "capture disabled");
-            setDisabled(true);
-            return;
-          }
-          setDisabled(false);
-          if (!statusR.healthy || !statusR.running) {
-            setDot("#d33", statusR.lastError || "unhealthy");
-          } else if ((statusR.lastWriteAgeMs ?? 0) >= 5000) {
-            setDot("#cc0", "idle - no recent writes");
-          } else {
-            setDot("#3c3", "live");
-          }
-          const c = sumR.counts || {};
-          const ago = statusR.lastWriteAgeMs == null ? "never"
-                      : (statusR.lastWriteAgeMs/1000).toFixed(1) + " s ago";
-          sum.textContent =
-            "UTC day " + sumR.date + ": " +
-            (c.snapshot_features||0) + " snapshots, " +
-            (c.level_events||0) + " level events, " +
-            (c.trigger_events||0) + " triggers, " +
-            (c.ai_turns||0) + " AI turns. Last write: " + ago + ".";
-        } catch (e) {
-          setDot("#d33", "fetch failed: " + e);
-        }
-      }
-
-      async function pollRecent() {
-        try {
-          const [lvR, trR] = await Promise.all([
-            fetch("/api/pax/bus/recent?table=level_events&limit=10").then(r => r.json()),
-            fetch("/api/pax/bus/recent?table=trigger_events&limit=10").then(r => r.json()),
-          ]);
-          if (lvR.enabled === false) return;
-          // Defense in depth: render DB-backed row values via textContent only.
-          // The divs use CSS white-space: pre-line so \n is visible.
-          if (lvl && (lvR.rows||[]).length) {
-            lvl.textContent = "Recent level events:\n" +
-              lvR.rows.map(r =>
-                new Date(r.ts_ms).toISOString().slice(11,19) + " " +
-                r.alias + " " + r.level_label + " " +
-                (r.prev_decision||"-") + "->" + (r.new_decision||"-") +
-                " (" + (r.prev_confidence||0).toFixed(2) + "->" +
-                (r.new_confidence||0).toFixed(2) + ")"
-              ).join("\n");
-          } else if (lvl) {
-            lvl.textContent = "Recent level events: (none today)";
-          }
-          if (trg && (trR.rows||[]).length) {
-            trg.textContent = "Recent triggers:\n" +
-              trR.rows.map(r =>
-                new Date(r.ts_ms).toISOString().slice(11,19) + " " +
-                r.alias + " " + r.kind + " " +
-                (r.label||"") + " " + r.severity
-              ).join("\n");
-          } else if (trg) {
-            trg.textContent = "Recent triggers: (none today)";
-          }
-        } catch (e) {
-          // Quiet: leave previous content in place.
-        }
-      }
-
-      function start() {
-        pollStatusAndSummary();
-        pollRecent();
-        timers.push(setInterval(pollStatusAndSummary, 2000));
-        timers.push(setInterval(pollRecent, 5000));
-      }
-
-      if (det) {
-        det.addEventListener("toggle", () => {
-          clearTimers();
-          if (det.open) start();
-        });
-      }
-    })();
-    </script>
 
       <div class="transcript-wrap">
         <div class="transcript" id="transcript"></div>
@@ -475,8 +362,22 @@
 
     <div class="cost-footer" id="cost-footer" hidden></div>
 
+    <div id="attach-chip" style="display:none;align-items:center;gap:8px;padding:5px 12px;
+      border-top:1px solid var(--line);background:var(--bg-1);font-size:11px;color:var(--text-dim)">
+      <img id="attach-thumb" alt="" style="height:34px;width:34px;object-fit:cover;border-radius:5px;border:1px solid var(--line-2)">
+      <span id="attach-name">image attached</span>
+      <span onclick="clearPendingImage()" title="remove"
+        style="cursor:pointer;color:var(--red);margin-left:auto;font-weight:700">&times;</span>
+    </div>
     <div class="input">
-      <textarea id="chat-input" placeholder="ask about flow, levels, or tap the mic..." rows="1"></textarea>
+      <textarea id="chat-input" placeholder="ask, attach an image, or tap the mic..." rows="1"></textarea>
+      <input type="file" id="attach-input" accept="image/*" style="display:none">
+      <button class="icon-btn attach" id="attach-btn" title="attach image"
+              onclick="document.getElementById('attach-input').click()">
+        <svg viewBox="0 0 16 16" fill="currentColor">
+          <path d="M9.5 2.5a3 3 0 0 0-3 3v6a1.5 1.5 0 0 0 3 0V6a.5.5 0 0 0-1 0v5.5a.5.5 0 0 1-1 0v-6a2 2 0 1 1 4 0v6a3.5 3.5 0 0 1-7 0V5a.5.5 0 0 1 1 0v6.5a2.5 2.5 0 0 0 5 0v-6a3 3 0 0 0-3-3z"/>
+        </svg>
+      </button>
       <button class="icon-btn mic" id="mic-btn" title="voice (Web Speech API)"
               onclick="toggleMic()">
         <svg viewBox="0 0 16 16" fill="currentColor">
@@ -656,158 +557,101 @@ async function pollContext() {
   }
 }
 
-async function pollLevel(label) {
-  const target = document.getElementById('edge-content');
-  if (!label) { target.textContent = 'no active level in proximity'; return; }
-  try {
-    const r = await fetch('/api/pax/level/' + encodeURIComponent(label), {cache:'no-store'});
-    if (!r.ok) {
-      // Surface the server-side error envelope so a URL-encoding
-      // mismatch is diagnosable from the panel instead of silently
-      // showing "not found". Falls back to the legacy message if the
-      // body is not parseable JSON.
-      let detail = '';
-      try {
-        const errJson = await r.json();
-        if (errJson && errJson.available) {
-          detail = ' / available: ' + errJson.available.join(',');
-        }
-        if (errJson && errJson.error) {
-          detail = ' (server saw "' + errJson.error.replace(/^level not found: /, '') + '")' + detail;
-        }
-      } catch (e) { /* keep detail empty on parse failure */ }
-      target.textContent = 'level ' + label + ' not found' + detail;
-      return;
-    }
-    const j = await r.json();
-    const e = j.edge_calculus || {};
-    // Numeric fields are .toFixed(...) -> safe, but string fields (label,
-    // decision, size_tier) come from the snapshot and must be escaped.
-    const row = (k, v) => '<div class="k">' + _esc(k) + '</div><div class="v">' +
-      (v == null ? '-' : _esc(v)) + '</div>';
-    target.innerHTML = '<div class="edge-grid">'
-      + row('label',         j.label)
-      + row('decision',      j.decision || '-')
-      + row('confidence',    j.confidence != null ? j.confidence.toFixed(2) : '-')
-      + row('size_tier',     e.size_tier)
-      + row('expected_R',    e.expected_R != null ? e.expected_R.toFixed(2) : '-')
-      + row('prob_payline',  e.prob_pay_for_trade != null ? e.prob_pay_for_trade.toFixed(2) : '-')
-      + row('prob_next',     e.prob_reach_next_rung != null ? e.prob_reach_next_rung.toFixed(2) : '-')
-      + row('max_heat',      e.max_heat_pts != null ? e.max_heat_pts.toFixed(1) + 'p' : '-')
-      + row('entry',         e.scratch_price != null ? e.scratch_price.toFixed(2) : '-')
-      + row('payline',       e.payline_price != null ? e.payline_price.toFixed(2) : '-')
-      + row('rung1',         e.rung1_price != null ? e.rung1_price.toFixed(2) : '-')
-      + row('stop',          e.invalidation_price != null ? e.invalidation_price.toFixed(2) : '-')
-      + '</div>'
-      + (e.reasons && e.reasons.length
-          ? '<div class="reasons"><ul>' + e.reasons.map(x => '<li>' + _esc(x) + '</li>').join('') + '</ul></div>'
-          : '');
-  } catch (e) { target.textContent = 'edge fetch error: ' + e; }
-}
-
-const PLAYBOOK_HOLD_MS = 30000;
-let _playbookHold = {key: '', html: '', until: 0};
-
-function renderPlaybook(j) {
-  // current_state, active_level, branch.name/.if/.then are all snapshot
-  // fields and must be escaped before going into innerHTML.
-  const head = '<div><span class="state">' + _esc(j.current_state || '-') +
-    '</span>' + (j.active_level ? ' at <b>' + _esc(j.active_level) + '</b>' : '') + '</div>';
-  const branches = (j.branches || []).map(b =>
-    '<div class="branch">' +
-      '<div class="nm">' + _esc(b.name) + '</div>' +
-      '<div class="iff">if: ' + _esc(b.if) + '</div>' +
-      '<div class="ths">then: ' + _esc(b.then) + '</div>' +
-    '</div>').join('');
-  return head +
-    (branches || '<div style="color:var(--text-faint); padding-top:4px">no branches active</div>');
-}
-
-function playbookKey(j) {
-  const branches = (j.branches || []).map(b =>
-    [b.name || '', b.if || '', b.then || ''].join('|')).join('||');
-  return [j.current_state || '', j.active_level || '', branches].join('::');
-}
-
-function isMeaningfulPlaybook(j) {
-  return !!(j.active_level || (j.current_state && j.current_state !== 'WAIT_FOR_LEVEL')
-    || (j.branches && j.branches.length));
-}
-
-async function pollPlaybook() {
-  const target = document.getElementById('playbook-content');
-  try {
-    const r = await fetch('/api/pax/playbook', {cache:'no-store'});
-    if (!r.ok) { target.textContent = '-'; return; }
-    const j = await r.json();
-    const now = Date.now();
-    const html = renderPlaybook(j);
-    const key = playbookKey(j);
-    const meaningful = isMeaningfulPlaybook(j);
-
-    // The snapshot can churn level/branch state every second. Pin the
-    // last meaningful playbook for 30s so the trader has time to read it.
-    if (_playbookHold.html && key !== _playbookHold.key && now < _playbookHold.until) {
-      target.innerHTML = _playbookHold.html;
-      return;
-    }
-    target.innerHTML = html;
-    if (meaningful) {
-      _playbookHold = {key: key, html: html, until: now + PLAYBOOK_HOLD_MS};
-    } else if (now >= _playbookHold.until) {
-      _playbookHold = {key: '', html: '', until: 0};
-    }
-  } catch (e) { target.textContent = 'playbook fetch error: ' + e; }
-}
-
-async function pollWhyNow() {
-  const target = document.getElementById('whynow-area');
-  try {
-    const r = await fetch('/api/pax/whynow', {cache:'no-store'});
-    if (!r.ok) { target.innerHTML = ''; return; }
-    const j = await r.json();
-    const triggers = j.triggers || [];
-    if (!triggers.length) { target.innerHTML = ''; return; }
-    const html = ['<div class="whynow">'];
-    for (const t of triggers) {
-      const sev = (t.severity || 'LOW').toUpperCase();
-      const kind = _esc(t.kind);
-      const label = _esc(t.label);
-      const headline = _esc(t.headline);
-      html.push(
-        '<div class="chip ' + sev + '" onclick="this.classList.toggle(\'open\')">' +
-          '<div class="sev">' + sev + '</div>' +
-          '<div class="body-txt">' +
-            '<span class="kind">' + kind + (t.label ? ' &middot; ' + label : '') + '</span>' +
-            '<span class="headline">' + headline + '</span>' +
-            (t.details ? '<div class="details">' + _esc(t.details) + '</div>' : '') +
-          '</div>' +
-          '<div class="ask" title="ask Pax about this trigger" ' +
-                'data-kind="'     + kind     + '" ' +
-                'data-label="'    + label    + '" ' +
-                'data-headline="' + headline + '">&#10148;</div>' +
-        '</div>'
-      );
-    }
-    html.push('</div>');
-    target.innerHTML = html.join('');
-    // Wire ask buttons. Listeners are re-attached every tick (innerHTML
-    // replaces the DOM nodes) -- cheap and avoids stale refs.
-    target.querySelectorAll('.chip .ask').forEach(btn => {
-      btn.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        askAboutTrigger(btn.dataset.kind, btn.dataset.label, btn.dataset.headline);
-      });
-    });
-  } catch (e) { /* keep prior render on transient errors */ }
-}
-
 async function tick() {
-  const label = await pollContext();
-  await Promise.all([pollLevel(label), pollPlaybook(), pollWhyNow()]);
+  await pollContext();   // strip only; analysis drawers removed
 }
 tick();
 setInterval(tick, 1000);
+
+// ---------- agentic sim trader control ----------
+let _agentState = {running:false, armed:false};
+let _lastTickTs = 0;
+
+// The actual scroll container is .transcript-wrap (overflow-y:auto), NOT
+// #transcript (its non-scrolling child). Pin it to the bottom on every update.
+function scrollBottom(){
+  const w = document.querySelector('.transcript-wrap');
+  if (w) w.scrollTop = w.scrollHeight;
+}
+
+// Stream each new agent cycle into the transcript like a terminal log.
+function appendAgentTick(L, armed){
+  const tr = document.getElementById('transcript'); if(!tr || !L) return;
+  const hh = L.ts_ms ? new Date(L.ts_ms).toTimeString().slice(0,8) : '';
+  const act = L.action || (L.error ? 'ERR' : '?');
+  const why = L.rationale || L.reason || L.governor || L.error || '';
+  const a = String(act);
+  const cls = a.indexOf('LONG')>=0 ? 'tk-long' : a.indexOf('SHORT')>=0 ? 'tk-short'
+    : (a==='WAIT'||a==='HOLD') ? 'tk-wait' : (a==='ERR') ? 'tk-err' : 'tk-act';
+  const div = document.createElement('div');
+  div.className = 'tick ' + cls;
+  div.textContent = hh + '  ' + (armed ? '[ARMED] ' : '') + a + (why ? ('  ' + why) : '');
+  tr.appendChild(div);
+  scrollBottom();
+}
+function renderAgent(s){
+  if(!s) return;
+  _agentState = {running:!!s.running, armed:!!s.armed};
+  const dot=document.getElementById('agent-dot');
+  const lab=document.getElementById('agent-label');
+  const tog=document.getElementById('agent-toggle');
+  const arm=document.getElementById('agent-arm');
+  if(!dot) return;
+  dot.className = 'adot' + (s.running ? (s.armed ? ' armed' : ' on') : '');
+  lab.textContent = s.error ? ('AGENT ' + s.error)
+    : ('AGENT ' + (s.running ? (s.armed ? 'ARMED (sim)' : 'observing') : 'off')
+       + (s.cycles!=null ? (' · ' + s.cycles + ' cycles') : ''));
+  tog.textContent = s.running ? 'Stop' : 'Start';
+  arm.textContent = s.armed ? 'Armed' : 'Observe';
+  arm.className = s.armed ? 'armed' : '';
+  const last=document.getElementById('agent-last'), L=s.last;
+  if(L){
+    const why = L.rationale || L.reason || L.governor || '';
+    last.textContent = (L.action||'?') + (why ? ' — ' + why : '');
+    if(L.ts_ms && L.ts_ms !== _lastTickTs){
+      _lastTickTs = L.ts_ms;
+      appendAgentTick(L, s.armed);   // new cycle -> terminal line
+    }
+  }
+}
+async function pollAgent(){
+  try{ renderAgent(await (await fetch('/api/pax/agent/status')).json()); }catch(e){}
+}
+async function _agentPost(path, body){
+  try{
+    const r = await fetch(path, {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify(body||{})});
+    renderAgent(await r.json());
+  }catch(e){}
+}
+// Generic terminal line (system/command echo), same look as agent ticks.
+function appendTermLine(text, cls){
+  const tr=document.getElementById('transcript'); if(!tr) return;
+  const div=document.createElement('div');
+  div.className='tick '+(cls||'tk-act');
+  div.textContent=text;
+  tr.appendChild(div);
+  scrollBottom();
+}
+function agentToggle(){
+  if(_agentState.running){
+    appendTermLine('[STOP] agent stopped', 'tk-wait');
+    _agentPost('/api/pax/agent/stop');
+  } else {
+    appendTermLine('[START] agent running ('+(_agentState.armed?'armed':'observe')+')', 'tk-act');
+    _agentPost('/api/pax/agent/start', {armed:_agentState.armed});
+  }
+}
+// Inline toggle, no browser confirm popup. Sim-only; arming just turns on
+// paper-order execution (never live).
+function agentArm(){
+  const next = !_agentState.armed;
+  appendTermLine(next ? '[ARMED] sim execution ON - placing paper orders'
+                      : '[OBSERVE] sim execution OFF', next ? 'tk-short' : 'tk-wait');
+  _agentPost('/api/pax/agent/arm', {armed:next});
+}
+pollAgent();
+setInterval(pollAgent, 2000);
 
 // ---------- chat ----------
 let _streamingPaxBubble = null;   // currently-streaming Pax turn DOM
@@ -840,6 +684,13 @@ function appendTurn(kind, who, text, isStreaming, opts) {
   msgEl.dataset.rawText = text || '';
   msgEl.textContent = kind === 'pax' ? stripMachineBlocks(text || '') : (text || '');
   div.appendChild(msgEl);
+  // Attached image thumbnail (YOU bubble). opts.image is a data: URL.
+  if (opts && opts.image) {
+    const im = document.createElement('img');
+    im.src = opts.image;
+    im.style.cssText = 'max-width:180px;max-height:140px;border-radius:6px;margin-top:6px;border:1px solid var(--line-2);display:block';
+    div.appendChild(im);
+  }
   // Phase 3 regenerate: each Pax bubble gets a ↻ button that surfaces
   // only when `.last-completed` is set (via CSS), wired up in the
   // _streamChatMessage finally branch.
@@ -852,7 +703,7 @@ function appendTurn(kind, who, text, isStreaming, opts) {
     div.appendChild(regen);
   }
   t.appendChild(div);
-  div.scrollIntoView({block: 'end', behavior: 'smooth'});
+  scrollBottom();
   return div;
 }
 
@@ -876,6 +727,7 @@ async function _streamChatMessage(request) {
   const msg = request && request.message;
   if (!msg) return;
   const deep = !!(request && request.deep);
+  const image = (request && request.image) || null;   // {media_type,data,dataUrl}
   const displayText = (request && request.displayText) || msg;
   // suppressUserEcho is set by regenerateLastPax so the original YOU
   // bubble in the transcript is preserved and only the Pax response is
@@ -891,7 +743,8 @@ async function _streamChatMessage(request) {
   }
 
   if (!suppressUserEcho) {
-    appendTurn('you', 'YOU', displayText, false, {deep: deep});
+    appendTurn('you', 'YOU', displayText, false,
+               {deep: deep, image: image && image.dataUrl});
   }
   _chatInFlight = true;
   document.body.classList.add('in-flight');
@@ -903,7 +756,9 @@ async function _streamChatMessage(request) {
     const r = await fetch('/api/pax/chat/stream', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({message: msg, deep: deep}),
+      body: JSON.stringify(image
+        ? {message: msg, deep: deep, image: {media_type: image.media_type, data: image.data}}
+        : {message: msg, deep: deep}),
     });
     if (!r.ok || !r.body) {
       msgEl.textContent = 'request failed: ' + r.status;
@@ -983,7 +838,7 @@ async function sendChat() {
   if (_chatInFlight) return;
   const ta = document.getElementById('chat-input');
   const raw = (ta.value || '').trim();
-  if (!raw) return;
+  if (!raw && !_pendingImage) return;     // allow image-only sends
   ta.value = '';                          // clear-on-send per spec
   // Slash commands intercepted client-side. /forget wipes current run's
   // history on the server AND clears the live transcript DOM. /forget
@@ -993,6 +848,19 @@ async function sendChat() {
     await runForget();
     return;
   }
+  // Terminal control commands for the agent loop.
+  const cmd = raw.toLowerCase();
+  if (cmd === '/clear') { document.getElementById('transcript').innerHTML = ''; return; }
+  if (cmd === '/start') {
+    appendTermLine('[START] agent running ('+(_agentState.armed?'armed':'observe')+')', 'tk-act');
+    _agentPost('/api/pax/agent/start', {armed:_agentState.armed}); return; }
+  if (cmd === '/stop')  { appendTermLine('[STOP] agent stopped', 'tk-wait');
+    _agentPost('/api/pax/agent/stop'); return; }
+  if (cmd === '/arm')   { appendTermLine('[ARMED] sim execution ON', 'tk-short');
+    _agentPost('/api/pax/agent/arm', {armed:true}); return; }
+  if (cmd === '/observe' || cmd === '/disarm') {
+    appendTermLine('[OBSERVE] sim execution OFF', 'tk-wait');
+    _agentPost('/api/pax/agent/arm', {armed:false}); return; }
   // /deep mode: strip exactly one "/deep " prefix and flip the model
   // selector server-side. Empty after strip -> no-op (do not send).
   let deep = false;
@@ -1000,10 +868,65 @@ async function sendChat() {
   if (raw.startsWith('/deep ')) {
     deep = true;
     msg = raw.slice(6).trim();
-    if (!msg) return;
+    if (!msg && !_pendingImage) return;
   }
-  await _streamChatMessage({message: msg, deep: deep});
+  const img = _pendingImage;
+  if (img) clearPendingImage();
+  if (!msg && img) msg = 'Read / describe this image.';
+  await _streamChatMessage({message: msg, deep: deep, image: img});
 }
+
+// ---------- image attachments ----------
+let _pendingImage = null;   // {media_type, data (base64), dataUrl}
+function clearPendingImage(){
+  _pendingImage = null;
+  const chip = document.getElementById('attach-chip');
+  if (chip) chip.style.display = 'none';
+  const fi = document.getElementById('attach-input');
+  if (fi) fi.value = '';
+}
+function _showAttachChip(name, dataUrl){
+  const chip = document.getElementById('attach-chip'); if (!chip) return;
+  document.getElementById('attach-thumb').src = dataUrl;
+  document.getElementById('attach-name').textContent = name || 'image attached';
+  chip.style.display = 'flex';
+}
+function _readImageFile(file){
+  if (!file || !file.type || file.type.indexOf('image/') !== 0) return;
+  const fr = new FileReader();
+  fr.onload = () => {
+    const dataUrl = fr.result;                 // data:<type>;base64,<b64>
+    const comma = String(dataUrl).indexOf(',');
+    const data = comma >= 0 ? String(dataUrl).slice(comma + 1) : String(dataUrl);
+    _pendingImage = {media_type: file.type, data: data, dataUrl: dataUrl};
+    _showAttachChip(file.name, dataUrl);
+  };
+  fr.readAsDataURL(file);
+}
+(function wireAttach(){
+  const fi = document.getElementById('attach-input');
+  if (fi) fi.addEventListener('change', e => {
+    if (e.target.files && e.target.files[0]) _readImageFile(e.target.files[0]);
+  });
+  document.addEventListener('paste', e => {
+    const items = (e.clipboardData && e.clipboardData.items) || [];
+    for (const it of items) {
+      if (it.type && it.type.indexOf('image/') === 0) {
+        const f = it.getAsFile(); if (f) { _readImageFile(f); e.preventDefault(); }
+        break;
+      }
+    }
+  });
+  const inp = document.querySelector('.input');
+  if (inp) {
+    inp.addEventListener('dragover', e => e.preventDefault());
+    inp.addEventListener('drop', e => {
+      e.preventDefault();
+      const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (f) _readImageFile(f);
+    });
+  }
+})();
 
 async function runForget() {
   try {
@@ -1071,9 +994,14 @@ function tsToHHMMSS(ts_ms) {
   return d.toTimeString().slice(0,8);
 }
 
-// Load history once at page boot. Idempotent against multiple invocations
-// because the transcript only renders rows from /history at startup.
-loadHistory();
+// Clean terminal on boot: do NOT replay old chat prose into the view. The
+// transcript fills with live agent ticks + new chat. History is still
+// journaled (memory); /forget wipes it, /clear clears the view.
+(function bootTerminal(){
+  const tr = document.getElementById('transcript');
+  if (tr) tr.innerHTML = '';
+  appendTermLine('PAX terminal ready - /start to run agent, /arm to trade sim, /stop, /clear', 'tk-wait');
+})();
 
 function askAboutTrigger(kind, label, headline) {
   if (_chatInFlight) return;
@@ -1108,7 +1036,7 @@ function handleSseEvent(raw, msgEl) {
     const rawText = (msgEl.dataset.rawText || '') + (obj.text || '');
     msgEl.dataset.rawText = rawText;
     msgEl.textContent = stripMachineBlocks(rawText);
-    msgEl.parentElement.scrollIntoView({block: 'end', behavior: 'instant'});
+    scrollBottom();
   } else if (event === 'start') {
     appendMeta(_streamingPaxBubble,
       'model=' + obj.model + ' router=' + obj.router_primary
