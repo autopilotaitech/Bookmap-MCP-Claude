@@ -5,6 +5,7 @@ this as its advisory baseline and the live loop executes it.
 """
 import datetime
 
+from bookmap_mcp import pax_expectancy
 from bookmap_mcp import pax_loop
 
 NOW = datetime.datetime(2026, 5, 28, 19, 30, 0)
@@ -53,6 +54,7 @@ def test_follow_long_breakout_places_stop_limit_at_orh():
     assert o["stop_loss"] == round(mid_or - pax_loop.STOP_BREATHING_PTS, 2)
     assert o["stop_loss"] < o["entry_stop"]
     assert o["tps"] == [30350.0, 30405.0]       # level +10, level +65
+    assert o["expectancy_source"] == "heuristic"
 
 
 def test_follow_short_breakdown_at_orl():
@@ -176,3 +178,41 @@ def test_off_level_inside_or_middle_lock_still_blocks():
     p = D(s, status())
     assert p["state"] == "SIT"
     assert "middleLock" in p["reason"]
+
+
+def test_learned_expectancy_source_flows_into_plan_and_order():
+    stats = {
+        pax_expectancy.setup_key("*", "LONG", "OR-H", "*"):
+            pax_expectancy.ExpectancyStats(
+                n=12, avg_r=-0.8, hit_rate=0.1, partial_rate=0.1,
+                miss_rate=0.8)
+    }
+    p = pax_loop.decide(snap(), status(), NOW, NOW_MS, expectancy_stats=stats)
+    assert p["state"] == "PLACE"
+    assert p["expectancy_source"].startswith("learned:n=12")
+    assert p["order"]["expectancy_source"] == p["expectancy_source"]
+
+
+def test_runtime_policy_throttle_blocks_bad_setup_bucket():
+    policy = {"suggestions": [{
+        "setup": "OR_BREAK_ACCEPT|LONG|OR-H|ETH",
+        "action": "THROTTLE",
+        "reason": "negative expectancy meanR=-0.50 hit=20%",
+    }]}
+    p = pax_loop.decide(snap(), status(), NOW, NOW_MS, runtime_policy=policy)
+    assert p["state"] == "ARMED"
+    assert p["order"] is None
+    assert p["runtime_policy"]["action"] == "THROTTLE"
+    assert "blocked by runtime THROTTLE" in p["reason"]
+
+
+def test_runtime_policy_promote_can_lower_floor_modestly():
+    policy = {"suggestions": [{
+        "setup": "OR_BREAK_ACCEPT|LONG|OR-H|ETH",
+        "action": "PROMOTE",
+        "reason": "positive expectancy meanR=+0.50 hit=70%",
+    }]}
+    p = pax_loop.decide(snap(conf=0.21), status(), NOW, NOW_MS,
+                        runtime_policy=policy)
+    assert p["state"] == "PLACE"
+    assert p["runtime_policy"]["action"] == "PROMOTE"

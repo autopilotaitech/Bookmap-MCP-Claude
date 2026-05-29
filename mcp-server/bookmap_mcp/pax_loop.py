@@ -26,7 +26,10 @@ session_type. Full spec: _session_snapshots/eth_trade_loop_spec.md.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
+
+from . import pax_brain, pax_runtime_policy
+from .pax_expectancy import ExpectancyStats
 
 # --- rule profile (Phase 1 will externalize to pax_rules.json) ---------------
 # Floors LOWERED for the sim-aggressive mandate (operator 2026-05-29: "trade the
@@ -134,42 +137,42 @@ def _trend_follow_side(snap: Dict[str, Any], mid: Optional[float],
     return None
 
 
-def _trend_order(side: str, mid: float, orH: float, orL: float,
-                 stype: str, snap: Dict[str, Any]) -> Dict[str, Any]:
+def _order_from_thesis(thesis: pax_brain.Thesis) -> Dict[str, Any]:
     slip = ENTRY_SLIP_TICKS * TICK
-    trigger_offset = TREND_ENTRY_OFFSET_TICKS * TICK
-    mid_or = (orH + orL) / 2.0
-    tape = snap.get("tape_flow") or {}
-    trend_signal = snap.get("trend_signal") or {}
-    conv = snap.get("conviction") or {}
-    if side == "LONG":
-        entry_stop = round(mid + trigger_offset, 2)
-        order = {"sidecmd": "long", "qty": 2, "entry_stop": entry_stop,
-                 "entry_limit": round(entry_stop + slip, 2),
-                 "stop_loss": round(mid_or - STOP_BREATHING_PTS, 2),
-                 "tps": [round(entry_stop + PAYLINE, 2),
-                         round(entry_stop + RUNG, 2)],
-                 "level": "TREND", "side": "LONG"}
+    if thesis.setup.side == "LONG":
+        entry_limit = round(thesis.entry + slip, 2)
+        sidecmd = "long"
     else:
-        entry_stop = round(mid - trigger_offset, 2)
-        order = {"sidecmd": "short", "qty": 2, "entry_stop": entry_stop,
-                 "entry_limit": round(entry_stop - slip, 2),
-                 "stop_loss": round(mid_or + STOP_BREATHING_PTS, 2),
-                 "tps": [round(entry_stop - PAYLINE, 2),
-                         round(entry_stop - RUNG, 2)],
-                 "level": "TREND", "side": "SHORT"}
-    order["reason"] = (
-        f"v5 TREND_FOLLOW {side} off-level "
-        f"tape={round(_f(tape.get('deltaScore')) or 0.0, 2)} "
-        f"trend={trend_signal.get('kind')} "
-        f"conv={round(_f(conv.get('score')) or 0.0, 2)} [{stype}]"
-    )
-    order["tag"] = "TRENDV1"
-    return order
+        entry_limit = round(thesis.entry - slip, 2)
+        sidecmd = "short"
+    reason = thesis.why_now
+    if thesis.setup.kind == "OFF_LEVEL_AUCTION_DRIVE":
+        reason = f"v6 TREND_FOLLOW {thesis.setup.side} {reason}"
+    else:
+        reason = f"v6 {reason}"
+    return {
+        "sidecmd": sidecmd,
+        "qty": 2,
+        "entry_stop": thesis.entry,
+        "entry_limit": entry_limit,
+        "stop_loss": thesis.stop,
+        "tps": thesis.targets,
+        "level": thesis.setup.level,
+        "side": thesis.setup.side,
+        "setup_type": thesis.setup.kind,
+        "expectancy": thesis.expectancy,
+        "expectancy_source": thesis.expectancy_source,
+        "invalidation": thesis.invalidation,
+        "reason": reason,
+        "tag": thesis.tag,
+    }
 
 
 def decide(snap: Dict[str, Any], status: Dict[str, Any],
-           now_dt, now_ms: int) -> Dict[str, Any]:
+           now_dt, now_ms: int,
+           expectancy_stats: Optional[Mapping[str, ExpectancyStats]] = None,
+           runtime_policy: Optional[Mapping[str, Any]] = None,
+           ) -> Dict[str, Any]:
     """Pure decision. Returns a plan dict (no side effects)."""
     ol = snap.get("or_levels") or {}
     ses = snap.get("session") or {}
@@ -200,7 +203,11 @@ def decide(snap: Dict[str, Any], status: Dict[str, Any],
          "orW": orW, "code": code, "anchorMode": anchor,
          "inProx": ol.get("inProximity"),
          "prox_decision": (prox or {}).get("decision"),
-         "prox_conf": (prox or {}).get("confidence"), "pos_size": pos}
+         "prox_conf": (prox or {}).get("confidence"), "pos_size": pos,
+         "market_state": pax_brain.classify_market_state(snap).code,
+         "money_score": pax_brain.money_score(snap),
+         "setup_type": None, "expectancy": None, "expectancy_source": None,
+         "invalidation": None, "runtime_policy": None}
 
     def cancel_stale(why):
         if wentry:
@@ -263,79 +270,84 @@ def decide(snap: Dict[str, Any], status: Dict[str, Any],
                      reason=f"resting {wside} entry working; let price reach it")
         return p
 
-    if not ol.get("inProximity") or prox is None:
-        side = _trend_follow_side(snap, _f(mid), _f(orH), _f(orL))
-        if side is None:
+    thesis = pax_brain.best_thesis(
+        snap,
+        session_type=stype,
+        payline=PAYLINE,
+        rung=RUNG,
+        stop_breathing_pts=STOP_BREATHING_PTS,
+        entry_slip_ticks=ENTRY_SLIP_TICKS,
+        tick=TICK,
+        trend_entry_offset_ticks=TREND_ENTRY_OFFSET_TICKS,
+        expectancy_stats=expectancy_stats,
+    )
+    if thesis is None:
+        if prox is None or not ol.get("inProximity"):
             cancel_stale("not in proximity of any level and no aligned trend-follow read")
-            return p
-        if last_exit is not None and (now_ms - last_exit) < COOLDOWN_MIN * 60_000:
-            mins = round((now_ms - last_exit) / 60_000, 1)
-            p.update(state="COOLDOWN", level="TREND",
-                     reason=f"post-trade cooldown ({mins}/{COOLDOWN_MIN} min)")
-            return p
-        order = _trend_order(side, float(mid), float(orH), float(orL), stype, snap)
-        p.update(state="PLACE", action=f"PLACE_{side}", side=side,
-                 level="TREND", order=order,
-                 reason=f"place off-level trend {order['sidecmd']} stop-limit "
-                        f"trig={order['entry_stop']} stop={order['stop_loss']}")
+        else:
+            dec = prox.get("decision") or "WAIT"
+            conf = prox.get("confidence") or 0.0
+            kind = "fade (deferred v6)" if "FADE" in str(dec) else "no actionable setup"
+            p.update(state="ARMED", level=prox.get("label"),
+                     reason=f"{prox.get('label')} dec={dec} conf={round(conf,2)} ({kind})")
         return p
 
-    dec = prox.get("decision") or "WAIT"
-    conf = prox.get("confidence") or 0.0
-    px = prox.get("price")
-    comp = prox.get("components") or {}
-    rot = comp.get("ps_rot")
+    pol = pax_runtime_policy.lookup_policy(
+        runtime_policy,
+        setup_type=thesis.setup.kind,
+        side=thesis.setup.side,
+        level=thesis.setup.level,
+        session_type=stype,
+    )
+    p["runtime_policy"] = pol
 
-    # No working entry: decide whether to place one.
-    if dec == "WAIT" or conf < floor:
-        p.update(state="ARMED", level=prox.get("label"),
-                 reason=f"{prox.get('label')} dec={dec} conf={round(conf,2)} < floor {floor}")
+    rot = ((prox or {}).get("components") or {}).get("ps_rot")
+    if (thesis.setup.side == "LONG" and rot == "ROTATION_DN") or \
+            (thesis.setup.side == "SHORT" and rot == "ROTATION_UP"):
+        p.update(state="ARMED", level=thesis.setup.level,
+                 setup_type=thesis.setup.kind, expectancy=thesis.expectancy,
+                 expectancy_source=thesis.expectancy_source,
+                 invalidation=thesis.invalidation,
+                 reason=f"{thesis.setup.level} {thesis.setup.kind} "
+                        f"conf={round(thesis.setup.confidence,2)} vetoed by {rot}")
         return p
+
+    if pol.get("action") == "THROTTLE":
+        p.update(state="ARMED", level=thesis.setup.level,
+                 setup_type=thesis.setup.kind, expectancy=thesis.expectancy,
+                 expectancy_source=thesis.expectancy_source,
+                 invalidation=thesis.invalidation,
+                 reason=f"{thesis.setup.level} {thesis.setup.kind} "
+                        f"blocked by runtime THROTTLE: {pol.get('reason')}")
+        return p
+
+    effective_floor = pax_runtime_policy.adjusted_floor(
+        float(floor), str(pol.get("action") or "KEEP"))
+    if thesis.setup.confidence < effective_floor:
+        p.update(state="ARMED", level=thesis.setup.level,
+                 setup_type=thesis.setup.kind, expectancy=thesis.expectancy,
+                 expectancy_source=thesis.expectancy_source,
+                 invalidation=thesis.invalidation,
+                 reason=f"{thesis.setup.level} {thesis.setup.kind} "
+                        f"conf={round(thesis.setup.confidence,2)} < floor {effective_floor}")
+        return p
+
     if last_exit is not None and (now_ms - last_exit) < COOLDOWN_MIN * 60_000:
         mins = round((now_ms - last_exit) / 60_000, 1)
-        p.update(state="COOLDOWN", level=prox.get("label"),
+        p.update(state="COOLDOWN", level=thesis.setup.level,
+                 setup_type=thesis.setup.kind, expectancy=thesis.expectancy,
+                 expectancy_source=thesis.expectancy_source,
+                 invalidation=thesis.invalidation,
                  reason=f"post-trade cooldown ({mins}/{COOLDOWN_MIN} min)")
         return p
 
-    label = prox.get("label")
-    is_follow = dec.endswith("FOLLOW")
-    long_brk = label == "OR-H" and "LONG" in dec and is_follow
-    short_brk = label == "OR-L" and "SHORT" in dec and is_follow
-    veto = (("LONG" in dec and rot == "ROTATION_DN") or
-            ("SHORT" in dec and rot == "ROTATION_UP"))
-
-    if veto:
-        p.update(state="ARMED", level=label,
-                 reason=f"{label} {dec} conf={round(conf,2)} vetoed by {rot}")
-        return p
-    if not (long_brk or short_brk):
-        kind = "fade (deferred v4)" if "FADE" in dec else "rung/non-boundary"
-        p.update(state="ARMED", level=label,
-                 reason=f"{label} {dec} conf={round(conf,2)} ({kind})")
-        return p
-    if mid is None or orH is None or orL is None:
-        p.update(state="ARMED", level=label, reason="missing mid/OR for sizing")
-        return p
-
-    mid_or = (orH + orL) / 2.0
-    slip = ENTRY_SLIP_TICKS * TICK
-    if long_brk:
-        order = {"sidecmd": "long", "qty": 2, "entry_stop": round(px, 2),
-                 "entry_limit": round(px + slip, 2),
-                 "stop_loss": round(mid_or - STOP_BREATHING_PTS, 2),
-                 "tps": [round(px + PAYLINE, 2), round(px + RUNG, 2)],
-                 "level": label, "side": "LONG"}
-    else:
-        order = {"sidecmd": "short", "qty": 2, "entry_stop": round(px, 2),
-                 "entry_limit": round(px - slip, 2),
-                 "stop_loss": round(mid_or + STOP_BREATHING_PTS, 2),
-                 "tps": [round(px - PAYLINE, 2), round(px - RUNG, 2)],
-                 "level": label, "side": "SHORT"}
-    order["reason"] = f"v4 {dec} @ {label} conf={round(conf,2)} [{stype}]"
-    order["tag"] = "ETHV1"
-    p.update(state="PLACE", action=f"PLACE_{order['side']}", side=order["side"],
-             level=label, order=order,
-             reason=f"place resting {order['sidecmd']} stop-limit @ {label} "
-                    f"trig={order['entry_stop']} stop={order['stop_loss']} "
-                    f"dec={dec} conf={round(conf,2)}")
+    order = _order_from_thesis(thesis)
+    p.update(state="PLACE", action=f"PLACE_{thesis.setup.side}",
+             side=thesis.setup.side, level=thesis.setup.level, order=order,
+             setup_type=thesis.setup.kind, expectancy=thesis.expectancy,
+             expectancy_source=thesis.expectancy_source,
+             invalidation=thesis.invalidation,
+             reason=f"place {thesis.setup.kind} {order['sidecmd']} stop-limit "
+                    f"@ {thesis.setup.level} trig={order['entry_stop']} "
+                    f"stop={order['stop_loss']} exp={thesis.expectancy}")
     return p

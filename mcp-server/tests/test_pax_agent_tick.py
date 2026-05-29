@@ -11,6 +11,7 @@ def test_parser_defaults_to_observe_mode():
     assert args.armed is False
     assert args.observe is False
     assert args.dashboard_url == pax_sim_agent.DASHBOARD_URL
+    assert args.timeout_sec == pax_sim_agent.AGENT_CALL_TIMEOUT
 
 
 def test_run_once_observe_logs_and_does_not_execute(monkeypatch, tmp_path):
@@ -81,3 +82,32 @@ def test_run_once_armed_passes_dry_false(monkeypatch, tmp_path):
 
     assert rec["dry"] is False
     assert rec["armed"] is True
+
+
+def test_run_once_scrubs_live_trading_env_before_sim(monkeypatch, tmp_path):
+    monkeypatch.setenv("BOOKMAP_ALLOW_TRADING", "1")
+    monkeypatch.setattr(T.pax_sim_agent, "_fetch_snapshot",
+                        lambda url: {"alias": "NQ"})
+
+    def fake_status(alias=None):
+        assert T.os.environ.get("BOOKMAP_ALLOW_TRADING") == ""
+        return {"position": {"size": 0}, "working": []}
+
+    monkeypatch.setattr(T.pax_sim_tools, "sim_status", fake_status)
+    monkeypatch.setattr(T.pax_sim_agent, "decide_cycle",
+                        lambda *a, **k: {"action": "WAIT", "dry": k.get("dry")})
+    monkeypatch.setattr(pax_sim_tools, "LEARN_DIR", tmp_path)
+    monkeypatch.setattr(pax_sim_agent, "AGENT_LOG", tmp_path / "agent-loop.jsonl")
+
+    args = argparse.Namespace(
+        dashboard_url="http://dash",
+        alias="NQ",
+        model="model",
+        armed=True,
+        observe=False,
+        timeout_sec=1.0,
+    )
+    rec = T.run_once(args)
+
+    assert rec["live_trading_env_scrubbed"] is True
+    assert rec["dry"] is False

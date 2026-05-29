@@ -189,12 +189,49 @@ non-config caches.
 
 ### Paper-trading daemon (live data + sim)
 
-Run-it-all launcher at the repo root:
+Legacy launchers still exist, but the current PAX AI SIM stack uses
+`paxi.bat`. Prefer this manager because it launches hidden `pythonw.exe`
+processes and disables the old `PaxAgentCron` tick task that can respawn
+`pax_agent_tick --armed`.
+
+Current manager:
+
+```cmd
+paxi.bat start          (hidden observe-mode autopilot + overview UI)
+paxi.bat armed          (hidden armed SIM autopilot + overview UI)
+paxi.bat stop           (stops autopilot/overview/old tick cron)
+paxi.bat restart        (stop then observe start)
+paxi.bat status         (prints matching PAX processes + cron state)
+```
+
+`pax-stop.bat` is now a compatibility wrapper for `paxi.bat stop`.
+
+New agentic SIM stack contracts:
+
+- `pax_autopilot` is the preferred always-awake runner. It wraps
+  `pax_sim_agent.AgentLoop` with a fast deterministic heartbeat and slower
+  optional narration. Start observe first; arm only for SIM execution.
+- `pax_loop.decide()` now delegates setup selection to the pure
+  `pax_brain` layer, then applies the deterministic governor. The brain has
+  no I/O, model calls, or broker route.
+- `pax_expectancy` and `pax_trade_learning` read prior SIM/IFL outcomes to
+  build learned expectancy, scorecards, runtime policy suggestions, and
+  geometry review hints. Runtime throttle/promote is guarded by scorecard
+  sample count; the model cannot silently mutate execution policy.
+- `pax_llm_provider` keeps Claude CLI as the default cloud reasoning provider.
+  Ollama/local providers are optional; Ollama is reachable on this machine but
+  may have no pulled models.
+- Overview UI `:18890` is read-only and should not spawn visible terminals.
+  Its cron-status PowerShell probe must use `CREATE_NO_WINDOW`. It filters the
+  agent feed to the current contiguous autopilot heartbeat epoch so old
+  `pax_agent_tick` records do not pollute current counts.
+
+Legacy run-it-all launcher at the repo root:
 
 ```cmd
 pax-start.bat                       (defaults: alias NQM6.CME@RITHMIC, port 18890)
 pax-start.bat ESM6.CME@RITHMIC      (override alias)
-pax-stop.bat                        (taskkill by window title, soft then /F)
+pax-stop.bat                        (delegates to paxi.bat stop)
 ```
 
 Manual invocation:

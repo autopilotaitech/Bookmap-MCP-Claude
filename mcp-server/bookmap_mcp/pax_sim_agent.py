@@ -26,22 +26,34 @@ import datetime
 import json
 import os
 import re
-import subprocess
 import threading
 import time
 import urllib.request
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from . import pax_loop, pax_sim_tools, pax_sim_calibration
+from . import (
+    pax_expectancy,
+    pax_llm_provider,
+    pax_loop,
+    pax_runtime_policy,
+    pax_sim_calibration,
+    pax_sim_tools,
+    pax_trade_learning,
+)
 
 DASHBOARD_URL = "http://127.0.0.1:18888/api/snapshot"
 AGENT_LOG = pax_sim_tools.LEARN_DIR / "agent-loop.jsonl"
+DEFAULT_EXPECTANCY_PATH = Path(r"D:\BookmapLogs\ifl-outcomes.csv")
 
 MAX_QTY = 2
 ENTER_ACTIONS = ("ENTER_LONG", "ENTER_SHORT")
 ALL_ACTIONS = ENTER_ACTIONS + ("HOLD", "WAIT", "FLATTEN", "CANCEL_ENTRY")
+DEFAULT_STALE_SNAPSHOT_MS = 5_000
 
+DEFAULT_PROVIDER = os.environ.get("PAX_LLM_PROVIDER", "claude_cli")
 DEFAULT_MODEL = os.environ.get("PAX_AGENT_MODEL", "claude-haiku-4-5")
+DEFAULT_OLLAMA_ENDPOINT = os.environ.get("PAX_OLLAMA_ENDPOINT", "http://127.0.0.1:11434")
 # The claude CLI cold-starts / OAuth-handshakes on the first calls; 45s timed
 # out intermittently (-> "agent error"). 120s absorbs the slow ones. Env-tunable.
 try:
@@ -62,6 +74,16 @@ def _f(x: Any) -> Optional[float]:
         return v if v == v else None
     except (TypeError, ValueError):
         return None
+
+
+def _snapshot_is_stale(snap: Dict[str, Any]) -> bool:
+    if snap.get("stale") is True:
+        return True
+    age = _f(snap.get("ageMs") or snap.get("snapshot_age_ms"))
+    if age is None:
+        return False
+    threshold = _f(snap.get("stale_threshold_ms")) or DEFAULT_STALE_SNAPSHOT_MS
+    return age > threshold
 
 
 def build_context(snap: Dict[str, Any], status: Dict[str, Any],
@@ -219,42 +241,22 @@ SYSTEM_INSTRUCTION = (
 # LLM call (tool-less, single-turn, JSON) — injectable for tests              #
 # --------------------------------------------------------------------------- #
 
-def _use_bare() -> bool:
-    return bool(os.environ.get("ANTHROPIC_API_KEY")) or \
-        os.environ.get("PAX_AI_CLAUDE_BARE") == "1"
-
-
 def call_claude_json(prompt: str, model: str = DEFAULT_MODEL,
                      timeout_sec: float = AGENT_CALL_TIMEOUT) -> str:
     """Live LLM call. Tool-less + single-turn (read-only invariant preserved).
     Returns the assistant's text (expected to contain a JSON object)."""
-    args = ["claude"]
-    if _use_bare():
-        args.append("--bare")
-    # Prompt goes to STDIN, NOT the command line. Passing it as `-p <prompt>`
-    # made the full system+context prompt an argv entry, and Windows caps the
-    # whole command line at ~32767 chars -> CreateProcess failed with
-    # WinError 206 ("command line too long") once the prompt grew. `claude -p`
-    # with no inline prompt reads the prompt from stdin, which has no such
-    # limit. (Pinned by test_call_claude_json_prompt_via_stdin.)
-    args += ["-p", "--model", model,
-             "--output-format", "json", "--tools", "", "--max-turns", "1"]
-    env = {**os.environ, "BOOKMAP_ALLOW_TRADING": ""}
-    # Force UTF-8 decode: on Windows text=True defaults to cp1252, which
-    # mangles the LLM's em-dashes/quotes in the rationale.
-    popen_kwargs: Dict[str, Any] = {}
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    r = subprocess.run(args, input=prompt, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", timeout=timeout_sec,
-                       env=env, **popen_kwargs)
-    if r.returncode != 0:
-        raise RuntimeError(f"claude CLI exit {r.returncode}: {(r.stderr or '')[:200]}")
-    try:
-        outer = json.loads(r.stdout)
-        return outer.get("result", r.stdout)
-    except json.JSONDecodeError:
-        return r.stdout
+    return pax_llm_provider.call_agent_json(
+        prompt, provider="claude_cli", model=model, timeout_sec=timeout_sec)
+
+
+def call_model_json(prompt: str, *, provider: str = DEFAULT_PROVIDER,
+                    model: str = DEFAULT_MODEL,
+                    timeout_sec: float = AGENT_CALL_TIMEOUT,
+                    endpoint: Optional[str] = None,
+                    keep_alive: str = "30m") -> str:
+    return pax_llm_provider.call_agent_json(
+        prompt, provider=provider, model=model, timeout_sec=timeout_sec,
+        endpoint=endpoint, keep_alive=keep_alive)
 
 
 def parse_decision(text: str) -> Dict[str, Any]:
@@ -317,6 +319,8 @@ def govern(decision: Dict[str, Any], snap: Dict[str, Any],
         return veto("entry already working (no stacking)")
     if snap.get("health") != "ok":
         return veto("bridge not ok")
+    if _snapshot_is_stale(snap):
+        return veto("snapshot stale")
     if ses.get("anchorMode") != "LIVE":
         return veto(f"anchor {ses.get('anchorMode')} not LIVE")
     if ses.get("code") in pax_loop.BLOCK_CODES:
@@ -456,7 +460,13 @@ class AgentLoop:
 
     def __init__(self, dashboard_url: str = DASHBOARD_URL,
                  alias: Optional[str] = None, interval_sec: float = 15.0,
-                 model: str = DEFAULT_MODEL, llm_every: int = 6):
+                 model: str = DEFAULT_MODEL, llm_every: int = 6,
+                 llm_provider: str = DEFAULT_PROVIDER,
+                 llm_endpoint: Optional[str] = None,
+                 llm_keep_alive: str = "30m",
+                 expectancy_path: Optional[Path] = DEFAULT_EXPECTANCY_PATH,
+                 expectancy_refresh_sec: float = 60.0,
+                 learning_refresh_sec: float = 120.0):
         self.url = dashboard_url
         self.alias = alias
         # FAST heartbeat: the deterministic rule (pax_loop.decide) is evaluated
@@ -467,7 +477,17 @@ class AgentLoop:
         # never blocks the heartbeat.
         self.interval = max(5.0, float(interval_sec))
         self.model = model
+        self.llm_provider = llm_provider
+        self.llm_endpoint = llm_endpoint
+        self.llm_keep_alive = llm_keep_alive
         self.llm_every = max(1, int(llm_every))
+        self.expectancy_path = Path(expectancy_path) if expectancy_path else None
+        self.expectancy_refresh_sec = max(5.0, float(expectancy_refresh_sec))
+        self._expectancy_stats: Dict[str, pax_expectancy.ExpectancyStats] = {}
+        self._expectancy_loaded_ms = 0
+        self.learning_refresh_sec = max(10.0, float(learning_refresh_sec))
+        self._learning_loaded_ms = 0
+        self.learning_summary: Dict[str, Any] = {}
         self._tick_n = 0
         self._narrating = False
         self.last_llm: Optional[Dict[str, Any]] = None
@@ -480,24 +500,50 @@ class AgentLoop:
         self.started_ms: Optional[int] = None
         self.last: Optional[Dict[str, Any]] = None
 
-    def _execute_rule_plan(self, plan: Dict[str, Any]) -> bool:
-        """Execute the deterministic plan on the local sim. Returns True if it
-        placed/flattened/cancelled, False for a no-op (WAIT/ARMED/SIT)."""
+    def _refresh_expectancy_stats(self, now_ms: int) -> None:
+        if self.expectancy_path is None:
+            return
+        due_ms = self.expectancy_refresh_sec * 1000.0
+        if self._expectancy_loaded_ms and now_ms - self._expectancy_loaded_ms < due_ms:
+            return
+        try:
+            self._expectancy_stats = pax_expectancy.load_ifl_stats(self.expectancy_path)
+            self._expectancy_loaded_ms = now_ms
+        except Exception:
+            self._expectancy_stats = {}
+            self._expectancy_loaded_ms = now_ms
+
+    def _refresh_learning_summary(self, now_ms: int) -> None:
+        due_ms = self.learning_refresh_sec * 1000.0
+        if self._learning_loaded_ms and now_ms - self._learning_loaded_ms < due_ms:
+            return
+        try:
+            self.learning_summary = pax_trade_learning.summarize_learning(persist=True)
+            self._learning_loaded_ms = now_ms
+        except Exception as e:
+            self.learning_summary = {"error": str(e)[:160]}
+            self._learning_loaded_ms = now_ms
+
+    def _execute_rule_plan(self, plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Execute the deterministic plan on the local sim.
+
+        Returns the sim broker receipt for acted plans, or None for a no-op.
+        The receipt carries bracket IDs, which the learning linker uses to
+        attach later fills/PnL back to the original Pax thesis.
+        """
         kw = {"alias": self.alias} if self.alias else {}
         if plan.get("flatten") or plan.get("cancel"):
-            pax_sim_tools.sim_flatten(
+            return pax_sim_tools.sim_flatten(
                 reason=("rule: " + str(plan.get("reason")))[:150], **kw)
-            return True
         o = plan.get("order")
         if o:
-            pax_sim_tools.sim_place_bracket(
+            return pax_sim_tools.sim_place_bracket(
                 side=o["sidecmd"], qty=int(o["qty"]),
                 entry_limit=o["entry_limit"], stop_loss=o["stop_loss"],
                 take_profits=o["tps"], entry_stop=o.get("entry_stop"),
                 tag=o.get("tag", "RULE"),
                 reason=str(o.get("reason"))[:150], **kw)
-            return True
-        return False
+        return None
 
     def _maybe_narrate(self, snap, st, now, now_ms, plan) -> None:
         """Fire-and-forget LLM commentary + lesson. Does NOT gate trades and
@@ -516,7 +562,9 @@ class AgentLoop:
                           "\n\nYou are NARRATING — the deterministic rule already "
                           "executes. Give your read; set lesson only on a real "
                           "learning point. action can be WAIT.")
-                d = parse_decision(call_claude_json(prompt, self.model))
+                d = parse_decision(call_model_json(
+                    prompt, provider=self.llm_provider, model=self.model,
+                    endpoint=self.llm_endpoint, keep_alive=self.llm_keep_alive))
                 self.last_llm = {"ts_ms": now_ms, "read": d.get("rationale"),
                                  "action": d.get("action")}
                 lesson = (d.get("lesson") or "").strip()
@@ -540,21 +588,38 @@ class AgentLoop:
         except Exception as e:
             st = {"position": {"size": 0}, "_status_error": str(e)}
 
+        self._refresh_expectancy_stats(now_ms)
+        self._refresh_learning_summary(now_ms)
+        runtime_policy = (self.learning_summary.get("policy")
+                          if isinstance(self.learning_summary, dict) else None)
+        scorecard = (self.learning_summary.get("scorecard")
+                     if isinstance(self.learning_summary, dict) else None)
+        runtime_policy = pax_runtime_policy.guard_runtime_policy(
+            runtime_policy, scorecard)
         # FAST: deterministic decision (instant) -> the live watcher/trigger.
-        plan = pax_loop.decide(snap, st, now, now_ms)
+        plan = pax_loop.decide(
+            snap, st, now, now_ms, expectancy_stats=self._expectancy_stats,
+            runtime_policy=runtime_policy)
         o = plan.get("order") or {}
         rec: Dict[str, Any] = {
             "ts_ms": now_ms, "heartbeat": True, "armed": self.armed,
             "baseline_state": plan.get("state"), "action": plan.get("action"),
             "governor": "ok", "rationale": plan.get("reason"),
             "mid": plan.get("mid"), "level": plan.get("level"),
+            "alias": self.alias,
+            "stype": plan.get("stype"),
+            "setup_type": plan.get("setup_type"),
+            "expectancy": plan.get("expectancy"),
+            "expectancy_source": plan.get("expectancy_source"),
             "order": ({k: o.get(k) for k in
                        ("side", "entry_stop", "entry_limit", "stop_loss", "tps", "qty")}
                       if plan.get("order") else None),
         }
         if self.armed:
             try:
-                rec["executed"] = self._execute_rule_plan(plan)
+                exec_result = self._execute_rule_plan(plan)
+                rec["exec"] = exec_result
+                rec["executed"] = exec_result is not None
             except Exception as e:
                 rec["exec_error"] = str(e); rec["executed"] = False
 
@@ -626,7 +691,11 @@ class AgentLoop:
     def status(self) -> Dict[str, Any]:
         return {"running": self._running, "armed": self.armed,
                 "cycles": self.cycles, "interval_sec": self.interval,
-                "model": self.model, "alias": self.alias,
+                "model": self.model, "llm_provider": self.llm_provider,
+                "llm_endpoint": self.llm_endpoint, "alias": self.alias,
+                "expectancy_stats_n": len(self._expectancy_stats),
+                "expectancy_loaded_ms": self._expectancy_loaded_ms,
+                "learning": self.learning_summary,
                 "started_ms": self.started_ms,
                 "last": self.last}
 

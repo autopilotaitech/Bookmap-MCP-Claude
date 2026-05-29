@@ -108,6 +108,54 @@ def test_errors_includes_warn(queries):
     assert "WARN" in kinds
 
 
+def test_agent_feed_prefers_current_autopilot_heartbeats(tmp_path, populated_journal):
+    learn = tmp_path / "learn"
+    learn.mkdir()
+    (learn / "agent-loop.jsonl").write_text(
+        json.dumps({"ts_ms": 1, "action": "WAIT", "armed": True}) + "\n" +
+        json.dumps({"ts_ms": 2, "heartbeat": True, "action": "NONE",
+                    "armed": False}) + "\n",
+        encoding="utf-8")
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    feed = q.agent_feed()
+    assert len(feed) == 1
+    assert feed[0]["heartbeat"] is True
+    assert feed[0]["armed"] is False
+
+
+def test_agent_feed_uses_current_contiguous_heartbeat_epoch(tmp_path, populated_journal):
+    learn = tmp_path / "learn"
+    learn.mkdir()
+    (learn / "agent-loop.jsonl").write_text(
+        json.dumps({"ts_ms": 1_000, "heartbeat": True, "action": "PLACE",
+                    "armed": True, "executed": True}) + "\n" +
+        json.dumps({"ts_ms": 400_000, "heartbeat": True, "action": "NONE",
+                    "armed": False}) + "\n" +
+        json.dumps({"ts_ms": 415_000, "heartbeat": True, "action": "NONE",
+                    "armed": False}) + "\n",
+        encoding="utf-8")
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    feed = q.agent_feed()
+    assert [r["ts_ms"] for r in feed] == [400_000, 415_000]
+    summary = q.agent_summary()
+    assert summary["executed"] == 0
+    assert summary["armed"] is False
+
+
+def test_learning_status_reads_persisted_artifacts(tmp_path, populated_journal):
+    learn = tmp_path / "learn"
+    learn.mkdir()
+    (learn / "scorecard.json").write_text(
+        json.dumps({"setups": [{"setup": "A"}]}), encoding="utf-8")
+    (learn / "runtime-policy.json").write_text(
+        json.dumps({"suggestions": [{"setup": "A", "action": "THROTTLE"}]}),
+        encoding="utf-8")
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    st = q.learning_status()
+    assert st["setup_count"] == 1
+    assert st["suggestion_count"] == 1
+
+
 def test_pnl_summary_zero_when_no_daily_stats(queries):
     p = queries.pnl_summary()
     assert p["total"] == 0
@@ -180,6 +228,35 @@ def test_api_errors_returns_array(live_server):
     assert any(e["kind"] == "WARN" for e in data)
 
 
+def test_api_learning_status_returns_json(live_server):
+    host, port = live_server
+    status, body = _get(host, port, "/api/learning_status")
+    assert status == 200
+    data = json.loads(body)
+    assert "setup_count" in data
+
+
+def test_cron_status_powershell_hidden_on_windows(monkeypatch, queries):
+    captured = {}
+
+    class _R:
+        returncode = 0
+        stdout = '{"installed":false}'
+        stderr = ""
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return _R()
+
+    monkeypatch.setattr("bookmap_mcp.overview_ui.sys.platform", "win32")
+    monkeypatch.setattr("bookmap_mcp.overview_ui.subprocess.CREATE_NO_WINDOW", 123)
+    monkeypatch.setattr("bookmap_mcp.overview_ui.subprocess.run", fake_run)
+    out = queries.cron_status()
+    assert out["available"] is True
+    assert captured["kwargs"]["creationflags"] == 123
+
+
 def test_post_to_root_is_rejected(live_server):
     host, port = live_server
     status, _ = _get(host, port, "/", method="POST")
@@ -204,6 +281,7 @@ def test_html_page_constant_has_dashboard_panels():
     self-contained SVG equity chart renderer are present."""
     for marker in ('id="stats"', 'id="equity"', 'id="feed"', 'id="calib"',
                    'id="settings"', '/api/cron_status',
+                   '/api/learning_status',
                    'id="lessons"', 'id="working"', 'id="fills"',
                    'function equityChart', 'function bars('):
         assert marker in _PAGE_HTML, f"missing dashboard panel: {marker}"

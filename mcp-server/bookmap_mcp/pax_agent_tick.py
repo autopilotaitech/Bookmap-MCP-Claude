@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import os
 import sys
 import time
 from typing import Any, Dict, Optional
@@ -34,6 +35,20 @@ def _load_status(alias: Optional[str]) -> Dict[str, Any]:
         return {"position": {"size": 0}, "working": [], "_status_error": str(exc)}
 
 
+def _scrub_live_trading_env_for_sim() -> bool:
+    """Make this one-shot process safe for the paper-only sim surface.
+
+    Bookmap may legitimately run with BOOKMAP_ALLOW_TRADING=1 for the Java
+    bridge's live broker tools. The autonomous Pax agent does not use those
+    tools; it routes only through pax_sim_tools, which refuses to run when that
+    variable is inherited. Clear it in this process before touching sim state.
+    """
+    if os.environ.get("BOOKMAP_ALLOW_TRADING") == "1":
+        os.environ["BOOKMAP_ALLOW_TRADING"] = ""
+        return True
+    return False
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m bookmap_mcp.pax_agent_tick",
@@ -49,12 +64,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Allow governor-approved sim execution.")
     p.add_argument("--observe", action="store_true",
                    help="Force observe mode. LLM decides and logs; no execution.")
-    p.add_argument("--timeout-sec", type=float, default=45.0,
+    p.add_argument("--timeout-sec", type=float,
+                   default=pax_sim_agent.AGENT_CALL_TIMEOUT,
                    help="Claude CLI timeout for this one tick.")
     return p
 
 
 def run_once(args: argparse.Namespace) -> Dict[str, Any]:
+    scrubbed_live_env = _scrub_live_trading_env_for_sim()
     now = _now_ct()
     now_ms = int(time.time() * 1000)
     snap = pax_sim_agent._fetch_snapshot(args.dashboard_url)
@@ -79,6 +96,7 @@ def run_once(args: argparse.Namespace) -> Dict[str, Any]:
         "alias": alias,
         "dashboard_url": args.dashboard_url,
         "model": args.model,
+        "live_trading_env_scrubbed": scrubbed_live_env,
     })
 
     try:

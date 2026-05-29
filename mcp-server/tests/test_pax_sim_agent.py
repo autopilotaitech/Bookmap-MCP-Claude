@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 from bookmap_mcp import pax_sim_agent as A
+from bookmap_mcp import pax_llm_provider
 from bookmap_mcp import pax_sim_tools
 
 NOW = datetime.datetime(2026, 5, 28, 19, 30, 0)
@@ -88,6 +89,14 @@ def test_governor_vetoes_stacking():
     g = A.govern({"action": "ENTER_LONG", "entry": 30340, "stop": 30330,
                   "tps": [30350]}, s, st, NOW_MS, baseline(s, st))
     assert "stacking" in g["governor"]
+
+
+def test_governor_vetoes_stale_snapshot():
+    s, st = snap(), status()
+    s["ageMs"] = A.DEFAULT_STALE_SNAPSHOT_MS + 1
+    g = A.govern({"action": "ENTER_LONG", "entry": 30340, "stop": 30330,
+                  "tps": [30350]}, s, st, NOW_MS, baseline(s, st))
+    assert "snapshot stale" in g["governor"]
 
 
 def test_governor_vetoes_invalid_long_geometry():
@@ -178,7 +187,7 @@ def test_clean_lessons_filters_wait_poison_and_caps_recent():
 
 
 def test_llm_call_stays_tool_less():
-    src = Path(A.__file__).read_text(encoding="utf-8")
+    src = Path(pax_llm_provider.__file__).read_text(encoding="utf-8")
     assert '"--tools", ""' in src
     assert '"--max-turns", "1"' in src
     assert "CREATE_NO_WINDOW" in src
@@ -202,6 +211,72 @@ def test_agent_loop_heartbeat_observe(monkeypatch, tmp_path):
     assert rec["action"] == "PLACE_LONG"
     assert "executed" not in rec          # observe -> nothing placed
     assert (tmp_path / "loop.jsonl").exists()
+
+
+def test_agent_loop_passes_cached_expectancy_stats(monkeypatch, tmp_path):
+    stats = {
+        "x": A.pax_expectancy.ExpectancyStats(
+            n=12, avg_r=-0.8, hit_rate=0.1, partial_rate=0.1, miss_rate=0.8)
+    }
+    seen = {}
+    monkeypatch.setattr(A, "_fetch_snapshot", lambda *a, **k: snap())
+    monkeypatch.setattr(A.pax_expectancy, "load_ifl_stats", lambda path: stats)
+    monkeypatch.setattr(A.pax_trade_learning, "summarize_learning",
+                        lambda **kw: {"policy": {"suggestions": []},
+                                      "scorecard": {"setups": []}})
+    monkeypatch.setattr(pax_sim_tools, "sim_status", lambda *a, **k: status())
+    monkeypatch.setattr(pax_sim_tools, "LEARN_DIR", tmp_path)
+    monkeypatch.setattr(A, "AGENT_LOG", tmp_path / "loop.jsonl")
+
+    def fake_decide(snap_, st_, now_, now_ms_, expectancy_stats=None,
+                    runtime_policy=None):
+        seen["stats"] = expectancy_stats
+        return {"state": "SIT", "action": "NONE", "reason": "x"}
+
+    monkeypatch.setattr(A.pax_loop, "decide", fake_decide)
+    loop = A.AgentLoop(interval_sec=15, expectancy_path=tmp_path / "ifl.csv")
+    loop._cycle_once()
+    assert seen["stats"] is stats
+
+
+def test_agent_loop_passes_runtime_policy_from_learning(monkeypatch, tmp_path):
+    summary = {"policy": {"suggestions": [
+        {"setup": "A|LONG|OR-H|ETH", "action": "THROTTLE", "reason": "x"}
+    ]}, "scorecard": {"setups": [
+        {"setup": "A|LONG|OR-H|ETH", "n": 3, "warning": None}
+    ]}}
+    seen = {}
+    monkeypatch.setattr(A, "_fetch_snapshot", lambda *a, **k: snap())
+    monkeypatch.setattr(A.pax_expectancy, "load_ifl_stats", lambda path: {})
+    monkeypatch.setattr(A.pax_trade_learning, "summarize_learning", lambda **kw: summary)
+    monkeypatch.setattr(pax_sim_tools, "sim_status", lambda *a, **k: status())
+    monkeypatch.setattr(pax_sim_tools, "LEARN_DIR", tmp_path)
+    monkeypatch.setattr(A, "AGENT_LOG", tmp_path / "loop.jsonl")
+
+    def fake_decide(snap_, st_, now_, now_ms_, expectancy_stats=None,
+                    runtime_policy=None):
+        seen["runtime_policy"] = runtime_policy
+        return {"state": "SIT", "action": "NONE", "reason": "x"}
+
+    monkeypatch.setattr(A.pax_loop, "decide", fake_decide)
+    loop = A.AgentLoop(interval_sec=15, expectancy_path=tmp_path / "ifl.csv")
+    loop._cycle_once()
+    assert seen["runtime_policy"] == summary["policy"]
+
+
+def test_agent_loop_status_exposes_learning_summary(monkeypatch, tmp_path):
+    summary = {"n_linked": 2, "policy": {"suggestions": []}}
+    monkeypatch.setattr(A, "_fetch_snapshot", lambda *a, **k: snap())
+    monkeypatch.setattr(A.pax_expectancy, "load_ifl_stats", lambda path: {})
+    monkeypatch.setattr(A.pax_trade_learning, "summarize_learning", lambda **kw: summary)
+    monkeypatch.setattr(pax_sim_tools, "sim_status", lambda *a, **k: status())
+    monkeypatch.setattr(pax_sim_tools, "LEARN_DIR", tmp_path)
+    monkeypatch.setattr(A, "AGENT_LOG", tmp_path / "loop.jsonl")
+    loop = A.AgentLoop(interval_sec=15, expectancy_path=tmp_path / "ifl.csv")
+    loop._cycle_once()
+    st = loop.status()
+    assert st["learning"] is summary
+    assert st["expectancy_stats_n"] == 0
 
 
 def test_agent_loop_armed_executes_rule_live(monkeypatch, tmp_path):
@@ -246,7 +321,7 @@ def test_call_claude_json_prompt_via_stdin(monkeypatch):
         captured["input"] = kw.get("input")
         return _R()
 
-    monkeypatch.setattr(A.subprocess, "run", fake_run)
+    monkeypatch.setattr(pax_llm_provider.subprocess, "run", fake_run)
     big = "HUGE_PROMPT_TOKEN " * 5000          # ~85k chars -> would blow argv
     A.call_claude_json(big)
     assert all("HUGE_PROMPT_TOKEN" not in str(a) for a in captured["args"]), \

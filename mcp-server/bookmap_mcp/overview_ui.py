@@ -206,7 +206,18 @@ class OverviewQueries:
                 out.append(json.loads(ln))
             except json.JSONDecodeError:
                 pass
-        return out
+        heartbeats = [r for r in out if r.get("heartbeat") is True]
+        if not heartbeats:
+            return out
+        current: List[Dict[str, Any]] = []
+        prev_ts: Optional[int] = None
+        for rec in reversed(heartbeats):
+            ts = int(rec.get("ts_ms") or 0)
+            if prev_ts is not None and ts and (prev_ts - ts) > 120_000:
+                break
+            current.append(rec)
+            prev_ts = ts
+        return list(reversed(current))
 
     def calibration(self) -> Dict[str, Any]:
         try:
@@ -214,6 +225,32 @@ class OverviewQueries:
                 encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return {}
+
+    def learning_scorecard(self) -> Dict[str, Any]:
+        try:
+            return json.loads((self.learn_dir / "scorecard.json").read_text(
+                encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def runtime_policy(self) -> Dict[str, Any]:
+        try:
+            return json.loads((self.learn_dir / "runtime-policy.json").read_text(
+                encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def learning_status(self) -> Dict[str, Any]:
+        scorecard = self.learning_scorecard()
+        policy = self.runtime_policy()
+        setups = scorecard.get("setups") if isinstance(scorecard, dict) else []
+        suggestions = policy.get("suggestions") if isinstance(policy, dict) else []
+        return {
+            "scorecard": scorecard,
+            "runtime_policy": policy,
+            "setup_count": len(setups or []),
+            "suggestion_count": len(suggestions or []),
+        }
 
     def lessons(self, limit: int = 40) -> List[str]:
         try:
@@ -274,6 +311,9 @@ class OverviewQueries:
         pos = self.current_position()
         last = feed[-1] if feed else None
         armed = bool(last.get("armed")) if last else False
+        now_ms = int(time.time() * 1000)
+        last_ts = int(last.get("ts_ms") or 0) if last else 0
+        last_age = round((now_ms - last_ts) / 1000.0, 3) if last_ts else None
         wins, losses = eq.get("wins", 0), eq.get("losses", 0)
         wr = round(100.0 * wins / (wins + losses), 1) if (wins + losses) else None
         return {
@@ -281,6 +321,7 @@ class OverviewQueries:
             "deviations": deviations, "actions": dict(acts),
             "realized": eq["realized"], "wins": wins, "losses": losses,
             "win_rate": wr, "armed": armed, "last": last,
+            "last_heartbeat_age_sec": last_age,
             "position": pos,
         }
 
@@ -299,11 +340,15 @@ class OverviewQueries:
             "missedRuns=$i.NumberOfMissedRuns} | ConvertTo-Json -Compress"
         ) % (task_name, task_name)
         try:
+            popen_kwargs: Dict[str, Any] = {}
+            if sys.platform == "win32":
+                popen_kwargs["creationflags"] = getattr(
+                    subprocess, "CREATE_NO_WINDOW", 0)
             r = subprocess.run(
                 ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
                  "-Command", ps],
                 capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=3.0)
+                errors="replace", timeout=3.0, **popen_kwargs)
         except Exception as exc:
             return {"available": False, "error": str(exc)}
         if r.returncode != 0:
@@ -380,6 +425,12 @@ def _build_handler(queries: OverviewQueries) -> type:
                     return _json_response(self, queries.cron_status())
                 if path == "/api/calibration":
                     return _json_response(self, queries.calibration())
+                if path == "/api/learning_scorecard":
+                    return _json_response(self, queries.learning_scorecard())
+                if path == "/api/runtime_policy":
+                    return _json_response(self, queries.runtime_policy())
+                if path == "/api/learning_status":
+                    return _json_response(self, queries.learning_status())
                 if path == "/api/equity":
                     return _json_response(self, queries.equity_curve())
                 if path == "/api/fills":
@@ -560,10 +611,10 @@ function feedRow(r){
 
 async function refresh(){
   try{
-    const [sum,feed,calib,eq,fills,pos,working,cron]=await Promise.all([
+    const [sum,feed,calib,eq,fills,pos,working,cron,learn]=await Promise.all([
       J('/api/agent_summary'),J('/api/agent_feed'),J('/api/calibration'),
       J('/api/equity'),J('/api/fills'),J('/api/position'),J('/api/working'),
-      J('/api/cron_status')]);
+      J('/api/cron_status'),J('/api/learning_status')]);
 
     const armed=sum.armed, running=(sum.cycles||0)>0;
     $('agdot').className='dot '+(armed?'armed':running?'on':'');
@@ -590,9 +641,13 @@ async function refresh(){
         'cron '+esc(cron.state)+' &middot; '+mode+'</div>'+
         '<div>next: '+esc(cron.nextRunTime||'--')+' &middot; last result: '+esc(cron.lastTaskResult)+'</div>'+
         '<div>runner: '+(hidden?'hidden pythonw':'visible python')+'</div>'+
-        '<div class="mut">'+esc(cron.arguments||'')+'</div>';
+        '<div class="mut">'+esc(cron.arguments||'')+'</div>'+
+        '<div>learning: '+(learn.setup_count||0)+' setup buckets &middot; '+
+        (learn.suggestion_count||0)+' runtime suggestions</div>';
     }else{
-      $('settings').innerHTML='<div class="mut">PaxAgentCron not installed</div>';
+      $('settings').innerHTML='<div class="mut">PaxAgentCron not installed</div>'+
+        '<div>learning: '+(learn.setup_count||0)+' setup buckets &middot; '+
+        (learn.suggestion_count||0)+' runtime suggestions</div>';
     }
 
     $('calib').innerHTML=
