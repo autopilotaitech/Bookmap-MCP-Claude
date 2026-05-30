@@ -20,31 +20,61 @@ legacy `PaxAgentCron` task. `stop` targets only PAX processes
 by command-line match and window title; it does **not** touch the Bookmap
 bridge, OpenRange, or Bookmap itself.
 
-## Pre-market SIM acceptance workflow
+## Operator loop (pre-session / during / post-session)
 
-Run this before arming SIM. It is read-only end-to-end (no broker order, no LLM,
-no service auto-start). SIM-only; live stays hard-blocked.
+Read-only end-to-end (no broker order, no LLM, no service auto-start). SIM-only;
+live stays hard-blocked.
+
+### Pre-session
 
 ```cmd
 paxi.bat stop                                   :: 1. clean slate (writes a session report)
 paxi.bat start                                  :: 2. observe mode + overview UI
 curl http://127.0.0.1:18890/api/health          :: 3. freshness / kill switch / risk halt / evidence
 curl http://127.0.0.1:18890/api/arming_check    :: 4. machine go/no-go
-python -m bookmap_mcp.pax_acceptance            :: 5. one JSON verdict (overall pass|warn|fail)
-paxi.bat armed                                  :: 6. ONLY if acceptance is not "fail"
-:: ... trade SIM ...
-paxi.bat stop                                   :: 7. stop writes session-report.json (+archive)
-python -m bookmap_mcp.pax_evidence_report --replay   :: 8. after the session, grade the evidence
+python -m bookmap_mcp.pax_acceptance --out D:\BookmapLogs\pax-agent\acceptance-report.json   :: 5. one JSON verdict
+paxi.bat armed                                  :: 6. ONLY if acceptance != fail AND operator accepts the warnings
 ```
 
-`pax_acceptance` verdict: **FAIL** on kill switch / stale heartbeat / stale market
-/ unreadable SIM broker / `live_blocked` not true (exit code 1). **WARN** when
-evidence is below `replayable`, `replay_input`/scorecard/session-report missing,
-or R-denominated risk counters unavailable (exit code 0). **PASS** needs clean
-ops AND evidence at least `replayable` AND no warns. Honest note: in the current
-build R-denominated counters are unavailable, so a clean stack typically reports
-**WARN, not PASS** -- that is expected; it means "operationally ready for SIM,
-real data + tuning still needed", not a failure.
+### During session
+
+- Trust the dashboard truth surfaces (`:18890`); no live trading; risk halts
+  are respected (kill switch / stale data / session limits enforce before SIM
+  placement).
+
+### Post-session
+
+```cmd
+paxi.bat stop                                                       :: 1. writes session-report.json (+archive)
+python -m bookmap_mcp.pax_session_report --archive --replay-summary :: 2. session report + replay summary
+python -m bookmap_mcp.pax_evidence_report --replay                  :: 3. grade the evidence
+python -m bookmap_mcp.pax_data_quality                              :: 4. is the data usable for tuning?
+python -m bookmap_mcp.pax_tuning_report                             :: 5. report-only: what to tune next
+```
+
+### Acceptance verdict (fail-closed)
+
+`pax_acceptance` is read-only and **fail-closed**: if the health surface cannot
+be gathered (exception/empty), or omits `live_blocked` / its `sources`, the
+dependent checks FAIL rather than silently pass. **FAIL** (exit 1) on health
+unavailable / `live_blocked` not explicitly true / kill switch / stale heartbeat
+/ stale market / unreadable SIM broker. **WARN** (exit 0) when evidence is below
+`replayable`, `replay_input`/scorecard/session-report missing, or R-denominated
+risk counters unavailable. **PASS** needs clean ops AND evidence at least
+`replayable` AND no warns. Honest note: in the current build R-denominated
+counters are unavailable, so a clean stack typically reports **WARN, not PASS**
+-- that is expected ("operationally ready for SIM; real data + tuning still
+needed"), not a failure. The report carries provenance (`input_paths`,
+`artifact_status`, `source_errors`, `current_git_commit`, `repo_dirty`);
+`--bundle-out` writes a single JSON bundle (acceptance + compact evidence /
+session / replay summaries, no raw logs).
+
+`pax_data_quality` verdict ladder: `no_data` -> `unusable` -> `usable_for_review`
+-> `usable_for_tuning_candidate`. A scorecard without replay-grade logs cannot
+exceed `usable_for_review`; no executions/fills cannot reach
+`usable_for_tuning_candidate`. `pax_tuning_report` is strictly REPORT-ONLY: it
+suggests candidate/blocked/under-sampled setups + what data to collect + which
+thresholds a HUMAN might review, and **writes no policy / never auto-promotes**.
 
 ## Lifecycle
 

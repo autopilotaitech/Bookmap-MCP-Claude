@@ -48,27 +48,76 @@ def _safe(fn: Callable[[], Any], default: Any) -> Any:
         return default
 
 
+def _safe2(fn: Callable[[], Any]):
+    """Call fn -> (value, error_str_or_None). Errors are surfaced, never hidden."""
+    try:
+        return fn(), None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"[:200]
+
+
+def _artifact_status(path: Path) -> Dict[str, Any]:
+    """existence / mtime_ms / size_bytes for one artifact (no read)."""
+    p = Path(path)
+    try:
+        st = p.stat()
+        return {"path": str(p), "exists": True,
+                "mtime_ms": int(st.st_mtime * 1000), "size_bytes": int(st.st_size)}
+    except OSError:
+        return {"path": str(p), "exists": False, "mtime_ms": None,
+                "size_bytes": None}
+
+
+def _repo_dirty() -> Optional[bool]:
+    """True if the repo working tree is dirty. Best-effort, no window on win32."""
+    try:
+        import subprocess
+        repo = Path(__file__).resolve().parents[2]
+        kwargs: Dict[str, Any] = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        r = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"],
+                           capture_output=True, text=True, timeout=3.0, **kwargs)
+        if r.returncode != 0:
+            return None
+        return bool((r.stdout or "").strip())
+    except Exception:
+        return None
+
+
 def run_acceptance(*,
                    journal: Path,
                    sim_db: Path,
                    learn_dir: Optional[Path] = None,
                    replay: bool = False,
                    now_ms: Optional[int] = None) -> Dict[str, Any]:
-    """Build the acceptance report. Read-only; never raises for missing data."""
+    """Build the acceptance report. Read-only; never raises for missing data.
+
+    FAIL-CLOSED: if the health surface cannot be gathered (exception or empty),
+    or omits ``live_blocked`` / its ``sources``, the dependent checks FAIL rather
+    than silently pass. SIM-only; live stays hard-blocked in the output."""
     from .overview_ui import OverviewQueries, _git_commit  # local: avoid cycle
 
     q = OverviewQueries(journal, sim_db_path=sim_db, learn_dir=learn_dir)
     learn = q.learn_dir
     now = int(now_ms) if now_ms is not None else int(time.time() * 1000)
 
-    health = _safe(q.health, {})
-    arming = _safe(q.arming_check, {})
-    evidence = _safe(q.evidence_report, {})
+    health, health_err = _safe2(q.health)
+    arming, arming_err = _safe2(q.arming_check)
+    evidence, evidence_err = _safe2(q.evidence_report)
+    promotion, promotion_err = _safe2(q.promotion_report)
     sim_pf = _safe(q.sim_broker_preflight, {"openable": False, "readable": False,
                                             "error": "preflight failed"})
-    promotion = _safe(q.promotion_report, {})
+    health = health if isinstance(health, dict) else {}
+    arming = arming if isinstance(arming, dict) else {}
+    evidence = evidence if isinstance(evidence, dict) else {}
+    promotion = promotion if isinstance(promotion, dict) else {}
 
-    sources = health.get("sources") or {}
+    source_errors = {k: v for k, v in (
+        ("health_error", health_err), ("arming_error", arming_err),
+        ("evidence_error", evidence_err), ("promotion_error", promotion_err))
+        if v}
+
     checks: List[Dict[str, Any]] = []
     required: List[str] = []
 
@@ -78,27 +127,57 @@ def run_acceptance(*,
         if action and status in ("fail", "warn"):
             required.append(action)
 
-    # --- hard FAIL conditions ------------------------------------------------
-    live_blocked = bool(health.get("live_blocked", True))
-    add("live_blocked", "pass" if live_blocked else "fail",
-        "live trading hard-blocked (SIM only)" if live_blocked
-        else "live_blocked is NOT true -- refuse to proceed",
-        "restore the live hard-block")
+    # --- health must be gatherable (fail-closed) -----------------------------
+    health_ok = bool(health) and health_err is None
+    add("health_available", "pass" if health_ok else "fail",
+        "health surface gathered" if health_ok
+        else f"health unavailable: {health_err or 'empty'}",
+        "investigate the overview health surface")
 
-    ks = bool(health.get("kill_switch_active"))
-    add("kill_switch_absent", "fail" if ks else "pass",
-        "operator kill switch engaged" if ks else "no kill switch file",
-        "remove the KILL_SWITCH file")
+    # --- live_blocked: pass ONLY when health explicitly reports True ---------
+    lb = health.get("live_blocked") if health_ok else None
+    if lb is True:
+        add("live_blocked", "pass", "live trading hard-blocked (SIM only)")
+    elif lb is False:
+        add("live_blocked", "fail", "live_blocked is NOT true -- refuse to proceed",
+            "restore the live hard-block")
+    else:
+        add("live_blocked", "fail",
+            "live_blocked_unknown -- health did not report live_blocked",
+            "restore the live hard-block / repair the health surface")
 
-    hb_stale = bool((sources.get("heartbeat") or {}).get("is_stale"))
-    add("heartbeat_fresh", "fail" if hb_stale else "pass",
-        "agent heartbeat stale/absent" if hb_stale else "heartbeat fresh",
+    # --- kill switch from the authoritative file check (not via health) ------
+    ks = _safe(q.kill_switch_active, None)
+    if ks is True:
+        add("kill_switch_absent", "fail", "operator kill switch engaged",
+            "remove the KILL_SWITCH file")
+    elif ks is False:
+        add("kill_switch_absent", "pass", "no kill switch file")
+    else:
+        add("kill_switch_absent", "fail",
+            "kill switch state unknown (learn dir unreadable)",
+            "make the learn dir readable")
+
+    # --- heartbeat / market: a missing sources dict or source FAILS ----------
+    sources = health.get("sources") if health_ok else None
+    have_sources = isinstance(sources, dict) and bool(sources)
+
+    def _source_fresh(name: str):
+        if not have_sources:
+            return False, "health has no sources dict -- cannot prove freshness"
+        src = sources.get(name)
+        if not isinstance(src, dict) or "is_stale" not in src:
+            return False, f"{name} source missing/unknown"
+        if src.get("is_stale"):
+            return False, f"{name} stale/absent"
+        return True, f"{name} fresh"
+
+    hb_ok, hb_msg = _source_fresh("heartbeat")
+    add("heartbeat_fresh", "pass" if hb_ok else "fail", hb_msg,
         "start PAX observe (paxi.bat start) and confirm a fresh heartbeat")
 
-    mk_stale = bool((sources.get("market") or {}).get("is_stale"))
-    add("market_data_fresh", "fail" if mk_stale else "pass",
-        "market data stale/absent (bridge/Bookmap feed down)" if mk_stale
-        else "market data fresh",
+    mk_ok, mk_msg = _source_fresh("market")
+    add("market_data_fresh", "pass" if mk_ok else "fail", mk_msg,
         "bring up Bookmap + bridge so market data is fresh")
 
     sim_ok = bool(sim_pf.get("openable") and sim_pf.get("readable"))
@@ -165,12 +244,17 @@ def run_acceptance(*,
         if a not in required:
             required.append(a)
 
+    git_commit = health.get("git_commit") or _safe(_git_commit, None)
+    agent_log = learn / "agent-loop.jsonl"
+    scorecard = learn / "scorecard.json"
     out: Dict[str, Any] = {
         "overall": overall,
         "sim_only": True,
         "live_blocked": True,
         "checked_ms": now,
-        "git_commit": health.get("git_commit") or _safe(_git_commit, None),
+        "git_commit": git_commit,
+        "current_git_commit": git_commit,
+        "repo_dirty": _repo_dirty(),
         "evidence_grade": grade,
         "candidate_setup_count": (evidence.get("scorecard_summary") or {}).get(
             "candidate_count", 0),
@@ -178,6 +262,20 @@ def run_acceptance(*,
                            "path": str(session_report)},
         "sim_broker": sim_pf,
         "risk_halt": {"active": rha, "code": health.get("risk_halt_code")},
+        "input_paths": {
+            "journal": str(journal), "sim_db": str(sim_db),
+            "learn_dir": str(learn), "agent_log": str(agent_log),
+            "scorecard": str(scorecard), "session_report": str(session_report),
+        },
+        "source_errors": source_errors,
+        "artifact_status": {
+            "agent_loop": _artifact_status(agent_log),
+            "scorecard": _artifact_status(scorecard),
+            "session_report": _artifact_status(session_report),
+            "evidence_report": _artifact_status(learn / "evidence-report.json"),
+            "runtime_policy": _artifact_status(learn / "runtime-policy.json"),
+            "calibration": _artifact_status(learn / "calibration.json"),
+        },
         "checks": checks,
         "required_actions": required,
         "limitations": [
@@ -191,7 +289,10 @@ def run_acceptance(*,
         ],
     }
     if replay:
-        out["replay_summary"] = _replay_summary(learn / "agent-loop.jsonl")
+        rsum = _replay_summary(agent_log)
+        out["replay_summary"] = rsum
+        if isinstance(rsum, dict) and rsum.get("error"):
+            out["source_errors"]["replay_error"] = rsum["error"]
     return out
 
 
@@ -216,6 +317,42 @@ def _replay_summary(agent_log: Path) -> Dict[str, Any]:
         return {"error": f"{type(exc).__name__}: {exc}"[:200]}
 
 
+def build_bundle(report: Dict[str, Any], learn_dir: Path) -> Dict[str, Any]:
+    """One JSON bundle: the acceptance report + COMPACT evidence/session/replay
+    summaries (no raw logs). Read-only; missing files degrade to None."""
+    learn = Path(learn_dir)
+    evidence = None
+    ev = learn / "evidence-report.json"
+    if ev.exists():
+        try:
+            d = json.loads(ev.read_text(encoding="utf-8"))
+            evidence = {k: d.get(k) for k in (
+                "generated_ms", "evidence_grade", "scorecard_summary",
+                "replay_readiness", "blockers", "warnings",
+                "next_required_data")}
+        except (OSError, json.JSONDecodeError) as exc:
+            evidence = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+    session = None
+    sr = learn / "session-report.json"
+    if sr.exists():
+        try:
+            d = json.loads(sr.read_text(encoding="utf-8"))
+            session = {k: d.get(k) for k in (
+                "generated_ms", "decisions", "executions", "risk_halts",
+                "pnl", "replay_readiness", "evidence_summary")}
+        except (OSError, json.JSONDecodeError) as exc:
+            session = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+    return {
+        "bundle_version": 1,
+        "acceptance": report,
+        "evidence_summary": evidence,
+        "session_summary": session,
+        "replay_summary": report.get("replay_summary"),
+        "sim_only": True,
+        "live_blocked": True,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="bookmap_mcp.pax_acceptance",
@@ -228,20 +365,35 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Also run pax_agent_replay over the agent log (slower).")
     p.add_argument("--out", type=Path, default=None,
                    help="Write the JSON here (else stdout).")
+    p.add_argument("--bundle-out", type=Path, default=None,
+                   help="Also write a single JSON bundle (acceptance + compact "
+                        "evidence/session/replay summaries) here.")
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    # A bundle needs the replay summary; turn replay on when bundling.
+    replay = bool(args.replay or args.bundle_out)
     report = run_acceptance(journal=args.journal, sim_db=args.sim_db,
-                            learn_dir=args.learn_dir, replay=args.replay)
+                            learn_dir=args.learn_dir, replay=replay)
     body = json.dumps(report, indent=2, sort_keys=True, default=str)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(body, encoding="utf-8")
         print(f"acceptance report written: {args.out} (overall="
               f"{report['overall']})", file=sys.stderr)
-    else:
+    if args.bundle_out:
+        from .overview_ui import OverviewQueries
+        learn = OverviewQueries(args.journal, sim_db_path=args.sim_db,
+                                learn_dir=args.learn_dir).learn_dir
+        bundle = build_bundle(report, learn)
+        args.bundle_out.parent.mkdir(parents=True, exist_ok=True)
+        args.bundle_out.write_text(
+            json.dumps(bundle, indent=2, sort_keys=True, default=str),
+            encoding="utf-8")
+        print(f"acceptance bundle written: {args.bundle_out}", file=sys.stderr)
+    if not args.out and not args.bundle_out:
         print(body)
     # Exit code mirrors the verdict so it can gate a script: pass/warn = 0,
     # fail = 1 (operationally not ready).

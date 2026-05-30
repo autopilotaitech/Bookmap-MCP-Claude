@@ -101,7 +101,16 @@ Production-ready PLUMBING (operationally hardened, test-covered): runtime safety
 gates, kill switch, stale-data enforcement, SIM broker preflight, honest USD
 drawdown + consecutive-loss counters, replay-grade logging, deterministic replay
 (decision + operational gate), evidence grading, promotion/eval reporting,
-arming check, acceptance doctor, session reports + archive. ~1314 tests pass.
+**fail-closed** acceptance doctor (+ provenance/bundle), post-session
+data-quality verdict, report-only tuning suggestions, session reports + archive.
+~1340 tests pass.
+
+Acceptance is fail-closed: if health is unavailable/empty or omits
+`live_blocked`/`sources`, the dependent checks FAIL (no silent pass).
+`pax_data_quality` -> `no_data|unusable|usable_for_review|usable_for_tuning_candidate`
+(scorecard without replay-grade logs caps at review; no fills caps below
+tuning_candidate). `pax_tuning_report` is REPORT-ONLY: writes no policy, never
+auto-promotes (pinned by a test).
 
 Honest limitations (NOT yet done): no real-market validation or tuning;
 R-denominated risk counters unavailable (no per-trade risk in the SIM close
@@ -110,9 +119,10 @@ thresholds untuned on live tape.
 
 Operator command list: `paxi.bat stop|start|armed|status`;
 `curl :18890/api/health|/api/arming_check|/api/evidence_report`;
-`python -m bookmap_mcp.pax_acceptance [--replay]`;
+`python -m bookmap_mcp.pax_acceptance [--out F] [--bundle-out F] [--replay]`;
+`python -m bookmap_mcp.pax_session_report [--archive|--replay-summary]`;
 `python -m bookmap_mcp.pax_evidence_report --replay`;
-`python -m bookmap_mcp.pax_session_report [--archive|--replay-summary]`.
+`python -m bookmap_mcp.pax_data_quality`; `python -m bookmap_mcp.pax_tuning_report`.
 
 Explicitly NOT claimed: profitability, market edge, live readiness, Jane
 Street-level quality. SIM-only; live trading remains hard-blocked.
@@ -222,9 +232,15 @@ versioned jar policy. Bookmap can hold old jars open.
   thin layer over `compute_replay_readiness` + `pax_promotion_report`. No new
   profitability logic; `candidate` != `validated`. STRICT ladder: scorecard
   alone stays `logging_only` without replay-grade logs.
-- `pax_acceptance.py` - read-only SIM acceptance/doctor CLI; one JSON verdict
-  (pass|warn|fail) over existing surfaces. No service start, no broker order,
-  no LLM.
+- `pax_acceptance.py` - read-only SIM acceptance/doctor CLI; one fail-closed JSON
+  verdict (pass|warn|fail) + provenance/`--bundle-out`. No service start, no
+  broker order, no LLM.
+- `pax_data_quality.py` - read-only post-session data-quality verdict
+  (`no_data|unusable|usable_for_review|usable_for_tuning_candidate`); honest
+  fill-linkage, no invention.
+- `pax_tuning_report.py` - REPORT-ONLY tuning suggestions (candidate/blocked/
+  under-sampled setups + next-data + threshold review). Writes no policy; never
+  auto-promotes.
 - `pax_brain.py` - pure setup/thesis selection, no I/O/model/broker.
 - `pax_expectancy.py`, `pax_trade_learning.py` - learned expectancy and SIM
   outcome scorecards.
