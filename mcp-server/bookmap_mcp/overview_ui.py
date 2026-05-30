@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import subprocess
 import sqlite3
 import sys
@@ -26,6 +27,31 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from . import pax_freshness, pax_roles, pax_eval_state
+
+
+def _mtime_ms(path: Path) -> Optional[int]:
+    try:
+        return int(path.stat().st_mtime * 1000)
+    except OSError:
+        return None
+
+
+def _git_commit() -> Optional[str]:
+    """Short HEAD commit of this repo, best-effort (no window on win32)."""
+    try:
+        repo = Path(__file__).resolve().parents[2]
+        kwargs: Dict[str, Any] = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        r = subprocess.run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+                           capture_output=True, text=True, timeout=2.0, **kwargs)
+        if r.returncode == 0:
+            return (r.stdout or "").strip() or None
+    except Exception:
+        return None
+    return None
 
 
 # ─── data access ────────────────────────────────────────────────────────
@@ -360,6 +386,232 @@ class OverviewQueries:
         out["available"] = True
         return out
 
+    # ─── freshness / source helpers (Stage 1 data-truth) ────────────
+
+    def _sim_max_ms(self, expr: str, where: str = "") -> Optional[int]:
+        c = self._sim()
+        if c is None:
+            return None
+        try:
+            row = c.execute(
+                f"SELECT MAX({expr}) AS m FROM orders {where}").fetchone()
+            return int(row["m"]) if row and row["m"] else None
+        except sqlite3.OperationalError:
+            return None
+        finally:
+            c.close()
+
+    def _journal_max_ms(self, table: str) -> Optional[int]:
+        try:
+            with self._journal() as c:
+                row = c.execute(f"SELECT MAX(ts_ms) AS m FROM {table}").fetchone()
+                return int(row["m"]) if row and row["m"] else None
+        except sqlite3.OperationalError:
+            return None
+
+    def _heartbeat_mode(self) -> Tuple[Optional[int], str]:
+        """Return (last_heartbeat_ms, mode) where mode is armed/observe/
+        stale/unknown. mode reflects the LAST record but the caller's
+        is_stale flag (via the envelope) is what makes 'looks live' honest.
+        """
+        feed = self.agent_feed(limit=2)
+        if not feed:
+            return None, "unknown"
+        last = feed[-1]
+        ts = int(last.get("ts_ms") or 0) or None
+        base = "armed" if last.get("armed") else "observe"
+        if ts:
+            fresh = pax_freshness.staleness(ts, "heartbeat")
+            if fresh["is_stale"]:
+                return ts, "stale"
+        return ts, base
+
+    def enveloped(self, name: str) -> Any:
+        """Return the freshness-enveloped payload for an endpoint name.
+
+        Centralizes the data-truth contract: every endpoint declares its
+        source, source_path, updated_at, and (where relevant) mode, and the
+        envelope computes age_sec / is_stale / stale_reason.
+        """
+        jp = str(self.journal_path)
+        sp = str(self.sim_db_path) if self.sim_db_path else None
+        ld = str(self.learn_dir)
+        if name == "status":
+            data = self.status()
+            return pax_freshness.envelope(
+                data, source="journal", source_path=jp,
+                updated_at_ms=self._journal_max_ms("snapshots"))
+        if name == "position":
+            return pax_freshness.envelope(
+                self.current_position(), source="sim_db", source_path=sp,
+                updated_at_ms=self._sim_max_ms("filled_ms"))
+        if name == "working":
+            return pax_freshness.envelope(
+                self.working_orders(), source="sim_db", source_path=sp,
+                updated_at_ms=self._sim_max_ms(
+                    "placed_ms", "WHERE status IN ('WORKING','TRIGGERED')"))
+        if name == "fills":
+            return pax_freshness.envelope(
+                self.recent_fills(), source="sim_db", source_path=sp,
+                updated_at_ms=self._sim_max_ms("filled_ms",
+                                               "WHERE status='FILLED'"))
+        if name == "equity":
+            eq = self.equity_curve()
+            pts = eq.get("points") or []
+            last_ts = pts[-1]["ts"] if pts else None
+            return pax_freshness.envelope(eq, source="sim_db", source_path=sp,
+                                          updated_at_ms=last_ts)
+        if name == "daily_stats":
+            return pax_freshness.envelope(
+                self.daily_stats(), source="journal", source_path=jp,
+                updated_at_ms=None)
+        if name == "pnl_summary":
+            return pax_freshness.envelope(self.pnl_summary(), source="journal",
+                                          source_path=jp, updated_at_ms=None)
+        if name == "signals":
+            return pax_freshness.envelope(
+                self.latest_signals(), source="journal", source_path=jp,
+                updated_at_ms=self._journal_max_ms("signals"))
+        if name == "setup_winrates":
+            return pax_freshness.envelope(self.setup_winrates(),
+                                          source="journal", source_path=jp,
+                                          updated_at_ms=None)
+        if name == "errors":
+            return pax_freshness.envelope(
+                self.errors(), source="journal", source_path=jp,
+                updated_at_ms=self._journal_max_ms("events"))
+        if name == "agent_feed":
+            ts, mode = self._heartbeat_mode()
+            feed = [pax_roles.annotate_record(r) for r in self.agent_feed()]
+            return pax_freshness.envelope(
+                feed, source="heartbeat",
+                source_path=str(self.learn_dir / "agent-loop.jsonl"),
+                updated_at_ms=ts, mode=mode)
+        if name == "agent_summary":
+            ts, mode = self._heartbeat_mode()
+            data = self.agent_summary()
+            return pax_freshness.envelope(
+                data, source="heartbeat",
+                source_path=str(self.learn_dir / "agent-loop.jsonl"),
+                updated_at_ms=ts, mode=mode)
+        if name == "calibration":
+            return pax_freshness.envelope(
+                self.calibration(), source="learn_file",
+                source_path=str(self.learn_dir / "calibration.json"),
+                updated_at_ms=_mtime_ms(self.learn_dir / "calibration.json"))
+        if name == "learning_scorecard":
+            return pax_freshness.envelope(
+                self.learning_scorecard(), source="learn_file",
+                source_path=str(self.learn_dir / "scorecard.json"),
+                updated_at_ms=_mtime_ms(self.learn_dir / "scorecard.json"))
+        if name == "runtime_policy":
+            return pax_freshness.envelope(
+                self.runtime_policy(), source="learn_file",
+                source_path=str(self.learn_dir / "runtime-policy.json"),
+                updated_at_ms=_mtime_ms(self.learn_dir / "runtime-policy.json"))
+        if name == "learning_status":
+            return pax_freshness.envelope(
+                self.learning_status(), source="learn_file", source_path=ld,
+                updated_at_ms=_mtime_ms(self.learn_dir / "scorecard.json"))
+        if name == "lessons":
+            return pax_freshness.envelope(
+                self.lessons(), source="learn_file",
+                source_path=str(self.learn_dir / "sim_lessons.md"),
+                updated_at_ms=_mtime_ms(self.learn_dir / "sim_lessons.md"))
+        if name == "cron_status":
+            return pax_freshness.envelope(self.cron_status(),
+                                          source="task_scheduler",
+                                          source_path=None, updated_at_ms=None)
+        raise KeyError(name)
+
+    # ─── evaluation gate (Stage 6, read-only) ───────────────────────
+
+    def kill_switch_active(self) -> bool:
+        return (self.learn_dir / "KILL_SWITCH").exists()
+
+    def evaluation_state(self) -> Dict[str, Any]:
+        summary = self.agent_summary()
+        eq = self.equity_curve()
+        ts, _mode = self._heartbeat_mode()
+        hb_stale = bool(pax_freshness.staleness(ts, "heartbeat")["is_stale"])
+        state = pax_eval_state.compute_eval_state(
+            scorecard=self.learning_scorecard(),
+            runtime_policy=self.runtime_policy(),
+            agent_stats={
+                "armed": summary.get("armed"),
+                "cycles": summary.get("cycles"),
+                "executed": summary.get("executed"),
+                "wins": eq.get("wins"),
+                "losses": eq.get("losses"),
+            },
+            ops={"heartbeat_stale": hb_stale,
+                 "malformed_count": 0},
+            kill_switch_active=self.kill_switch_active(),
+        )
+        return pax_freshness.envelope(
+            state, source="heartbeat",
+            source_path=str(self.learn_dir / "agent-loop.jsonl"),
+            updated_at_ms=ts, mode=("stale" if hb_stale else
+                                    ("armed" if summary.get("armed") else "observe")))
+
+    # ─── health (Stage 7) ───────────────────────────────────────────
+
+    def health(self) -> Dict[str, Any]:
+        """Aggregate per-source freshness + risk/eval summary into one
+        authoritative truth surface."""
+        now = pax_freshness.now_ms()
+        sources: Dict[str, Any] = {}
+
+        snap_ms = self._journal_max_ms("snapshots")
+        sources["market"] = pax_freshness.staleness(snap_ms, "market", now)
+        sources["market"]["source"] = "market"
+        sources["market"]["source_path"] = str(self.journal_path)
+
+        sim_ms = self._sim_max_ms("placed_ms")
+        sources["sim_db"] = pax_freshness.staleness(sim_ms, "sim_db", now)
+        sources["sim_db"]["source"] = "sim_db"
+        sources["sim_db"]["reachable"] = (self.sim_db_path is not None
+                                          and Path(self.sim_db_path).exists())
+        sources["sim_db"]["source_path"] = (str(self.sim_db_path)
+                                            if self.sim_db_path else None)
+
+        hb_ms, mode = self._heartbeat_mode()
+        sources["heartbeat"] = pax_freshness.staleness(hb_ms, "heartbeat", now)
+        sources["heartbeat"]["source"] = "heartbeat"
+        sources["heartbeat"]["mode"] = mode
+
+        for fname, key in (("scorecard.json", "scorecard"),
+                           ("runtime-policy.json", "runtime_policy"),
+                           ("calibration.json", "calibration")):
+            p = self.learn_dir / fname
+            m = pax_freshness.staleness(_mtime_ms(p), "learn_file", now)
+            m["source"] = "learn_file"
+            m["reachable"] = p.exists()
+            m["source_path"] = str(p)
+            sources[key] = m
+
+        agg = pax_freshness.worst_of(*sources.values())
+        try:
+            evald = self.evaluation_state()
+            eval_level = evald.get("level")
+            live_blocked = evald.get("live_blocked")
+        except Exception:
+            eval_level, live_blocked = None, True
+
+        return {
+            "service": "pax_overview_ui",
+            "up": True,
+            "git_commit": _git_commit(),
+            "checked_ms": now,
+            "mode": mode,
+            "sources": sources,
+            "is_stale": agg["is_stale"],
+            "stale_sources": agg["stale_sources"],
+            "kill_switch_active": self.kill_switch_active(),
+            "evaluation_level": eval_level,
+            "live_blocked": live_blocked,
+        }
+
 
 # ─── HTTP handler ───────────────────────────────────────────────────────
 
@@ -401,42 +653,25 @@ def _build_handler(queries: OverviewQueries) -> type:
             try:
                 if path in ("", "/"):
                     return _html_response(self, _PAGE_HTML)
-                if path == "/api/status":
-                    return _json_response(self, queries.status())
-                if path == "/api/position":
-                    return _json_response(self, queries.current_position())
-                if path == "/api/working":
-                    return _json_response(self, queries.working_orders())
-                if path == "/api/daily_stats":
-                    return _json_response(self, queries.daily_stats())
-                if path == "/api/pnl_summary":
-                    return _json_response(self, queries.pnl_summary())
-                if path == "/api/signals":
-                    return _json_response(self, queries.latest_signals())
-                if path == "/api/setup_winrates":
-                    return _json_response(self, queries.setup_winrates())
-                if path == "/api/errors":
-                    return _json_response(self, queries.errors())
-                if path == "/api/agent_summary":
-                    return _json_response(self, queries.agent_summary())
-                if path == "/api/agent_feed":
-                    return _json_response(self, queries.agent_feed())
-                if path == "/api/cron_status":
-                    return _json_response(self, queries.cron_status())
-                if path == "/api/calibration":
-                    return _json_response(self, queries.calibration())
-                if path == "/api/learning_scorecard":
-                    return _json_response(self, queries.learning_scorecard())
-                if path == "/api/runtime_policy":
-                    return _json_response(self, queries.runtime_policy())
-                if path == "/api/learning_status":
-                    return _json_response(self, queries.learning_status())
-                if path == "/api/equity":
-                    return _json_response(self, queries.equity_curve())
-                if path == "/api/fills":
-                    return _json_response(self, queries.recent_fills())
-                if path == "/api/lessons":
-                    return _json_response(self, queries.lessons())
+                # Freshness-enveloped endpoints (Stage 1 data-truth). Every
+                # one carries _meta {source, source_path, updated_at, age_sec,
+                # is_stale, stale_reason, mode}. Lists are under .items.
+                _ENVELOPED = {
+                    "/api/status", "/api/position", "/api/working",
+                    "/api/daily_stats", "/api/pnl_summary", "/api/signals",
+                    "/api/setup_winrates", "/api/errors", "/api/agent_summary",
+                    "/api/agent_feed", "/api/cron_status", "/api/calibration",
+                    "/api/learning_scorecard", "/api/runtime_policy",
+                    "/api/learning_status", "/api/equity", "/api/fills",
+                    "/api/lessons",
+                }
+                if path in _ENVELOPED:
+                    return _json_response(self,
+                                          queries.enveloped(path[len("/api/"):]))
+                if path == "/api/health":
+                    return _json_response(self, queries.health())
+                if path == "/api/evaluation_state":
+                    return _json_response(self, queries.evaluation_state())
                 return self.send_error(404, f"unknown path: {path}")
             except Exception as exc:   # pragma: no cover — defensive
                 return _json_response(self,
@@ -470,6 +705,7 @@ _PAGE_HTML = """<!doctype html>
   .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#445;margin-right:6px;vertical-align:middle}
   .dot.on{background:var(--grn);box-shadow:0 0 8px var(--grn)}
   .dot.armed{background:var(--red);box-shadow:0 0 8px var(--red)}
+  .dot.stale{background:var(--amber);box-shadow:0 0 8px var(--amber)}
   .card{background:var(--glass);border:1px solid var(--line);border-radius:14px;
     padding:14px 16px;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
     box-shadow:0 8px 30px rgba(0,0,0,.35)}
@@ -557,6 +793,11 @@ const esc = s => String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt
 const money = n => (n<0?'-$':'$') + Math.abs(Number(n||0)).toFixed(2);
 const fmtMs = ms => ms ? new Date(Number(ms)).toLocaleTimeString() : '--';
 async function J(p){const r=await fetch(p,{cache:'no-store'});if(!r.ok)throw new Error(p+' '+r.status);return r.json();}
+// Stage 1 envelope helpers: list endpoints now return {items,_meta}; dict
+// endpoints carry a _meta block. Stay tolerant of both old and new shapes.
+const arr = x => Array.isArray(x)?x:((x&&x.items)||[]);
+const meta = x => (x&&x._meta)||{};
+const ageStr = m => (m&&m.age_sec!=null)?(m.age_sec<90?Math.round(m.age_sec)+'s':Math.round(m.age_sec/60)+'m')+' ago':'--';
 
 function statCard(lbl,val,sub,cls){
   return '<div class="card stat"><div class="lbl">'+lbl+'</div><div class="val '+(cls||'')+'">'+
@@ -616,10 +857,19 @@ async function refresh(){
       J('/api/equity'),J('/api/fills'),J('/api/position'),J('/api/working'),
       J('/api/cron_status'),J('/api/learning_status')]);
 
+    const sm=meta(sum);
+    const stale=!!sm.is_stale, mode=sm.mode||(sum.armed?'armed':'observe');
     const armed=sum.armed, running=(sum.cycles||0)>0;
-    $('agdot').className='dot '+(armed?'armed':running?'on':'');
-    $('agstate').textContent='AGENT '+(armed?'ARMED (sim)':running?'observing':'idle');
-    $('rfsh').textContent=new Date().toLocaleTimeString();
+    // Data truth: never present a stale heartbeat as live. If the last
+    // heartbeat is older than its budget, say STALE with the age.
+    if(stale){
+      $('agdot').className='dot stale';
+      $('agstate').textContent='AGENT STALE ('+ageStr(sm)+')'+(mode==='armed'?' last:ARMED':mode==='observe'?' last:observe':'');
+    }else{
+      $('agdot').className='dot '+(armed?'armed':running?'on':'');
+      $('agstate').textContent='AGENT '+(armed?'ARMED (sim)':running?'observing':'idle');
+    }
+    $('rfsh').textContent=new Date().toLocaleTimeString()+(stale?' · STALE':'');
 
     const rz=Number(sum.realized||0);
     const pz=(sum.position&&sum.position.size)||0;
@@ -632,7 +882,8 @@ async function refresh(){
       statCard('Open pos',pz,pz>0?'long':pz<0?'short':'flat',pz>0?'pos':pz<0?'neg':'mut');
 
     $('equity').innerHTML=equityChart(eq.points);
-    $('feed').innerHTML=(feed||[]).slice().reverse().map(feedRow).join('')||'<div class="mut">waiting for agent...</div>';
+    const feedArr=arr(feed);
+    $('feed').innerHTML=feedArr.slice().reverse().map(feedRow).join('')||'<div class="mut">waiting for agent...</div>';
     if(cron && cron.installed){
       const hidden = String(cron.execute||'').toLowerCase().indexOf('pythonw.exe')>=0;
       const mode = String(cron.arguments||'').indexOf('--armed')>=0 ? 'ARMED' : 'observe';
@@ -657,26 +908,27 @@ async function refresh(){
       '<span class="pill">'+(calib.decisions||0)+' decisions</span></div>'+
       bars((calib.by_action)||sum.actions);
 
-    if(!pos){$('posbox').innerHTML='<div class="mut">flat</div>';}
-    else{const s=pos.size||0;
+    const psize=(pos&&pos.size)||0;
+    if(!pos||!('size' in pos)){$('posbox').innerHTML='<div class="mut">flat</div>';}
+    else{const s=psize;
       $('posbox').innerHTML='<div style="font-family:ui-monospace;font-size:13px">'+
         '<span class="'+(s>0?'pos':s<0?'neg':'mut')+'">'+(s>0?'LONG ':s<0?'SHORT ':'FLAT ')+s+'</span>'+
         (pos.avg_price?(' @ '+Number(pos.avg_price).toFixed(2)):'')+
         '  &middot; realized '+money(pos.realized_pnl)+'</div>';}
 
-    $('working').innerHTML=table(working,[
+    $('working').innerHTML=table(arr(working),[
       {h:'Side',k:'side'},{h:'Type',k:'type'},{h:'Qty',k:'qty'},
       {h:'Limit',f:r=>r.limit_price?Number(r.limit_price).toFixed(2):'--'},
       {h:'Stop',f:r=>r.stop_price?Number(r.stop_price).toFixed(2):'--'},
       {h:'Role',k:'role'},{h:'Status',k:'status'}]);
 
-    $('fills').innerHTML=table(fills,[
+    $('fills').innerHTML=table(arr(fills),[
       {h:'Time',f:r=>fmtMs(r.filled_ms)},{h:'Side',k:'side'},{h:'Qty',k:'qty'},
       {h:'Price',f:r=>r.filled_price?Number(r.filled_price).toFixed(2):'--'},
       {h:'Role',k:'role'},{h:'Tag',k:'decision_tag'}]);
 
     // lessons
-    try{const ls=await J('/api/lessons');
+    try{const ls=arr(await J('/api/lessons'));
       $('lessons').innerHTML=(ls&&ls.length)?ls.slice().reverse().map(l=>'<div>'+esc(l)+'</div>').join(''):'<div class="mut">none yet - the agent writes these as it learns</div>';
     }catch(e){}
   }catch(err){ $('rfsh').textContent='error: '+err.message; }

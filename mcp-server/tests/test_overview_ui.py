@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -211,21 +212,25 @@ def test_api_status_returns_json(live_server):
     assert data["snapshot_count"] == 1
 
 
-def test_api_signals_returns_array(live_server):
+def test_api_signals_returns_enveloped_items(live_server):
+    # Stage 1: list endpoints now return {items, _meta}.
     host, port = live_server
     status, body = _get(host, port, "/api/signals")
     assert status == 200
     data = json.loads(body)
-    assert isinstance(data, list)
-    assert len(data) == 1
-    assert data[0]["decision"] == "ENTER_LONG_FOLLOW"
+    assert isinstance(data["items"], list)
+    assert len(data["items"]) == 1
+    assert data["items"][0]["decision"] == "ENTER_LONG_FOLLOW"
+    assert data["_meta"]["source"] == "journal"
+    assert "is_stale" in data["_meta"]
 
 
-def test_api_errors_returns_array(live_server):
+def test_api_errors_returns_enveloped_items(live_server):
     host, port = live_server
     status, body = _get(host, port, "/api/errors")
     data = json.loads(body)
-    assert any(e["kind"] == "WARN" for e in data)
+    assert any(e["kind"] == "WARN" for e in data["items"])
+    assert data["_meta"]["source"] == "journal"
 
 
 def test_api_learning_status_returns_json(live_server):
@@ -274,6 +279,125 @@ def test_unknown_path_returns_404(live_server):
     host, port = live_server
     status, _ = _get(host, port, "/api/does_not_exist")
     assert status == 404
+
+
+# ─── Stage 1 / 6 / 7: data-truth, health, evaluation ────────────────────
+
+def _learn(tmp_path, **files):
+    d = tmp_path / "learn"
+    d.mkdir()
+    for name, text in files.items():
+        (d / name).write_text(text, encoding="utf-8")
+    return d
+
+
+def test_enveloped_dict_endpoint_carries_meta(queries):
+    env = queries.enveloped("status")
+    assert "_meta" in env
+    assert env["_meta"]["source"] == "journal"
+    assert "is_stale" in env["_meta"]
+    # underlying status fields still present (non-breaking merge)
+    assert env["snapshot_count"] == 1
+
+
+def test_enveloped_list_endpoint_uses_items(queries):
+    env = queries.enveloped("signals")
+    assert isinstance(env["items"], list)
+    assert env["_meta"]["source"] == "journal"
+
+
+def test_stale_heartbeat_reports_stale_mode(tmp_path, populated_journal):
+    # An hour-old heartbeat must NOT be presented as live.
+    old = int(time.time() * 1000) - 3_600_000
+    learn = _learn(tmp_path, **{"agent-loop.jsonl":
+        json.dumps({"ts_ms": old, "heartbeat": True, "armed": True,
+                    "action": "PLACE_SHORT"}) + "\n"})
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    env = q.enveloped("agent_summary")
+    assert env["_meta"]["is_stale"] is True
+    assert env["_meta"]["mode"] == "stale"   # not "armed"
+
+
+def test_fresh_heartbeat_reports_live_mode(tmp_path, populated_journal):
+    now = int(time.time() * 1000)
+    learn = _learn(tmp_path, **{"agent-loop.jsonl":
+        json.dumps({"ts_ms": now - 3_000, "heartbeat": True, "armed": False,
+                    "action": "NONE"}) + "\n"})
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    env = q.enveloped("agent_summary")
+    assert env["_meta"]["is_stale"] is False
+    assert env["_meta"]["mode"] == "observe"
+
+
+def test_agent_feed_items_carry_roles(tmp_path, populated_journal):
+    now = int(time.time() * 1000)
+    learn = _learn(tmp_path, **{"agent-loop.jsonl":
+        json.dumps({"ts_ms": now, "heartbeat": True, "armed": True,
+                    "action": "PLACE_SHORT", "governor": "ok",
+                    "order": {"side": "SHORT"}, "executed": True}) + "\n"})
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    env = q.enveloped("agent_feed")
+    assert env["items"][0]["roles"]["risk"]["outcome"] == "ALLOWED"
+
+
+def test_missing_sim_db_is_safe_and_stale(tmp_path, populated_journal):
+    learn = _learn(tmp_path)
+    q = OverviewQueries(populated_journal,
+                        sim_db_path=tmp_path / "nope.db", learn_dir=learn)
+    pos = q.enveloped("position")
+    assert pos["_meta"]["is_stale"] is True          # never_updated
+    h = q.health()
+    assert h["sources"]["sim_db"]["reachable"] is False
+    assert h["up"] is True
+
+
+def test_health_shape_and_live_blocked(tmp_path, populated_journal):
+    learn = _learn(tmp_path)
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    h = q.health()
+    assert h["up"] is True
+    assert h["live_blocked"] is True
+    for src in ("market", "sim_db", "heartbeat", "scorecard"):
+        assert src in h["sources"]
+    assert all(src for src in h["stale_sources"])
+    assert "heartbeat" in h["stale_sources"]
+
+
+def test_evaluation_state_envelope_and_block(tmp_path, populated_journal):
+    learn = _learn(tmp_path, **{"scorecard.json": json.dumps({"setups": []}),
+                                "runtime-policy.json": json.dumps({})})
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    env = q.evaluation_state()
+    assert env["live_blocked"] is True
+    assert env["level"] in ("observe_only", "sim_armed", "sim_restricted",
+                            "sim_candidate")
+    assert "_meta" in env
+
+
+def test_kill_switch_surfaces_in_eval_and_health(tmp_path, populated_journal):
+    learn = _learn(tmp_path, **{"scorecard.json": json.dumps({"setups": []})})
+    (learn / "KILL_SWITCH").write_text("stop", encoding="utf-8")
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    assert q.kill_switch_active() is True
+    assert q.evaluation_state()["reason"] == "kill_switch_active"
+    assert q.health()["kill_switch_active"] is True
+
+
+def test_api_health_endpoint_200(live_server):
+    host, port = live_server
+    status, body = _get(host, port, "/api/health")
+    assert status == 200
+    data = json.loads(body)
+    assert data["up"] is True
+    assert data["live_blocked"] is True
+
+
+def test_api_evaluation_state_endpoint_200(live_server):
+    host, port = live_server
+    status, body = _get(host, port, "/api/evaluation_state")
+    assert status == 200
+    data = json.loads(body)
+    assert data["live_blocked"] is True
 
 
 def test_html_page_constant_has_dashboard_panels():

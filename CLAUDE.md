@@ -243,6 +243,41 @@ python -m bookmap_mcp.pax_daemon --source bookmap --alias 'NQM6.CME@RITHMIC' --p
 python -m bookmap_mcp.overview_ui       # http://127.0.0.1:18890
 ```
 
+### Overview UI data-truth contract (truth slice)
+
+Read-only `:18890` endpoints carry a freshness envelope so the UI never
+shows stale state as live. Implemented in `pax_freshness.py` (pure) and wired
+through `OverviewQueries.enveloped()`:
+
+- Dict endpoints add a `_meta` block; list endpoints return
+  `{"items": [...], "_meta": {...}}`. JS reads `.items` tolerantly.
+- `_meta`: `source`, `source_path`, `updated_at`, `age_sec`, `is_stale`,
+  `stale_reason`, `threshold_sec`, `mode`, `historical`.
+- Stale budgets per source (env override `PAX_STALE_SEC_<SOURCE>`):
+  heartbeat 30s, market 15s, sim_db 120s, journal 120s, learn_file 86400s
+  (historical: stale but not a freshness failure).
+- Header shows **AGENT STALE (age)** when the heartbeat exceeds budget
+  instead of a fake live "ARMED"/"observing".
+
+New read-only endpoints (no decision/order path touched):
+
+- `GET /api/health` -- per-source freshness, `up`, `git_commit`, `mode`,
+  `kill_switch_active`, `evaluation_level`, `live_blocked` (always true).
+- `GET /api/evaluation_state` -- `pax_eval_state.compute_eval_state` (pure):
+  ladder `observe_only`/`sim_armed`/`sim_restricted`/`sim_candidate`,
+  per-setup eligibility (sample-gated, no false promotion), `live_blocked`
+  hard-coded true.
+- `/api/agent_feed` items carry a `roles` block (observer/strategist/risk/
+  executor/auditor) via `pax_roles.annotate_record` -- read-side only, the
+  writer is unchanged.
+
+`pax_session_report.py` writes `D:\BookmapLogs\pax-agent\session-report.json`.
+Kill switch `D:\BookmapLogs\pax-agent\KILL_SWITCH` is REPORTED in
+health/eval but NOT yet enforced in the governor. Full runbook:
+`docs/PAX_RUNBOOK.md`. These modules do not duplicate the existing
+`pax_replay`/`pax_policy_replay`/`pax_calibration`/`pax_research_claude`/
+`pax_trade_learning` engines -- those already exist and were left intact.
+
 First-time setup: `cd mcp-server && python -m pip install -e .` so the
 system Python can `import bookmap_mcp` from anywhere. (The MCP server
 itself uses the venv at `mcp-server/.venv/Scripts/python.exe`; this
