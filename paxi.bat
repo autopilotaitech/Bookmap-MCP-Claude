@@ -69,8 +69,10 @@ REM console (no new/persistent terminal), and a failure here must NOT prevent
 REM the stop. --archive also keeps a timestamped copy under sessions\.
 if exist "%PY%" (
   echo [paxi] writing session report (best-effort)...
+  pushd "%SRV%"
   "%PY%" -B -m bookmap_mcp.pax_session_report --archive --learn-dir "%LOGDIR%" --journal "%JOURNAL%" --sim-db "%SIMDB%" >> "%LOGDIR%\session-report.log" 2>&1
   if errorlevel 1 echo [paxi] session report failed (continuing stop).
+  popd
 )
 call :stop_processes_only
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$t=Get-ScheduledTask -TaskName 'PaxAgentCron' -ErrorAction SilentlyContinue; if($t){Disable-ScheduledTask -TaskName 'PaxAgentCron' | Out-Null}" >nul 2>nul

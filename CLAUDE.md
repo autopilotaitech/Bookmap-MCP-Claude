@@ -57,6 +57,13 @@ legal/risk, capital, latency, exchange-failure, and manual approval controls.
   auto-assigned), auto session-report-on-`paxi.bat stop` (+timestamped archive),
   and `GET /api/arming_check` go/no-go + `GET /api/promotion_report`. 1232 tests
   pass.
+- audit fixes: `/api/arming_check` is strictly read-only (no probe-file write;
+  non-mutating writability check). `paxi.bat stop` runs the report under
+  `pushd "%SRV%"`/`popd`. `pax_agent_replay` adds an OPTIONAL second layer
+  (`pax_risk_gate.evaluate_entry_gate` for entry plans with a real market
+  timestamp) -> `replayed_risk_halt_counts` / `op_gate_replayed_count` /
+  `op_gate_missing_fields_count` / `risk_halt_divergence_count`; missing fields
+  are a limitation, never faked.
 
 ### Active Next Phase
 

@@ -593,6 +593,33 @@ def test_arming_check_missing_scorecard_is_warning_not_blocker(tmp_path,
     assert "scorecard_present" not in a["blocking_codes"]
 
 
+def test_arming_check_is_read_only_no_probe_file(tmp_path):
+    q = _green_arming(tmp_path)
+    before = sorted(p.name for p in q.learn_dir.iterdir())
+    a = q.arming_check()
+    after = sorted(p.name for p in q.learn_dir.iterdir())
+    # No probe file created and no files added/removed -> endpoint is read-only.
+    assert ".arming_write_test" not in after
+    assert before == after
+    sr = [c for c in a["checks"] if c["code"] == "session_report_writable"][0]
+    assert sr["status"] in ("pass", "warn")
+    assert "session_report_writable" not in a["blocking_codes"]
+
+
+def test_arming_check_does_not_create_missing_learn_dir(tmp_path):
+    from bookmap_mcp.journal import Journal
+    db = tmp_path / "j.db"
+    j = Journal(db); j.open()
+    j.begin_run(adapter_name="csv", signal_version="v2", weights_hash="x")
+    j.end_run("done"); j.close()
+    missing = tmp_path / "no_such_learn"
+    q = OverviewQueries(db, learn_dir=missing)
+    a = q.arming_check()                       # must not write anything
+    assert not missing.exists()
+    sr = [c for c in a["checks"] if c["code"] == "session_report_writable"][0]
+    assert sr["status"] == "warn"              # never claims writable by writing
+
+
 def test_arming_check_bookmap_closed_is_nogo_not_exception(tmp_path):
     # Fresh empty journal, no learn files, no sim db -> all-stale weekend state.
     from bookmap_mcp.journal import Journal

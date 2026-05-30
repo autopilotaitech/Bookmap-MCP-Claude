@@ -47,7 +47,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import pax_loop
+from . import pax_loop, pax_risk_gate   # pax_risk_gate is pure (no broker/LLM)
 
 # Captured so the report is self-describing about the policy it replayed. These
 # are the deterministic pax_loop knobs that shape a decision.
@@ -87,6 +87,32 @@ def _status_of(record: Dict[str, Any]) -> Dict[str, Any]:
 def _recorded_halt(record: Dict[str, Any]) -> Optional[str]:
     code = record.get("risk_halt_code") or record.get("risk_halt")
     return str(code) if code else None
+
+
+def _num(x: Any) -> Optional[float]:
+    try:
+        v = float(x)
+        return v if v == v else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _market_age_sec(snap: Dict[str, Any], now_ms: int) -> Optional[float]:
+    """Market/feed data age (seconds) from a REAL bridge timestamp, or None when
+    none exists. Mirrors pax_sim_agent._market_age_sec; never uses dashboard
+    compose time. None -> the operational gate cannot be replayed (missing
+    fields), which is reported as a limitation rather than faked."""
+    as_of = _num(snap.get("marketDataAsOfMs"))
+    if as_of is None:
+        as_of = _num(snap.get("marketAsOfMs"))
+    if as_of is not None:
+        return max(0.0, (now_ms - as_of) / 1000.0)
+    age_ms = _num(snap.get("ageMs"))
+    if age_ms is None:
+        age_ms = _num(snap.get("snapshot_age_ms"))
+    if age_ms is not None:
+        return max(0.0, age_ms / 1000.0)
+    return None
 
 
 def _now_from(record: Dict[str, Any], snap: Dict[str, Any]) -> Tuple[Any, int]:
@@ -131,8 +157,17 @@ def replay_records(records: List[Dict[str, Any]],
                    malformed: int = 0,
                    input_path: Optional[str] = None,
                    limit: Optional[int] = None,
-                   now_ms: Optional[int] = None) -> Dict[str, Any]:
+                   now_ms: Optional[int] = None,
+                   risk_config: Optional["pax_risk_gate.RiskGateConfig"] = None
+                   ) -> Dict[str, Any]:
     """Pure replay over already-parsed records. Returns a stable summary dict.
+
+    Two layers, both pure (no orders, no LLM, no live Bookmap):
+      1. Decision replay -- always runs ``pax_loop.decide``.
+      2. OPTIONAL operational risk-gate replay -- runs
+         ``pax_risk_gate.evaluate_entry_gate`` ONLY for entry plans that carry a
+         real market-freshness timestamp. Records lacking it are reported as a
+         limitation, never faked into a pass/fail.
 
     Deterministic except ``generated_ms`` (pin with ``now_ms``)."""
     if limit is not None and limit >= 0:
@@ -141,11 +176,16 @@ def replay_records(records: List[Dict[str, Any]],
     action_counts: Counter = Counter()
     recorded_action_counts: Counter = Counter()
     setup_counts: Counter = Counter()
-    risk_halt_counts: Counter = Counter()
+    risk_halt_counts: Counter = Counter()          # recorded (kept for compat)
+    replayed_halt_counts: Counter = Counter()      # re-evaluated by the gate
     decisions = 0
     usable = 0
     divergences: List[Dict[str, Any]] = []
     divergence_count = 0
+    risk_halt_divergences: List[Dict[str, Any]] = []
+    risk_halt_divergence_count = 0
+    op_replayed = 0                                # entries the gate was run on
+    op_missing_fields = 0                          # entries skipped: no mkt ts
 
     for idx, rec in enumerate(records):
         recorded_action = rec.get("action")
@@ -183,6 +223,42 @@ def replay_records(records: List[Dict[str, Any]],
                     "replay_state": plan.get("state"),
                 })
 
+        # ---- Layer 2: optional operational risk-gate replay (entry plans) ----
+        if not plan.get("order"):
+            continue   # gate is entry-only; non-entry plans are not gated
+        market_age = _market_age_sec(snap, ts_ms)
+        if market_age is None:
+            # No real market timestamp -> cannot prove freshness without faking
+            # it; do NOT run the gate (fail-closed faking is exactly what we are
+            # avoiding here). Counted as a limitation instead.
+            op_missing_fields += 1
+            continue
+        kill_active = bool(rec.get("kill_switch_active")) \
+            if "kill_switch_active" in rec else False
+        hb_age = _num(rec.get("heartbeat_age_sec")) \
+            if "heartbeat_age_sec" in rec else None
+        sim_ok = bool(rec.get("sim_broker_ok")) if "sim_broker_ok" in rec \
+            else (not status.get("_status_error"))
+        gate = pax_risk_gate.evaluate_entry_gate(
+            now_ms=ts_ms, kill_switch_active=kill_active,
+            heartbeat_age_sec=hb_age, market_age_sec=market_age,
+            sim_broker_ok=sim_ok,
+            session=pax_risk_gate.session_counters_from_status(status),
+            config=risk_config)
+        op_replayed += 1
+        replayed_code = gate.code   # None when the gate allows the entry
+        if replayed_code:
+            replayed_halt_counts[replayed_code] += 1
+        if (halt or None) != (replayed_code or None):
+            risk_halt_divergence_count += 1
+            if len(risk_halt_divergences) < 50:
+                risk_halt_divergences.append({
+                    "index": idx,
+                    "ts_ms": ts_ms,
+                    "recorded_risk_halt": halt,
+                    "replayed_risk_halt": replayed_code,
+                })
+
     limitations: List[str] = []
     if usable < len(records):
         limitations.append(
@@ -193,6 +269,11 @@ def replay_records(records: List[Dict[str, Any]],
         limitations.append(
             "no usable snapshots: this input cannot prove decision-path replay; "
             "use a snapshot-embedding fixture to exercise pax_loop.decide.")
+    if op_missing_fields:
+        limitations.append(
+            f"operational risk gate not replayed for {op_missing_fields} entry "
+            "record(s) due to missing fields (no real market-freshness "
+            "timestamp); not faked into a pass/fail.")
     limitations.append("SIM-only deterministic replay: no orders, no LLM, no "
                        "live Bookmap; no market-edge claim.")
 
@@ -206,7 +287,15 @@ def replay_records(records: List[Dict[str, Any]],
         "action_counts": dict(sorted(action_counts.items())),
         "recorded_action_counts": dict(sorted(recorded_action_counts.items())),
         "setup_counts": dict(sorted(setup_counts.items())),
+        # recorded halts read from the log (back-compat: risk_halt_counts) +
+        # the gate-replayed halts, kept strictly separate.
         "risk_halt_counts": dict(sorted(risk_halt_counts.items())),
+        "recorded_risk_halt_counts": dict(sorted(risk_halt_counts.items())),
+        "replayed_risk_halt_counts": dict(sorted(replayed_halt_counts.items())),
+        "op_gate_replayed_count": op_replayed,
+        "op_gate_missing_fields_count": op_missing_fields,
+        "risk_halt_divergence_count": risk_halt_divergence_count,
+        "risk_halt_divergences": risk_halt_divergences,
         "divergence_count": divergence_count,
         "divergences": divergences,
         "deterministic_config": DETERMINISTIC_CONFIG,
@@ -220,7 +309,9 @@ def _wall_ms() -> int:
 
 
 def replay_file(input_path: Path, *, limit: Optional[int] = None,
-                now_ms: Optional[int] = None) -> Dict[str, Any]:
+                now_ms: Optional[int] = None,
+                risk_config: Optional["pax_risk_gate.RiskGateConfig"] = None
+                ) -> Dict[str, Any]:
     """Read a JSONL file and replay it. Missing file -> a structured summary
     with an explicit limitation (never raises for a missing input)."""
     p = Path(input_path)
@@ -238,6 +329,12 @@ def replay_file(input_path: Path, *, limit: Optional[int] = None,
             "recorded_action_counts": {},
             "setup_counts": {},
             "risk_halt_counts": {},
+            "recorded_risk_halt_counts": {},
+            "replayed_risk_halt_counts": {},
+            "op_gate_replayed_count": 0,
+            "op_gate_missing_fields_count": 0,
+            "risk_halt_divergence_count": 0,
+            "risk_halt_divergences": [],
             "divergence_count": 0,
             "divergences": [],
             "deterministic_config": DETERMINISTIC_CONFIG,
@@ -245,7 +342,7 @@ def replay_file(input_path: Path, *, limit: Optional[int] = None,
         }
     records, malformed = iter_records(text)
     return replay_records(records, malformed=malformed, input_path=str(p),
-                          limit=limit, now_ms=now_ms)
+                          limit=limit, now_ms=now_ms, risk_config=risk_config)
 
 
 def build_parser() -> argparse.ArgumentParser:

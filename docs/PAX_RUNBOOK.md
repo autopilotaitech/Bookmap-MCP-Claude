@@ -56,8 +56,9 @@ paxi.bat stop
 `stop` first writes a **session report** (best-effort, read-only) BEFORE killing
 processes, then stops only the PAX autopilot/overview/cron. It runs
 `python -m bookmap_mcp.pax_session_report --archive` synchronously in the same
-console (no new/persistent terminal); a report failure prints a notice and the
-stop continues regardless. The canonical report lands at
+console (no new/persistent terminal), wrapped in `pushd "%SRV%"` / `popd` so it
+is independent of the caller's working directory; `popd` runs even if the report
+fails, and a report failure prints a notice and the stop continues regardless. The canonical report lands at
 `D:\BookmapLogs\pax-agent\session-report.json` and a timestamped copy at
 `D:\BookmapLogs\pax-agent\sessions\session-report-YYYYMMDD-HHMMSS.json`. It does
 NOT touch Bookmap / OpenRange / the bridge and does not require Bookmap open.
@@ -74,6 +75,12 @@ hard-blocked, required live sources fresh, no active risk halt. Missing
 scorecard is a WARNING, not a blocker. `live_blocked` is always true. With
 Bookmap closed/weekend the market + heartbeat sources are stale, so this
 correctly returns `can_arm=false` -- that is expected, not a bug.
+
+`/api/arming_check` is **strictly read-only**: it performs NO filesystem writes.
+The session-report-path check reasons about writability without writing a probe
+file -- when writability cannot be positively proven (e.g. Windows directory
+`os.access` semantics) it reports `warn` / `writability_not_proven`, never
+writes to find out, and never blocks arming on it.
 
 ## Dashboard / data truth
 
@@ -251,9 +258,25 @@ logs are summarized (recorded actions/risk-halts counted) but their decisions
 cannot be re-derived -- the report says so honestly via `usable_snapshot_count`
 and a `limitations` note (nothing is faked). Snapshot-embedding fixtures under
 `mcp-server/tests/fixtures/pax_replay/` exercise the full path. Output is
-byte-stable except `generated_ms`. The report includes event/usable/malformed
-counts, replay action/setup/risk-halt counts, and `divergence_count` (recorded
-vs replay action).
+byte-stable except `generated_ms`.
+
+Replay has **two layers**, both pure (no orders, no LLM, no live Bookmap):
+
+1. **Decision replay** -- always runs `pax_loop.decide`. Yields
+   `action_counts`, `setup_counts`, and `divergence_count` (recorded vs replay
+   action). `risk_halt_counts` / `recorded_risk_halt_counts` count the enforced
+   halts read from the log.
+2. **Optional operational risk-gate replay** -- re-runs
+   `pax_risk_gate.evaluate_entry_gate` ONLY for entry plans that carry a real
+   market-freshness timestamp (`marketDataAsOfMs` / `marketAsOfMs` / `ageMs`).
+   It reads `kill_switch_active`, `heartbeat_age_sec`, and `sim_broker_ok` from
+   the record when present (safe defaults otherwise) and the session counters
+   from `status`. Results land in `replayed_risk_halt_counts`,
+   `op_gate_replayed_count`, and `risk_halt_divergence_count` (recorded halt vs
+   replayed halt). Entry records WITHOUT a real market timestamp are NOT gated
+   -- they are counted in `op_gate_missing_fields_count` and a `limitations`
+   note ("operational risk gate not replayed for N records due to missing
+   fields"), never faked into a pass/fail.
 
 ### Promotion report (new, honest, candidate is the ceiling)
 

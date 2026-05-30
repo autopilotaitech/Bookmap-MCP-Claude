@@ -142,5 +142,11 @@ def test_paxi_stop_writes_session_report_before_kill():
     assert "--archive" in block
     pre_kill = block.index("pax_session_report") < block.index("call :stop_processes_only")
     assert pre_kill, "session report must run before processes are killed"
+    # runs from %SRV%: pushd before the report, popd present (CWD-independent).
+    assert 'pushd "%SRV%"' in block
+    assert block.index('pushd "%SRV%"') < block.index("pax_session_report")
+    assert "popd" in block
+    assert block.index("pax_session_report") < block.index("popd")
+    assert block.index("popd") < block.index("call :stop_processes_only")
     # failure-tolerant: stop block does not 'exit /b 1' on report failure
     assert "exit /b 1" not in block.split("call :stop_processes_only")[0]

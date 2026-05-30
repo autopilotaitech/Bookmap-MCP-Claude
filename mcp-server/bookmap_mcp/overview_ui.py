@@ -729,16 +729,31 @@ class OverviewQueries:
 
     # ─── arming readiness (Stage 5, read-only go/no-go) ─────────────
 
-    def _learn_dir_writable(self) -> Tuple[bool, Optional[str]]:
+    def _session_report_path_status(self) -> Tuple[str, str]:
+        """Reason about session-report path writability WITHOUT mutating the
+        filesystem. The overview is strictly read-only, so this performs NO
+        writes (no probe file). It can only return ``pass`` or ``warn`` -- a
+        report path is never an arming blocker.
+
+        Windows ``os.access(dir, W_OK)`` is unreliable, so when writability
+        cannot be positively proven this returns ``warn`` /
+        ``writability_not_proven`` rather than writing a probe to find out."""
         d = self.learn_dir
         try:
-            d.mkdir(parents=True, exist_ok=True)
-            probe = d / ".arming_write_test"
-            probe.write_text("ok", encoding="utf-8")
-            probe.unlink()
-            return True, None
+            if d.is_dir():
+                if os.access(str(d), os.W_OK):
+                    return "pass", "session report dir exists and appears writable"
+                return "warn", ("writability_not_proven: report dir exists but "
+                                "writability not provable without writing; will "
+                                "be attempted on stop")
+            parent = d.parent
+            if parent.exists() and os.access(str(parent), os.W_OK):
+                return "warn", ("report dir missing; parent appears writable so "
+                                "it can be created on stop")
+            return "warn", ("writability_not_proven: report dir missing and "
+                            "parent writability not provable without writing")
         except OSError as e:
-            return False, f"{type(e).__name__}: {e}"
+            return "warn", f"writability_not_proven: {type(e).__name__}: {e}"
 
     def arming_check(self) -> Dict[str, Any]:
         """Machine-readable go/no-go before arming SIM. Read-only; never arms,
@@ -822,10 +837,8 @@ class OverviewQueries:
             "scorecard with setups present" if has_setups
             else "no scorecard/outcome data yet (exploratory; not a blocker)")
 
-        writable, werr = self._learn_dir_writable()
-        add("session_report_writable", "pass" if writable else "warn",
-            "session report path writable" if writable
-            else f"learn dir not writable: {werr}")
+        wr_status, wr_msg = self._session_report_path_status()
+        add("session_report_writable", wr_status, wr_msg)
 
         return {
             "can_arm": len(fails) == 0,

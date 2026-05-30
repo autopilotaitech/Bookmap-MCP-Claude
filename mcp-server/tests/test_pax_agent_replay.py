@@ -108,6 +108,103 @@ def test_summary_shape_is_stable():
     assert rep["deterministic_config"]["policy"] == "pax_loop.decide"
 
 
+# ── TASK 3: optional operational risk-gate replay ──────────────────────────
+
+def _entry_record(*, as_of, ts=1779900000000, status=None, **extra):
+    snap = {
+        "health": "ok", "book": {"mid": 30339.0},
+        "marketDataAsOfMs": as_of, "composedAtMs": as_of,
+        "session": {"anchorMode": "LIVE", "code": "ACTIVE"},
+        "or_day_ledger": {"session_type": "ETH"},
+        "gates": {"news": {"blocked": False}}, "flow": {},
+        "or_levels": {"orHigh": 30340.0, "orLow": 30325.5, "orWidthPts": 14.5,
+                      "inProximity": True, "middleLock": False,
+                      "levels": [{"label": "OR-H", "price": 30340.0,
+                                  "distance": 1.0, "proximity": True,
+                                  "decision": "ENTER_LONG_FOLLOW",
+                                  "confidence": 0.6,
+                                  "components": {"ps_rot": "NONE"}}]}}
+    rec = {"ts_ms": ts, "snapshot": snap,
+           "status": status if status is not None
+           else {"position": {"size": 0}, "fills_today": [],
+                 "realized_today_usd": 0.0},
+           "action": "PLACE_LONG"}
+    rec.update(extra)
+    return rec
+
+
+def test_op_gate_replays_stale_market_from_fixture():
+    # stale_market_blocked.jsonl: marketDataAsOfMs is 60s before ts_ms -> stale.
+    rep = R.replay_file(FIX / "stale_market_blocked.jsonl", now_ms=1)
+    assert rep["replayed_risk_halt_counts"].get("stale_market_data") == 1
+    assert rep["op_gate_replayed_count"] == 1
+    # recorded == replayed here -> no divergence.
+    assert rep["risk_halt_divergence_count"] == 0
+
+
+def test_op_gate_replays_max_trades_with_status_and_config():
+    from bookmap_mcp import pax_risk_gate as RG
+    ts = 1779900000000
+    rec = _entry_record(
+        as_of=ts,                                   # fresh market
+        status={"position": {"size": 0},
+                "fills_today": [{"role": "ENTRY"}, {"role": "ENTRY"}],
+                "realized_today_usd": 0.0})
+    cfg = RG.RiskGateConfig(max_trades_per_session=2)
+    rep = R.replay_records([rec], now_ms=1, risk_config=cfg)
+    assert rep["replayed_risk_halt_counts"].get("max_trades_reached") == 1
+    assert rep["op_gate_replayed_count"] == 1
+
+
+def test_op_gate_missing_market_field_is_limitation_not_fake():
+    ts = 1779900000000
+    rec = _entry_record(as_of=ts)
+    rec["snapshot"].pop("marketDataAsOfMs")
+    rec["snapshot"].pop("composedAtMs")            # no real market timestamp
+    rep = R.replay_records([rec], now_ms=1)
+    assert rep["op_gate_replayed_count"] == 0
+    assert rep["op_gate_missing_fields_count"] == 1
+    assert rep["replayed_risk_halt_counts"] == {}   # nothing faked
+    assert any("operational risk gate not replayed" in s
+               for s in rep["limitations"])
+
+
+def test_op_gate_divergence_recorded_vs_replayed():
+    # Recorded stale_heartbeat, but the gate (fresh market, no heartbeat_age
+    # field -> bootstrap allow, no kill switch) replays as ALLOWED -> divergence.
+    rep = R.replay_file(FIX / "stale_heartbeat_blocked.jsonl", now_ms=1)
+    assert rep["recorded_risk_halt_counts"].get("stale_heartbeat") == 1
+    assert rep["replayed_risk_halt_counts"] == {}
+    assert rep["risk_halt_divergence_count"] == 1
+    d = rep["risk_halt_divergences"][0]
+    assert d["recorded_risk_halt"] == "stale_heartbeat"
+    assert d["replayed_risk_halt"] is None
+
+
+def test_op_gate_uses_record_kill_switch_and_broker_fields():
+    ts = 1779900000000
+    rec = _entry_record(as_of=ts, kill_switch_active=True)
+    rep = R.replay_records([rec], now_ms=1)
+    assert rep["replayed_risk_halt_counts"].get("kill_switch_active") == 1
+    rec2 = _entry_record(as_of=ts, sim_broker_ok=False)
+    rep2 = R.replay_records([rec2], now_ms=1)
+    assert rep2["replayed_risk_halt_counts"].get("sim_broker_unavailable") == 1
+
+
+def test_op_gate_not_run_for_non_entry_plans():
+    # out-of-proximity snapshot -> decide() NONE -> no entry -> gate not run.
+    rep = R.replay_file(FIX / "divergence.jsonl", now_ms=1)
+    assert rep["op_gate_replayed_count"] == 0
+    assert rep["op_gate_missing_fields_count"] == 0
+    assert rep["replayed_risk_halt_counts"] == {}
+
+
+def test_recorded_counts_alias_preserved():
+    # back-compat: risk_halt_counts == recorded_risk_halt_counts.
+    rep = R.replay_file(FIX / "stale_market_blocked.jsonl", now_ms=1)
+    assert rep["risk_halt_counts"] == rep["recorded_risk_halt_counts"]
+
+
 # ── safety: no broker / no Claude / no live ────────────────────────────────
 
 def test_module_has_no_broker_or_llm_path():
