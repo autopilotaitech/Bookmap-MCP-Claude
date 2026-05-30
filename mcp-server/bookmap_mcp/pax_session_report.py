@@ -135,12 +135,28 @@ def build_session_report(*,
     }
 
 
+def archive_path(out_path: Path, now_ms: int) -> Path:
+    """Timestamped archive path for a session report:
+    ``<out_dir>/sessions/session-report-YYYYMMDD-HHMMSS.json`` (UTC).
+    Pure/deterministic given ``now_ms``."""
+    import datetime
+    out_path = Path(out_path)
+    stamp = datetime.datetime.fromtimestamp(
+        int(now_ms) / 1000.0, datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return out_path.parent / "sessions" / f"session-report-{stamp}.json"
+
+
 def gather_and_write(*,
                      journal: Path,
                      sim_db: Path,
                      learn_dir: Optional[Path] = None,
-                     out_path: Optional[Path] = None) -> Path:
-    """Read live data via OverviewQueries, build the report, write JSON."""
+                     out_path: Optional[Path] = None,
+                     archive: bool = False) -> Path:
+    """Read live data via OverviewQueries, build the report, write JSON.
+
+    When ``archive`` is set, ALSO writes a timestamped copy under
+    ``<out_dir>/sessions/`` so a session history accumulates. Archive-write
+    failure never prevents the canonical write."""
     from .overview_ui import OverviewQueries  # local import: avoid cycle at import time
 
     q = OverviewQueries(journal, sim_db, learn_dir=learn_dir)
@@ -171,7 +187,16 @@ def gather_and_write(*,
                                   eval_state=eval_state)
     out = Path(out_path) if out_path else (learn / "session-report.json")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    body = json.dumps(report, indent=2, default=str)
+    out.write_text(body, encoding="utf-8")
+    if archive:
+        try:
+            arch = archive_path(out, report.get("generated_ms")
+                                or pax_freshness.now_ms())
+            arch.parent.mkdir(parents=True, exist_ok=True)
+            arch.write_text(body, encoding="utf-8")
+        except OSError:
+            pass   # archive is best-effort; canonical write already succeeded
     return out
 
 
@@ -185,13 +210,16 @@ def build_parser() -> argparse.ArgumentParser:
                    default=Path(r"D:\BookmapLogs\pax-daemon-trades.db"))
     p.add_argument("--learn-dir", type=Path, default=None)
     p.add_argument("--out", type=Path, default=None)
+    p.add_argument("--archive", action="store_true",
+                   help="Also write a timestamped copy under <out_dir>/sessions/.")
     return p
 
 
 def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
     out = gather_and_write(journal=args.journal, sim_db=args.sim_db,
-                           learn_dir=args.learn_dir, out_path=args.out)
+                           learn_dir=args.learn_dir, out_path=args.out,
+                           archive=args.archive)
     print(f"session report written: {out}")
     return 0
 

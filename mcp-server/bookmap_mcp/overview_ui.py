@@ -28,7 +28,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import pax_freshness, pax_roles, pax_eval_state, pax_risk_gate
+from . import (pax_freshness, pax_roles, pax_eval_state, pax_risk_gate,
+               pax_promotion_report)
 
 
 def _mtime_ms(path: Path) -> Optional[int]:
@@ -564,6 +565,11 @@ class OverviewQueries:
             return pax_freshness.envelope(self.cron_status(),
                                           source="task_scheduler",
                                           source_path=None, updated_at_ms=None)
+        if name == "promotion_report":
+            return pax_freshness.envelope(
+                self.promotion_report(), source="learn_file",
+                source_path=str(self.learn_dir / "scorecard.json"),
+                updated_at_ms=_mtime_ms(self.learn_dir / "scorecard.json"))
         raise KeyError(name)
 
     # ─── evaluation gate (Stage 6, read-only) ───────────────────────
@@ -712,6 +718,126 @@ class OverviewQueries:
             "live_blocked": live_blocked,
         }
 
+    # ─── promotion report (Stage 3, read-only) ──────────────────────
+
+    def promotion_report(self) -> Dict[str, Any]:
+        """Honest per-setup promotion view from the SIM scorecard. Read-only,
+        deterministic; reuses pax_promotion_report (which reuses the audited
+        eval-state eligibility). live trading stays hard-blocked."""
+        return pax_promotion_report.build_promotion_report(
+            self.learning_scorecard())
+
+    # ─── arming readiness (Stage 5, read-only go/no-go) ─────────────
+
+    def _learn_dir_writable(self) -> Tuple[bool, Optional[str]]:
+        d = self.learn_dir
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            probe = d / ".arming_write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return True, None
+        except OSError as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    def arming_check(self) -> Dict[str, Any]:
+        """Machine-readable go/no-go before arming SIM. Read-only; never arms,
+        never unlocks live. ``can_arm`` is false unless every BLOCKING check
+        passes (warnings do not block). With Bookmap closed/weekend the market
+        + heartbeat sources are stale, so this correctly returns can_arm=false."""
+        now = pax_freshness.now_ms()
+        try:
+            h = self.health()
+        except Exception as exc:   # never raise from a readiness probe
+            return {
+                "can_arm": False, "mode": "unknown", "live_blocked": True,
+                "checks": [{"code": "health_error", "status": "fail",
+                            "message": f"{type(exc).__name__}: {exc}"}],
+                "blocking_codes": ["health_error"], "warnings": [],
+                "required_actions": ["investigate overview health error"],
+                "checked_ms": now,
+            }
+
+        sources = h.get("sources") or {}
+        checks: List[Dict[str, Any]] = []
+        fails: List[str] = []
+        warns: List[str] = []
+        required: List[str] = []
+
+        def add(code: str, ok_status: str, message: str,
+                action: Optional[str] = None) -> None:
+            checks.append({"code": code, "status": ok_status, "message": message})
+            if ok_status == "fail":
+                fails.append(code)
+                if action:
+                    required.append(action)
+            elif ok_status == "warn":
+                warns.append(code)
+
+        ks = bool(h.get("kill_switch_active"))
+        add("kill_switch_absent", "fail" if ks else "pass",
+            "operator kill switch engaged" if ks else "no kill switch file",
+            "remove the KILL_SWITCH file")
+
+        hb_stale = bool((sources.get("heartbeat") or {}).get("is_stale"))
+        add("heartbeat_fresh", "fail" if hb_stale else "pass",
+            "heartbeat stale/absent -- start observe mode and confirm a beat"
+            if hb_stale else "agent heartbeat fresh",
+            "start PAX observe (paxi.bat start) and confirm a fresh heartbeat")
+
+        mk_stale = bool((sources.get("market") or {}).get("is_stale"))
+        add("market_data_fresh", "fail" if mk_stale else "pass",
+            "market data stale/absent (bridge/Bookmap feed down)"
+            if mk_stale else "market data fresh",
+            "bring up Bookmap + bridge so market data is fresh")
+
+        sim_ok = bool((sources.get("sim_db") or {}).get("reachable"))
+        add("sim_broker_ok", "pass" if sim_ok else "fail",
+            "SIM broker openable+readable" if sim_ok
+            else ((sources.get("sim_db") or {}).get("error")
+                  or "SIM broker DB unavailable"),
+            "point PAX at a valid, readable SIM broker DB")
+
+        live_blocked = bool(h.get("live_blocked", True))
+        add("live_hard_blocked", "pass" if live_blocked else "fail",
+            "live trading hard-blocked (SIM only)" if live_blocked
+            else "LIVE NOT BLOCKED -- refuse to arm",
+            "restore the live hard-block before any arming")
+
+        stale_required = [s for s in (h.get("stale_sources") or [])
+                          if s in ("market", "heartbeat")]
+        add("required_sources_fresh", "fail" if stale_required else "pass",
+            ("stale required sources: " + ", ".join(stale_required))
+            if stale_required else "required live sources fresh")
+
+        rha = bool(h.get("risk_halt_active"))
+        add("risk_halt_clear", "fail" if rha else "pass",
+            (h.get("risk_halt_message") or h.get("risk_halt_code")
+             or "active risk halt") if rha else "no active risk halt",
+            f"clear risk halt: {h.get('risk_halt_code')}" if rha else None)
+
+        sc = self.learning_scorecard()
+        has_setups = bool(isinstance(sc, dict) and sc.get("setups"))
+        add("scorecard_present", "pass" if has_setups else "warn",
+            "scorecard with setups present" if has_setups
+            else "no scorecard/outcome data yet (exploratory; not a blocker)")
+
+        writable, werr = self._learn_dir_writable()
+        add("session_report_writable", "pass" if writable else "warn",
+            "session report path writable" if writable
+            else f"learn dir not writable: {werr}")
+
+        return {
+            "can_arm": len(fails) == 0,
+            "mode": h.get("mode"),
+            "live_blocked": True,
+            "checks": checks,
+            "blocking_codes": fails,
+            "warnings": warns,
+            "required_actions": required,
+            "checked_ms": now,
+        }
+
 
 # ─── HTTP handler ───────────────────────────────────────────────────────
 
@@ -772,6 +898,11 @@ def _build_handler(queries: OverviewQueries) -> type:
                     return _json_response(self, queries.health())
                 if path == "/api/evaluation_state":
                     return _json_response(self, queries.evaluation_state())
+                if path == "/api/arming_check":
+                    return _json_response(self, queries.arming_check())
+                if path == "/api/promotion_report":
+                    return _json_response(self,
+                                          queries.enveloped("promotion_report"))
                 return self.send_error(404, f"unknown path: {path}")
             except Exception as exc:   # pragma: no cover — defensive
                 return _json_response(self,

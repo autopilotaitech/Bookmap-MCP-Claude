@@ -1,0 +1,5 @@
+{"ts_ms": 1, "snapshot": 
+{"ts_ms": 1779900000000, "heartbeat": true, "action": "NONE"}
+{"ts_ms": 1779900000000, "snapshot": null, "action": "WAIT"}
+not json at all
+[1, 2, 3]

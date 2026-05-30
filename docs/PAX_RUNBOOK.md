@@ -53,6 +53,28 @@ governor; `BOOKMAP_ALLOW_TRADING` is scrubbed in the autopilot process.
 paxi.bat stop
 ```
 
+`stop` first writes a **session report** (best-effort, read-only) BEFORE killing
+processes, then stops only the PAX autopilot/overview/cron. It runs
+`python -m bookmap_mcp.pax_session_report --archive` synchronously in the same
+console (no new/persistent terminal); a report failure prints a notice and the
+stop continues regardless. The canonical report lands at
+`D:\BookmapLogs\pax-agent\session-report.json` and a timestamped copy at
+`D:\BookmapLogs\pax-agent\sessions\session-report-YYYYMMDD-HHMMSS.json`. It does
+NOT touch Bookmap / OpenRange / the bridge and does not require Bookmap open.
+
+### Go/no-go before arming
+
+```cmd
+curl http://127.0.0.1:18890/api/arming_check
+```
+
+`can_arm` is true only when every BLOCKING check passes: kill switch absent,
+heartbeat fresh, market data fresh, SIM broker openable+readable, live
+hard-blocked, required live sources fresh, no active risk halt. Missing
+scorecard is a WARNING, not a blocker. `live_blocked` is always true. With
+Bookmap closed/weekend the market + heartbeat sources are stale, so this
+correctly returns `can_arm=false` -- that is expected, not a bug.
+
 ## Dashboard / data truth
 
 Read-only overview UI: **http://127.0.0.1:18890**
@@ -87,6 +109,11 @@ amber dot, not a green/red "live" state.
 - `GET /api/evaluation_state` -- autonomy ladder
   (`observe_only` / `sim_armed` / `sim_restricted` / `sim_candidate`),
   per-setup eligibility, `live_blocked` (always true), `requirements_for_next`.
+- `GET /api/arming_check` -- machine-readable go/no-go before arming SIM:
+  `can_arm`, `checks[]` (pass/fail/warn + code + message), `blocking_codes`,
+  `warnings`, `required_actions`, `live_blocked` (always true).
+- `GET /api/promotion_report` -- honest per-setup promotion view (read-only,
+  freshness-enveloped); `validated` is never auto-assigned.
 - `GET /api/agent_feed` -- decision feed; each item carries a `roles` block
   (observer / strategist / risk / executor / auditor) derived read-only.
 - `GET /api/agent_summary`, `/api/equity`, `/api/fills`, `/api/working`,
@@ -205,6 +232,43 @@ python -m bookmap_mcp.pax_calibration --date YYYY-MM-DD --forecasts D:\BookmapLo
 # Candidate-lesson research (dry-run by default, writes candidates only)
 python -m bookmap_mcp.pax_research_claude --date YYYY-MM-DD --calibration reports\calibration-YYYY-MM-DD.json
 ```
+
+### Decision-path replay (new, deterministic)
+
+Re-runs the SAME deterministic policy (`pax_loop.decide`) over saved JSONL --
+no orders, no LLM, no live Bookmap. Distinct from `pax_policy_replay` (lesson
+candidates) and `pax_replay` (CSV outcomes): this answers "given the saved
+snapshots, what would the policy decide, and does it match what was logged?".
+
+```cmd
+python -m bookmap_mcp.pax_agent_replay --input path\to\agent-loop.jsonl ^
+    --output reports\agent-replay.json --limit 1000
+```
+
+A record is replayable only if it embeds a market snapshot under `snapshot` /
+`snap`. The live `agent-loop.jsonl` heartbeat does NOT embed snapshots, so real
+logs are summarized (recorded actions/risk-halts counted) but their decisions
+cannot be re-derived -- the report says so honestly via `usable_snapshot_count`
+and a `limitations` note (nothing is faked). Snapshot-embedding fixtures under
+`mcp-server/tests/fixtures/pax_replay/` exercise the full path. Output is
+byte-stable except `generated_ms`. The report includes event/usable/malformed
+counts, replay action/setup/risk-halt counts, and `divergence_count` (recorded
+vs replay action).
+
+### Promotion report (new, honest, candidate is the ceiling)
+
+```cmd
+python -m bookmap_mcp.pax_promotion_report ^
+    --scorecard D:\BookmapLogs\pax-agent\scorecard.json --out reports\promotion-report.json
+```
+
+Reuses `pax_eval_state.setup_eligibility`. Per setup it reports n, avg R, net R,
+win rate (max drawdown / calibration bucket are null when the SIM scorecard
+lacks them -- never fabricated) and a status: `insufficient_sample` ->
+`blocked` (non-positive expectancy) -> `exploratory` -> `candidate`.
+**`validated` is never auto-assigned** -- promotion past candidate requires the
+human + replay + paper-pass gate, and live stays hard-blocked. Also exposed
+read-only at `GET /api/promotion_report` (freshness-enveloped).
 
 ## Session report
 

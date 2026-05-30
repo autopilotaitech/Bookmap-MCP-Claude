@@ -497,6 +497,145 @@ def test_evaluation_state_blocks_on_broker_unavailable(tmp_path, populated_journ
     assert env["live_blocked"] is True
 
 
+# ── STAGE 5: arming go/no-go + STAGE 3 promotion endpoint ──────────────────
+
+def _fresh_journal(tmp_path):
+    """Journal with a snapshot whose ts is NOW -> market source is fresh
+    (the shared populated_journal pins ts to 2026-05-18, which is stale)."""
+    import datetime
+    from bookmap_mcp.journal import Journal
+    db = tmp_path / "fresh-journal.db"
+    j = Journal(db); j.open()
+    j.begin_run(adapter_name="csv", signal_version="v2", weights_hash="x")
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat(
+        timespec="seconds")
+    j.write_snapshot({"alias": "NQM6", "health": "ok", "ts": now_iso,
+                      "book": {"mid": 1.0}})
+    j.end_run("done"); j.close()
+    return db
+
+
+def _green_arming(tmp_path, *, scorecard=True, kill_switch=False):
+    """A fully-green arming setup: fresh snapshot, fresh heartbeat, valid SIM
+    DB, optional scorecard."""
+    from bookmap_mcp.sim_engine import SimEngine
+    journal = _fresh_journal(tmp_path)
+    db = tmp_path / "sim.db"
+    SimEngine(alias="NQM6", db_path=db, eod_close_hour_ct=None)
+    now = int(time.time() * 1000)
+    files = {"agent-loop.jsonl":
+             json.dumps({"ts_ms": now, "heartbeat": True, "armed": False,
+                         "action": "NONE"}) + "\n"}
+    if scorecard:
+        files["scorecard.json"] = json.dumps(
+            {"setups": [{"setup": "A|LONG|OR-H|ETH", "n": 5,
+                         "mean_realized_r": 0.2, "hit_rate": 0.6}]})
+    learn = _learn(tmp_path, **files)
+    if kill_switch:
+        (learn / "KILL_SWITCH").write_text("stop", encoding="utf-8")
+    return OverviewQueries(journal, sim_db_path=db, learn_dir=learn)
+
+
+def test_arming_check_all_green_can_arm(tmp_path, populated_journal):
+    q = _green_arming(tmp_path)
+    a = q.arming_check()
+    assert a["can_arm"] is True
+    assert a["blocking_codes"] == []
+    assert a["live_blocked"] is True
+
+
+def test_arming_check_kill_switch_blocks(tmp_path, populated_journal):
+    q = _green_arming(tmp_path, kill_switch=True)
+    a = q.arming_check()
+    assert a["can_arm"] is False
+    assert "kill_switch_absent" in a["blocking_codes"]
+    assert a["live_blocked"] is True
+
+
+def test_arming_check_stale_market_blocks(tmp_path, populated_journal):
+    # Empty journal => no snapshots => market never_updated => stale.
+    from bookmap_mcp.journal import Journal
+    from bookmap_mcp.sim_engine import SimEngine
+    empty = tmp_path / "empty.db"
+    j = Journal(empty); j.open()
+    j.begin_run(adapter_name="csv", signal_version="v2", weights_hash="x")
+    j.end_run("done"); j.close()
+    db = tmp_path / "sim.db"
+    SimEngine(alias="NQM6", db_path=db, eod_close_hour_ct=None)
+    now = int(time.time() * 1000)
+    learn = _learn(tmp_path, **{"agent-loop.jsonl":
+        json.dumps({"ts_ms": now, "heartbeat": True, "action": "NONE"}) + "\n"})
+    q = OverviewQueries(empty, sim_db_path=db, learn_dir=learn)
+    a = q.arming_check()
+    assert a["can_arm"] is False
+    assert "market_data_fresh" in a["blocking_codes"]
+    assert a["live_blocked"] is True
+
+
+def test_arming_check_sim_broker_unavailable_blocks(tmp_path, populated_journal):
+    bad = tmp_path / "corrupt.db"
+    bad.write_bytes(b"not a database")
+    now = int(time.time() * 1000)
+    learn = _learn(tmp_path, **{"agent-loop.jsonl":
+        json.dumps({"ts_ms": now, "heartbeat": True, "action": "NONE"}) + "\n"})
+    q = OverviewQueries(populated_journal, sim_db_path=bad, learn_dir=learn)
+    a = q.arming_check()
+    assert a["can_arm"] is False
+    assert "sim_broker_ok" in a["blocking_codes"]
+
+
+def test_arming_check_missing_scorecard_is_warning_not_blocker(tmp_path,
+                                                               populated_journal):
+    q = _green_arming(tmp_path, scorecard=False)
+    a = q.arming_check()
+    assert a["can_arm"] is True                    # warning does not block
+    assert "scorecard_present" in a["warnings"]
+    assert "scorecard_present" not in a["blocking_codes"]
+
+
+def test_arming_check_bookmap_closed_is_nogo_not_exception(tmp_path):
+    # Fresh empty journal, no learn files, no sim db -> all-stale weekend state.
+    from bookmap_mcp.journal import Journal
+    db = tmp_path / "empty.db"
+    j = Journal(db); j.open()
+    j.begin_run(adapter_name="csv", signal_version="v2", weights_hash="x")
+    j.end_run("done"); j.close()
+    q = OverviewQueries(db, learn_dir=tmp_path / "learn")
+    a = q.arming_check()                            # must not raise
+    assert a["can_arm"] is False
+    assert a["live_blocked"] is True
+
+
+def test_promotion_report_endpoint_enveloped(tmp_path, populated_journal):
+    learn = _learn(tmp_path, **{"scorecard.json": json.dumps(
+        {"min_samples": 30,
+         "setups": [{"setup": "A|LONG|OR-H|ETH", "n": 40,
+                     "mean_realized_r": 0.3, "hit_rate": 0.6}]})})
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    env = q.enveloped("promotion_report")
+    assert "_meta" in env
+    assert env["live_blocked"] is True
+    assert env["setups"][0]["promotion_status"] == "candidate"
+
+
+def test_api_arming_check_endpoint_200(live_server):
+    host, port = live_server
+    status, body = _get(host, port, "/api/arming_check")
+    assert status == 200
+    data = json.loads(body)
+    assert data["live_blocked"] is True
+    assert "can_arm" in data and "checks" in data
+
+
+def test_api_promotion_report_endpoint_200(live_server):
+    host, port = live_server
+    status, body = _get(host, port, "/api/promotion_report")
+    assert status == 200
+    data = json.loads(body)
+    assert data["live_blocked"] is True
+    assert "_meta" in data
+
+
 def test_api_health_endpoint_200(live_server):
     host, port = live_server
     status, body = _get(host, port, "/api/health")

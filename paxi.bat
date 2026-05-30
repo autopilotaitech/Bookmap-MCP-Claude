@@ -63,6 +63,15 @@ echo [paxi] armed SIM mode up: http://127.0.0.1:%PORT%
 exit /b 0
 
 :stop
+REM Write a session report BEFORE killing processes. Read-only (tails the agent
+REM log + reads the SIM/journal DBs read-only), runs synchronously in this
+REM console (no new/persistent terminal), and a failure here must NOT prevent
+REM the stop. --archive also keeps a timestamped copy under sessions\.
+if exist "%PY%" (
+  echo [paxi] writing session report (best-effort)...
+  "%PY%" -B -m bookmap_mcp.pax_session_report --archive --learn-dir "%LOGDIR%" --journal "%JOURNAL%" --sim-db "%SIMDB%" >> "%LOGDIR%\session-report.log" 2>&1
+  if errorlevel 1 echo [paxi] session report failed (continuing stop).
+)
 call :stop_processes_only
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$t=Get-ScheduledTask -TaskName 'PaxAgentCron' -ErrorAction SilentlyContinue; if($t){Disable-ScheduledTask -TaskName 'PaxAgentCron' | Out-Null}" >nul 2>nul
 echo [paxi] stopped PAX AI/autopilot/overview and disabled PaxAgentCron.

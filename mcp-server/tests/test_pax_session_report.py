@@ -95,3 +95,52 @@ def test_malformed_records_counted_not_crashed():
                                   equity={}, errors=[])
     assert rep["stale_data_events"]["malformed_records"] == 2
     assert rep["decisions"]["total"] == 1
+
+
+# ── STAGE 4: archive + auto-report-on-stop wiring ──────────────────────────
+
+def test_archive_path_is_deterministic():
+    out = Path(r"D:\BookmapLogs\pax-agent\session-report.json")
+    a = sr.archive_path(out, 1_700_000_000_000)
+    assert a.parent.name == "sessions"
+    assert a.name.startswith("session-report-")
+    assert a.name.endswith(".json")
+    # deterministic for a fixed now_ms
+    assert sr.archive_path(out, 1_700_000_000_000) == a
+
+
+def test_gather_and_write_archives(tmp_path, monkeypatch):
+    import bookmap_mcp.pax_session_report as SR
+    from bookmap_mcp.journal import Journal
+
+    db = tmp_path / "journal.db"
+    j = Journal(db); j.open()
+    j.begin_run(adapter_name="csv", signal_version="v2", weights_hash="x")
+    j.end_run("done"); j.close()
+
+    learn = tmp_path / "learn"; learn.mkdir()
+    out = learn / "session-report.json"
+    res = SR.gather_and_write(journal=db, sim_db=tmp_path / "sim.db",
+                              learn_dir=learn, out_path=out, archive=True)
+    assert res == out and out.exists()
+    sessions = list((learn / "sessions").glob("session-report-*.json"))
+    assert len(sessions) == 1
+    # archive content matches the canonical report (same body).
+    assert sessions[0].read_text(encoding="utf-8") == out.read_text(encoding="utf-8")
+
+
+def test_paxi_stop_writes_session_report_before_kill():
+    """Batch inspection: stop must invoke the session report (failure-tolerant)
+    before stop_processes_only, and use --archive."""
+    bat = (ROOT.parent / "paxi.bat").read_text(encoding="utf-8")
+    stop_idx = bat.index("\n:stop")
+    # bound the stop block at the next label
+    after = bat[stop_idx + 1:]
+    block = after[:after.index("\n:stop_processes_only")] if "\n:stop_processes_only" in after else after
+    # the stop block references the report module before calling stop_processes_only
+    assert "bookmap_mcp.pax_session_report" in block
+    assert "--archive" in block
+    pre_kill = block.index("pax_session_report") < block.index("call :stop_processes_only")
+    assert pre_kill, "session report must run before processes are killed"
+    # failure-tolerant: stop block does not 'exit /b 1' on report failure
+    assert "exit /b 1" not in block.split("call :stop_processes_only")[0]

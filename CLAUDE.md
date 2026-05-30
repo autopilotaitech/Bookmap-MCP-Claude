@@ -45,18 +45,30 @@ legal/risk, capital, latency, exchange-failure, and manual approval controls.
   operational HALT facade at the last pre-execution gate. ENTRIES only;
   flatten/cancel never gated (kill switch excepted). Precedence
   `kill_switch_active` -> `stale_heartbeat` -> `stale_market_data` ->
-  `sim_broker_unavailable` -> session limits. Fail-closed on missing market
-  timestamp; `dashboard.fetch_snapshot` emits `asOfMs`. Health/eval/session
-  report expose the same halt truth. LLM cannot override. 1186 tests pass.
+  `sim_broker_unavailable` -> session limits. Health/eval/session report expose
+  the same halt truth. LLM cannot override.
+- `d9f5c1c` - market-freshness vs compose-time split (`marketDataAsOfMs` from a
+  real bridge/feed timestamp, `composedAtMs` diagnostics only) + real read-only
+  SIM broker preflight.
+- replay/validation/arming slice (this checkpoint): `pax_agent_replay.py`
+  (deterministic decision-path replay over saved JSONL; no orders/LLM/live),
+  regression fixtures under `tests/fixtures/pax_replay/`,
+  `pax_promotion_report.py` (honest per-setup status; `validated` never
+  auto-assigned), auto session-report-on-`paxi.bat stop` (+timestamped archive),
+  and `GET /api/arming_check` go/no-go + `GET /api/promotion_report`. 1232 tests
+  pass.
 
 ### Active Next Phase
 
-Operational hardening (stale-data + session-risk gates) is DONE -- see the
-checkpoint above and `docs/PAX_RUNBOOK.md`. Remaining prototype-grade items:
+Replay/validation/arming readiness is DONE -- see the checkpoint above and
+`docs/PAX_RUNBOOK.md`. Remaining prototype-grade items:
 
 1. Wire consecutive-loss / R / drawdown counters to the live SIM path (the
    status payload lacks them; gates are unit-tested but report `unavailable`).
-2. This is SIM-only; live remains hard-blocked. No market-edge validation yet.
+2. The live `agent-loop.jsonl` does not embed snapshots, so decision-path replay
+   only fully exercises snapshot-embedding fixtures (honest limitation, not
+   faked). A snapshot-embedding heartbeat writer would unlock real-log replay.
+3. This is SIM-only; live remains hard-blocked. No market-edge validation yet.
 
 Keep this narrow. Do not rebuild replay, research, learning, or strategy logic.
 
@@ -148,6 +160,10 @@ versioned jar policy. Bookmap can hold old jars open.
 - `pax_loop.py` - deterministic decision/governor path.
 - `pax_risk_gate.py` - pure operational HALT gate (kill switch / stale data /
   session limits) at the final pre-SIM-placement point. Not a strategy brain.
+- `pax_agent_replay.py` - deterministic decision-path replay (`pax_loop.decide`)
+  over saved JSONL; no orders/LLM/live. Reuses the policy, not a new engine.
+- `pax_promotion_report.py` - honest per-setup promotion view over the SIM
+  scorecard; reuses `pax_eval_state.setup_eligibility`. `validated` never auto.
 - `pax_brain.py` - pure setup/thesis selection, no I/O/model/broker.
 - `pax_expectancy.py`, `pax_trade_learning.py` - learned expectancy and SIM
   outcome scorecards.
