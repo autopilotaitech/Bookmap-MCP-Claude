@@ -44,6 +44,50 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+# ─── pure session-risk derivation ────────────────────────────────────────────
+
+def session_risk_from_deltas(deltas: Iterable[float]) -> Dict[str, Any]:
+    """Honest session-risk counters from an ASCENDING-time list of realized
+    PnL deltas (USD) per close. Pure, deterministic, no I/O.
+
+    - ``consecutive_losses``: trailing run of losing (delta<0) closes; a winner
+      (delta>0) resets it, a scratch (delta==0) leaves it unchanged.
+    - ``peak_equity``: running max of cumulative realized PnL (>=0; day starts 0).
+    - ``drawdown_usd``: WORST trough-from-peak over the day (USD, <=0). It is a
+      circuit-breaker reading -- recovering does NOT un-break it.
+
+    R is intentionally NOT derived here: the SimEngine close stream carries no
+    per-trade risk (entry/stop linkage), so any R figure would be fabricated.
+    """
+    cum = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    streak = 0
+    for raw in deltas:
+        try:
+            d = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if d != d:   # NaN
+            continue
+        cum += d
+        if cum > peak:
+            peak = cum
+        dd = cum - peak
+        if dd < max_dd:
+            max_dd = dd
+        if d < 0:
+            streak += 1
+        elif d > 0:
+            streak = 0
+        # d == 0 (scratch): leave streak unchanged.
+    return {
+        "consecutive_losses": streak,
+        "peak_equity": round(peak, 2),
+        "drawdown_usd": round(max_dd, 2),
+    }
+
+
 # ─── config ─────────────────────────────────────────────────────────────────
 
 LOG_DIR = Path(os.environ.get("PAX_LOG_DIR", r"D:\BookmapLogs"))
@@ -586,6 +630,15 @@ class SimEngine:
                 "SELECT COUNT(*) AS n FROM events WHERE alias=? AND kind='POSITION_UPDATE' "
                 "AND ts_ms>=? AND json_extract(payload,'$.realized_delta') < 0",
                 (self.alias, today_anchor)).fetchone()["n"]
+            # Time-ordered realized-PnL series for session-risk counters
+            # (consecutive losses, peak equity, drawdown). Honest derivation.
+            delta_rows = c.execute(
+                "SELECT json_extract(payload,'$.realized_delta') AS d FROM events "
+                "WHERE alias=? AND kind='POSITION_UPDATE' AND ts_ms>=? "
+                "ORDER BY ts_ms ASC",
+                (self.alias, today_anchor)).fetchall()
+        deltas = [r["d"] for r in delta_rows if r["d"] is not None]
+        risk = session_risk_from_deltas(deltas)
         return {
             "alias": self.alias,
             "position": pos,
@@ -594,6 +647,17 @@ class SimEngine:
             "n_fills_today": n_today,
             "losers_today": n_losers,
             "realized_today_usd": round(day_real or 0.0, 2),
+            # --- session-risk counters (additive; consumed by pax_risk_gate) ---
+            "consecutive_losses_today": risk["consecutive_losses"],
+            "session_peak_equity": risk["peak_equity"],
+            "session_drawdown_usd": risk["drawdown_usd"],
+            "loss_streak_source": "sim_events_realized_delta",
+            "drawdown_source": "sim_events_realized_delta_cumulative_peak",
+            # R is NOT derivable from the SimEngine close stream (no per-trade
+            # risk/entry-stop linkage) -> null, never fabricated.
+            "realized_today_r": None,
+            "session_drawdown_r": None,
+            "r_source": "unavailable_no_per_trade_risk_in_sim_close_stream",
         }
 
     def _maybe_eod_flatten(self, now_ms: Optional[int]) -> Optional[Dict[str, Any]]:

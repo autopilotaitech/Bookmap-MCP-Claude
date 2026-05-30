@@ -20,6 +20,32 @@ legacy `PaxAgentCron` task. `stop` targets only PAX processes
 by command-line match and window title; it does **not** touch the Bookmap
 bridge, OpenRange, or Bookmap itself.
 
+## Pre-market SIM acceptance workflow
+
+Run this before arming SIM. It is read-only end-to-end (no broker order, no LLM,
+no service auto-start). SIM-only; live stays hard-blocked.
+
+```cmd
+paxi.bat stop                                   :: 1. clean slate (writes a session report)
+paxi.bat start                                  :: 2. observe mode + overview UI
+curl http://127.0.0.1:18890/api/health          :: 3. freshness / kill switch / risk halt / evidence
+curl http://127.0.0.1:18890/api/arming_check    :: 4. machine go/no-go
+python -m bookmap_mcp.pax_acceptance            :: 5. one JSON verdict (overall pass|warn|fail)
+paxi.bat armed                                  :: 6. ONLY if acceptance is not "fail"
+:: ... trade SIM ...
+paxi.bat stop                                   :: 7. stop writes session-report.json (+archive)
+python -m bookmap_mcp.pax_evidence_report --replay   :: 8. after the session, grade the evidence
+```
+
+`pax_acceptance` verdict: **FAIL** on kill switch / stale heartbeat / stale market
+/ unreadable SIM broker / `live_blocked` not true (exit code 1). **WARN** when
+evidence is below `replayable`, `replay_input`/scorecard/session-report missing,
+or R-denominated risk counters unavailable (exit code 0). **PASS** needs clean
+ops AND evidence at least `replayable` AND no warns. Honest note: in the current
+build R-denominated counters are unavailable, so a clean stack typically reports
+**WARN, not PASS** -- that is expected; it means "operationally ready for SIM,
+real data + tuning still needed", not a failure.
+
 ## Lifecycle
 
 ### Start observe mode (default, safe)
@@ -204,14 +230,18 @@ Config (env overrides; defaults are conservative-but-not-blocking for SIM):
 Set a `*_R` / `*_DD_USD` / `*_LOSS_USD` var to `off`/`none` to disable that gate.
 
 **Data-path honesty (do not pretend these are enforced live):** the SIM status
-payload (`SimEngine.snapshot`) exposes entry-fill count and `realized_today_usd`,
-so `max_trades_reached` and the USD `max_loss_reached` ARE wired to the live
-heartbeat. It does NOT expose a per-trade R, a running consecutive-loss streak,
-or a running drawdown, so `max_consecutive_losses_reached`, the R variant of
-`max_loss_reached`, and `max_drawdown_reached` are implemented and unit-tested
-in the pure gate but reported `unavailable` on the live path (see
-`risk_halt_detail.unavailable`) rather than faked. They activate the moment a
-caller supplies those counters.
+payload (`SimEngine.snapshot`) exposes entry-fill count, `realized_today_usd`,
+and now -- derived honestly from the realized-PnL close stream (the `events`
+`POSITION_UPDATE` series) -- `consecutive_losses_today`, `session_peak_equity`,
+and `session_drawdown_usd` (worst trough-from-peak, a latching circuit-breaker
+reading). So `max_trades_reached`, USD `max_loss_reached`,
+`max_consecutive_losses_reached`, and USD `max_drawdown_reached` are ALL wired to
+the live heartbeat (drawdown fires only when `PAX_RISK_MAX_DD_USD` is set;
+consecutive-losses uses the default cap of 6). **R-denominated counters remain
+unavailable** -- the SIM close stream carries no per-trade risk (entry/stop
+linkage), so `realized_today_r` / `session_drawdown_r` stay `null`
+(`r_source = unavailable_*`) and the R variant of `max_loss_reached` is reported
+`unavailable` (see `risk_halt_detail.unavailable`), never fabricated.
 
 ### Health / evaluation visibility
 
@@ -333,10 +363,16 @@ usable evidence exists (`evidence_grade`, worst -> best):
 | grade | meaning | what's still needed |
 |-------|---------|---------------------|
 | `no_data` | no agent records AND no scorecard | run PAX (`paxi.bat start`) |
-| `logging_only` | records exist but `replay_input` coverage too low (`< 50%`) and no outcomes | relaunch on the current build so heartbeats embed `replay_input` |
-| `replayable` | `replay_input` coverage sufficient, but no scorecard/outcomes | run armed SIM so `pax_trade_learning` writes `scorecard.json` |
-| `outcome_linked` | a scorecard/outcomes exist (decisions linked to R) | accumulate samples toward candidate gates |
-| `promotion_candidate` | `outcome_linked` AND >= 1 candidate setup | human + replay + paper-pass review (NOT automatic) |
+| `logging_only` | records exist but `replay_input` coverage `< 50%` (logs not replay-grade) -- **even if a scorecard exists** | relaunch on the current build so heartbeats embed `replay_input` |
+| `replayable` | `replay_input` coverage `>= 50%`, but no scorecard/outcomes | run armed SIM so `pax_trade_learning` writes `scorecard.json` |
+| `outcome_linked` | **replayable AND** a scorecard/outcomes exist, no candidate | accumulate samples toward candidate gates |
+| `promotion_candidate` | **replayable AND** scorecard/outcomes exist AND >= 1 candidate setup | human + replay + paper-pass review (NOT automatic) |
+
+**Strict ladder (truth):** a scorecard alone CANNOT lift the grade past
+`logging_only`. `outcome_linked` / `promotion_candidate` require BOTH replay-grade
+logs (coverage `>= 50%`) AND outcomes -- otherwise the decisions behind those
+outcomes cannot be audited. A scorecard with non-replayable (or zero) logs grades
+`logging_only` with the explicit blocker `scorecard_present_but_logs_not_replayable`.
 
 Report fields: `evidence_grade`, `blockers`, `warnings`, `next_required_data`,
 `replay_readiness`, `replay_summary` (only with `--replay`), `session_summary`,

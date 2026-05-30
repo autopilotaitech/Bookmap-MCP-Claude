@@ -155,10 +155,12 @@ def session_counters_from_status(status: Optional[Dict[str, Any]]
     exposes. Counters the status does not carry are returned as None
     (unavailable), never invented.
 
-    Available from ``SimEngine.snapshot``: entry-fill count (-> trades),
-    realized_today_usd, losers_today. Per-trade R, a running consecutive-loss
-    streak, and drawdown are NOT in that payload, so they are None here and the
-    gate reports them unavailable.
+    ``SimEngine.snapshot`` now exposes (honestly, from the realized-PnL close
+    stream): entry-fill count (-> trades), ``realized_today_usd``,
+    ``losers_today``, ``consecutive_losses_today``, ``session_drawdown_usd``.
+    Per-trade R (``realized_today_r`` / ``session_drawdown_r``) is NOT derivable
+    from that stream and stays None here -- the gate reports R unavailable.
+    A status that predates these keys (e.g. an old fixture) simply yields None.
     """
     status = status or {}
     if status.get("_status_error"):
@@ -168,12 +170,14 @@ def session_counters_from_status(status: Optional[Dict[str, Any]]
     fills = status.get("fills_today") or []
     trades = sum(1 for f in fills
                  if isinstance(f, dict) and str(f.get("role")) == "ENTRY")
+    cl = status.get("consecutive_losses_today")
     return {
         "trades": trades,
-        "consecutive_losses": None,   # not derivable from the status payload
+        # honestly derived from the SimEngine close stream when present:
+        "consecutive_losses": int(cl) if cl is not None else None,
         "realized_usd": _f(status.get("realized_today_usd")),
-        "realized_r": None,           # no per-trade R in the live path
-        "drawdown_usd": None,         # no running drawdown in the status payload
+        "realized_r": _f(status.get("realized_today_r")),   # None unless supplied
+        "drawdown_usd": _f(status.get("session_drawdown_usd")),
         "losers_today": status.get("losers_today"),
     }
 

@@ -125,6 +125,20 @@ _REPLAY_FLOW_KEYS = ("regime", "biasScore", "biasTrajectory", "ofiZ", "cvdDeltaZ
 _REPLAY_MKT_TS_KEYS = ("marketDataAsOfMs", "marketAsOfMs", "composedAtMs",
                        "ageMs", "snapshot_age_ms")
 
+# Drift guard (STAGE 4). The compact replay_input MUST keep emitting these keys,
+# or pax_agent_replay can no longer re-run pax_loop.decide + pax_risk_gate from a
+# live log. A pinned test asserts build_replay_input emits every required key;
+# bump REPLAY_INPUT_VERSION when the contract changes intentionally.
+REQUIRED_REPLAY_INPUT_KEYS = (
+    "version", "snapshot", "status", "now_ms", "market_age_sec",
+    "heartbeat_age_sec", "sim_broker_ok", "kill_switch_active")
+# Snapshot keys pax_loop.decide / pax_brain read; the compact snapshot must carry
+# them (or the gate/decision replay silently degrades).
+REQUIRED_REPLAY_SNAPSHOT_KEYS = (
+    "health", "book", "session", "or_day_ledger", "gates", "or_levels")
+REQUIRED_REPLAY_STATUS_KEYS = (
+    "position", "working", "fills_today", "losers_today", "realized_today_usd")
+
 
 def _trunc_str(value: Any, n: int = _REPLAY_MAX_STR) -> str:
     s = str(value)

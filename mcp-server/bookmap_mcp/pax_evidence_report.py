@@ -145,14 +145,25 @@ def grade_evidence(replay_readiness: Dict[str, Any],
                          "(n>=min_samples, avgR>=candidate_avg_r, "
                          "netR>=candidate_net_r)")
 
+    # STRICT LADDER. outcome_linked / promotion_candidate require BOTH a
+    # scorecard AND replay-grade logs -- a scorecard alone cannot lift the grade
+    # past logging_only, because without replayable logs the decisions behind
+    # those outcomes cannot be audited. This is the honest semantics.
     if records == 0 and not has_scorecard:
         grade = "no_data"
-    elif has_scorecard:
+    elif replay_ok and has_scorecard:
         grade = "promotion_candidate" if candidate >= 1 else "outcome_linked"
     elif replay_ok:
         grade = "replayable"
     else:
         grade = "logging_only"
+        if has_scorecard:
+            # outcomes exist but the logs are not replay-grade -> cannot reach
+            # outcome_linked. Surface this explicitly so it is not silent.
+            blockers.append("scorecard_present_but_logs_not_replayable")
+            next_data.append("make logs replay-grade (relaunch on the current "
+                             "build so heartbeats embed replay_input) before the "
+                             "scorecard can lift the grade to outcome_linked")
 
     return grade, blockers, warnings, next_data
 

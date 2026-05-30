@@ -260,3 +260,61 @@ def test_session_counters_handles_status_error():
     c = RG.session_counters_from_status({"_status_error": "db locked"})
     assert c["trades"] == 0
     assert c["realized_usd"] is None
+
+
+# --- STAGE 2: honestly-derived live counters wired into the gate -----------
+
+def test_status_path_supplies_loss_streak_and_drawdown():
+    # A SimEngine-shaped status carrying the new derived keys flows into the gate.
+    status = {
+        "position": {"size": 0},
+        "fills_today": [{"role": "ENTRY"}, {"role": "ENTRY"}],
+        "realized_today_usd": -50.0,
+        "losers_today": 3,
+        "consecutive_losses_today": 4,
+        "session_drawdown_usd": -120.0,
+        "realized_today_r": None,           # R not derivable -> stays null
+        "session_drawdown_r": None,
+    }
+    c = RG.session_counters_from_status(status)
+    assert c["consecutive_losses"] == 4
+    assert c["drawdown_usd"] == -120.0
+    assert c["realized_usd"] == -50.0
+    assert c["realized_r"] is None          # never fabricated
+
+
+def test_gate_blocks_on_status_derived_consecutive_losses():
+    status = {"position": {"size": 0}, "fills_today": [],
+              "realized_today_usd": 0.0, "consecutive_losses_today": 7,
+              "session_drawdown_usd": -10.0}
+    cfg = RG.RiskGateConfig(max_consecutive_losses=6)
+    r = RG.evaluate_entry_gate(
+        now_ms=1, market_age_sec=1.0,
+        session=RG.session_counters_from_status(status), config=cfg)
+    assert r.allowed is False
+    assert r.code == "max_consecutive_losses_reached"
+
+
+def test_gate_blocks_on_status_derived_drawdown():
+    status = {"position": {"size": 0}, "fills_today": [],
+              "realized_today_usd": -900.0, "consecutive_losses_today": 1,
+              "session_drawdown_usd": -900.0}
+    cfg = RG.RiskGateConfig(max_drawdown_usd=800.0)
+    r = RG.evaluate_entry_gate(
+        now_ms=1, market_age_sec=1.0,
+        session=RG.session_counters_from_status(status), config=cfg)
+    assert r.allowed is False
+    assert r.code == "max_drawdown_reached"
+
+
+def test_missing_r_stays_unavailable_even_with_usd_counters():
+    status = {"position": {"size": 0}, "fills_today": [],
+              "realized_today_usd": -1500.0, "consecutive_losses_today": 2,
+              "session_drawdown_usd": -1500.0}
+    cfg = RG.RiskGateConfig(max_session_loss_r=3.0)   # R gate configured...
+    r = RG.evaluate_entry_gate(
+        now_ms=1, market_age_sec=1.0,
+        session=RG.session_counters_from_status(status), config=cfg)
+    # ...but R is unavailable, so the R gate does NOT fire (not faked).
+    assert "realized_r" in r.detail["unavailable"]
+    assert r.code != "max_loss_reached" or r.detail["counters"]["realized_usd"] is not None

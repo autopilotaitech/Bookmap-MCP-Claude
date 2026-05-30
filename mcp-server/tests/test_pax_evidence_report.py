@@ -181,3 +181,46 @@ def test_gather_writes_and_reads(tmp_path):
     assert rep["evidence_grade"] == "promotion_candidate"
     written = json.loads(out.read_text(encoding="utf-8"))
     assert written["evidence_grade"] == "promotion_candidate"
+
+
+# --- STAGE 1 (strict ladder): scorecard alone cannot lift the grade --------
+
+def test_scorecard_with_zero_records_is_not_outcome_linked():
+    rep = E.build_evidence_report(feed=[], scorecard=_candidate_scorecard(),
+                                  now_ms=1)
+    assert rep["evidence_grade"] not in ("outcome_linked", "promotion_candidate")
+    assert "no_agent_records" in rep["blockers"]
+
+
+def test_scorecard_with_old_logs_stays_logging_only():
+    feed = [_plain_record(i) for i in range(5)]            # no replay_input
+    rep = E.build_evidence_report(feed=feed, scorecard=_candidate_scorecard(),
+                                  now_ms=1)
+    assert rep["evidence_grade"] == "logging_only"
+    assert "scorecard_present_but_logs_not_replayable" in rep["blockers"]
+
+
+def test_candidate_scorecard_low_coverage_not_promotion_candidate():
+    # 2 of 5 records carry replay_input -> 40% < 50% floor -> not replayable.
+    feed = [_ri_record(0), _ri_record(1), _plain_record(2), _plain_record(3),
+            _plain_record(4)]
+    rep = E.build_evidence_report(feed=feed, scorecard=_candidate_scorecard(),
+                                  now_ms=1)
+    assert rep["evidence_grade"] == "logging_only"
+    assert rep["evidence_grade"] != "promotion_candidate"
+    assert "scorecard_present_but_logs_not_replayable" in rep["blockers"]
+
+
+def test_replayable_logs_noncandidate_scorecard_is_outcome_linked():
+    feed = [_ri_record(i) for i in range(5)]
+    sc = _scorecard([{"setup": "A|LONG|OR-H|ETH", "n": 10,
+                      "mean_realized_r": 0.2, "hit_rate": 0.5}])  # not candidate
+    rep = E.build_evidence_report(feed=feed, scorecard=sc, now_ms=1)
+    assert rep["evidence_grade"] == "outcome_linked"
+
+
+def test_replayable_logs_candidate_scorecard_is_promotion_candidate():
+    feed = [_ri_record(i) for i in range(5)]
+    rep = E.build_evidence_report(feed=feed, scorecard=_candidate_scorecard(),
+                                  now_ms=1)
+    assert rep["evidence_grade"] == "promotion_candidate"

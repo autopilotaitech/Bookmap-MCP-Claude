@@ -80,17 +80,49 @@ legal/risk, capital, latency, exchange-failure, and manual approval controls.
   + missing_fields). Compact summary in `/api/health.evidence` + session report
   `evidence_summary`; full report at `GET /api/evidence_report` (cheap, no replay
   on a GET) + CLI (`--replay` opt-in). `candidate` is NOT `validated`.
+- acceptance hardening: (1) STRICT evidence ladder -- `outcome_linked`/
+  `promotion_candidate` require replay-grade logs AND outcomes; a scorecard alone
+  stays `logging_only` + blocker `scorecard_present_but_logs_not_replayable`.
+  (2) Honest live risk counters: `SimEngine.snapshot` derives
+  `consecutive_losses_today` / `session_peak_equity` / `session_drawdown_usd`
+  from the realized-PnL close stream (`sim_engine.session_risk_from_deltas`),
+  wired into `pax_risk_gate.session_counters_from_status` -> consecutive-loss +
+  USD drawdown gates now enforce live; R stays null (no per-trade risk in the
+  close stream), never faked. (3) `pax_acceptance.py` read-only doctor CLI ->
+  one JSON verdict (pass|warn|fail; FAIL on kill switch / stale heartbeat /
+  stale market / unreadable broker / not live_blocked). (4) replay_input drift
+  guard: `REQUIRED_REPLAY_INPUT_KEYS` / `REQUIRED_REPLAY_SNAPSHOT_KEYS` /
+  `REQUIRED_REPLAY_STATUS_KEYS` in `pax_sim_agent` + pinned tests +
+  `replay_input_heartbeat.jsonl` fixture.
+
+### Production state (SIM-only)
+
+Production-ready PLUMBING (operationally hardened, test-covered): runtime safety
+gates, kill switch, stale-data enforcement, SIM broker preflight, honest USD
+drawdown + consecutive-loss counters, replay-grade logging, deterministic replay
+(decision + operational gate), evidence grading, promotion/eval reporting,
+arming check, acceptance doctor, session reports + archive. ~1314 tests pass.
+
+Honest limitations (NOT yet done): no real-market validation or tuning;
+R-denominated risk counters unavailable (no per-trade risk in the SIM close
+stream); old pre-`replay_input` logs summarized only (no backfill); strategy
+thresholds untuned on live tape.
+
+Operator command list: `paxi.bat stop|start|armed|status`;
+`curl :18890/api/health|/api/arming_check|/api/evidence_report`;
+`python -m bookmap_mcp.pax_acceptance [--replay]`;
+`python -m bookmap_mcp.pax_evidence_report --replay`;
+`python -m bookmap_mcp.pax_session_report [--archive|--replay-summary]`.
+
+Explicitly NOT claimed: profitability, market edge, live readiness, Jane
+Street-level quality. SIM-only; live trading remains hard-blocked.
 
 ### Active Next Phase
 
-Replay-grade logging + readiness surfacing is DONE -- see the checkpoint above
-and `docs/PAX_RUNBOOK.md`. Remaining prototype-grade items:
-
-1. Wire consecutive-loss / R / drawdown counters to the live SIM path (the
-   status payload lacks them; gates are unit-tested but report `unavailable`).
-2. Old `agent-loop.jsonl` lines (pre-`replay_input`) are summarized only -- a
-   one-time backfill is not provided (honest limitation, not faked).
-3. This is SIM-only; live remains hard-blocked. No market-edge validation yet.
+Acceptance/evidence hardening is DONE -- see the checkpoint above and
+`docs/PAX_RUNBOOK.md`. Remaining: collect real market data + tune; surface
+per-trade R (would unlock R-denominated risk counters). This is SIM-only; live
+remains hard-blocked. No market-edge validation yet.
 
 Keep this narrow. Do not rebuild replay, research, learning, or strategy logic.
 
@@ -188,7 +220,11 @@ versioned jar policy. Bookmap can hold old jars open.
   scorecard; reuses `pax_eval_state.setup_eligibility`. `validated` never auto.
 - `pax_evidence_report.py` - evidence-quality grading + per-setup evidence table;
   thin layer over `compute_replay_readiness` + `pax_promotion_report`. No new
-  profitability logic; `candidate` != `validated`.
+  profitability logic; `candidate` != `validated`. STRICT ladder: scorecard
+  alone stays `logging_only` without replay-grade logs.
+- `pax_acceptance.py` - read-only SIM acceptance/doctor CLI; one JSON verdict
+  (pass|warn|fail) over existing surfaces. No service start, no broker order,
+  no LLM.
 - `pax_brain.py` - pure setup/thesis selection, no I/O/model/broker.
 - `pax_expectancy.py`, `pax_trade_learning.py` - learned expectancy and SIM
   outcome scorecards.
