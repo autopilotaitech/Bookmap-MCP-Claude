@@ -272,9 +272,16 @@ New read-only endpoints (no decision/order path touched):
   writer is unchanged.
 
 `pax_session_report.py` writes `D:\BookmapLogs\pax-agent\session-report.json`.
-Kill switch `D:\BookmapLogs\pax-agent\KILL_SWITCH` is REPORTED in
-health/eval but NOT yet enforced in the governor. Full runbook:
-`docs/PAX_RUNBOOK.md`. These modules do not duplicate the existing
+Kill switch `D:\BookmapLogs\pax-agent\KILL_SWITCH` is **enforced before SIM
+order placement** (in addition to being reported in health/eval): the
+autopilot risk-halts at the last safe point before any broker call
+(`pax_sim_agent._cycle_once` armed path + `decide_cycle`) -> clean veto record
+(`governor=VETO: kill_switch_active`, `order=null`, `executed=false`, no broker
+receipt), with a defense-in-depth backstop in `pax_sim_tools.sim_place_bracket`
+(raises `SimKillSwitchError`). Helpers `pax_sim_tools.kill_switch_active` /
+`risk_halt_reason`. This blocks SIM placement only; **live trading stays
+hard-blocked** regardless. Full runbook: `docs/PAX_RUNBOOK.md`. These modules
+do not duplicate the existing
 `pax_replay`/`pax_policy_replay`/`pax_calibration`/`pax_research_claude`/
 `pax_trade_learning` engines -- those already exist and were left intact.
 

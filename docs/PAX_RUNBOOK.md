@@ -94,13 +94,27 @@ amber dot, not a green/red "live" state.
   `/api/runtime_policy`, `/api/lessons`, `/api/signals`, `/api/errors`,
   `/api/cron_status`.
 
-### Kill switch (read-only status today)
+### Kill switch (enforced before SIM order placement)
 
-Create `D:\BookmapLogs\pax-agent\KILL_SWITCH` to flag the system: it forces
-`/api/evaluation_state` to `observe_only` / blocked and surfaces in
-`/api/health`. **Enforcement note:** the file is currently REPORTED only; it
-is not yet wired into the governor to physically halt SIM order placement.
-See "Known limitations".
+Create `D:\BookmapLogs\pax-agent\KILL_SWITCH` to halt the autopilot. It is
+**enforced before SIM order placement**, not merely reported:
+
+- The autopilot risk-halts at the last safe point before any broker call
+  (`pax_sim_agent._cycle_once` armed path and `decide_cycle`). An acting plan
+  is vetoed with a clean audit record: `governor` = `VETO: kill_switch_active`,
+  `risk_halt` = `kill_switch_active`, `order` = `null`, `executed` = `false`,
+  and **no SIM broker receipt** is produced.
+- Defense in depth: `pax_sim_tools.sim_place_bracket` itself raises
+  `SimKillSwitchError` if reached while the switch is engaged, so no current or
+  future caller can place a SIM order while halted. Helpers:
+  `pax_sim_tools.kill_switch_active(learn_dir)` /
+  `risk_halt_reason(learn_dir)`.
+- It also forces `/api/evaluation_state` to `observe_only` / blocked and
+  surfaces `kill_switch_active` in `/api/health`.
+
+Remove the file to resume. Flatten/cancel (risk-reducing) are not blocked by
+the backstop. **This does NOT enable live trading** -- live remains hard-blocked
+(see "Live trading blockers"); the kill switch only stops SIM placement.
 
 ## Replay and research (existing, deterministic, no orders)
 
@@ -165,9 +179,10 @@ python -m compileall -q bookmap_mcp                                       # synt
 
 ## Known limitations
 
-- Kill switch is **reported, not enforced** in the governor yet (wiring it
-  into `pax_loop`/`pax_sim_agent` is a decision-path change, out of scope for
-  the read-only truth slice).
+- Kill switch is **enforced before SIM order placement** (blocks new SIM
+  brackets); it does not auto-flatten an open SIM position -- flatten manually
+  if needed. It does not affect live trading, which is independently
+  hard-blocked.
 - List endpoints individually carry freshness via `_meta`; their stale budgets
   use the `sim_db` / `journal` source budgets.
 - Market/heartbeat staleness depends on the Bookmap bridge -> dashboard

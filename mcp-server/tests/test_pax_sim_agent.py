@@ -295,6 +295,69 @@ def test_agent_loop_armed_executes_rule_live(monkeypatch, tmp_path):
     assert placed.get("side") == "long" and placed.get("entry_stop") == 30340.0
 
 
+def test_kill_switch_blocks_armed_execution(monkeypatch, tmp_path):
+    # Armed + kill switch present: the rule plan would normally PLACE, but the
+    # risk halt blocks before any broker call and records a clean veto.
+    calls = []
+    monkeypatch.setattr(A, "_fetch_snapshot", lambda *a, **k: snap())
+    monkeypatch.setattr(pax_sim_tools, "sim_status", lambda *a, **k: status())
+    monkeypatch.setattr(pax_sim_tools, "LEARN_DIR", tmp_path)
+    monkeypatch.setattr(A, "AGENT_LOG", tmp_path / "loop.jsonl")
+    monkeypatch.setattr(pax_sim_tools, "sim_place_bracket",
+                        lambda **kw: calls.append(kw) or {"ok": True})
+    (tmp_path / "KILL_SWITCH").write_text("stop", encoding="utf-8")
+    loop = A.AgentLoop(interval_sec=15)
+    loop.armed = True
+    rec = loop._cycle_once()
+    assert calls == []                                 # broker never called
+    assert rec["governor"].startswith("VETO")
+    assert "kill_switch_active" in rec["governor"]
+    assert rec["risk_halt"] == "kill_switch_active"
+    assert rec["executed"] is False
+    assert rec["order"] is None
+    assert "exec" not in rec                            # no broker receipt
+
+
+def test_kill_switch_blocks_decide_cycle(monkeypatch, tmp_path):
+    placed = []
+    monkeypatch.setattr(pax_sim_tools, "LEARN_DIR", tmp_path)
+    monkeypatch.setattr(pax_sim_tools, "LESSONS_PATH", tmp_path / "lessons.md")
+    monkeypatch.setattr(pax_sim_tools, "SELFMOD_LEDGER", tmp_path / "ledger.csv")
+    monkeypatch.setattr(pax_sim_tools, "sim_place_bracket",
+                        lambda **kw: placed.append(kw) or {"ok": True})
+    (tmp_path / "KILL_SWITCH").write_text("stop", encoding="utf-8")
+    s, st = snap(), status()
+    call = lambda p: json.dumps({"action": "ENTER_LONG", "entry": 30340.0,
+                                 "stop": 30330.0, "tps": [30350.0, 30405.0],
+                                 "qty": 2, "confidence": 0.7,
+                                 "rationale": "follow OR-H",
+                                 "lesson": "should not be written"})
+    rec = A.decide_cycle(s, st, NOW, NOW_MS, call_fn=call, dry=False)
+    assert placed == []                                # broker never called
+    assert rec["governor"].startswith("VETO")
+    assert "kill_switch_active" in rec["governor"]
+    assert rec["executed"] is False
+    assert rec["order"] is None
+    assert "lesson_added" not in rec                   # vetoed -> no lesson
+    assert "should not be written" not in pax_sim_tools.read_lessons()
+
+
+def test_no_kill_switch_allows_armed_execution(monkeypatch, tmp_path):
+    # Requirement 2: absent kill switch preserves existing execution behavior.
+    calls = []
+    monkeypatch.setattr(A, "_fetch_snapshot", lambda *a, **k: snap())
+    monkeypatch.setattr(pax_sim_tools, "sim_status", lambda *a, **k: status())
+    monkeypatch.setattr(pax_sim_tools, "LEARN_DIR", tmp_path)
+    monkeypatch.setattr(A, "AGENT_LOG", tmp_path / "loop.jsonl")
+    monkeypatch.setattr(pax_sim_tools, "sim_place_bracket",
+                        lambda **kw: calls.append(kw) or {"ok": True})
+    loop = A.AgentLoop(interval_sec=15)
+    loop.armed = True
+    rec = loop._cycle_once()
+    assert rec["action"] == "PLACE_LONG" and rec["executed"] is True
+    assert len(calls) == 1 and "risk_halt" not in rec
+
+
 def test_agent_loop_arming_state():
     loop = A.AgentLoop(interval_sec=60)
     assert loop.status()["armed"] is False and loop.status()["running"] is False

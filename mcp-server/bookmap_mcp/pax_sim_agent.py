@@ -419,6 +419,16 @@ def decide_cycle(snap: Dict[str, Any], status: Dict[str, Any], now_dt, now_ms: i
                if governed.get("action") in ENTER_ACTIONS else None)
 
     if not dry:
+        acting = governed.get("action") in ENTER_ACTIONS + ("FLATTEN", "CANCEL_ENTRY")
+        halt = pax_sim_tools.risk_halt_reason() if acting else None
+        if halt:
+            # Kill switch engaged: block before execution, record a clean veto,
+            # write no lesson (a vetoed decision must not poison the prompt).
+            rec["governor"] = f"VETO: {halt}"
+            rec["risk_halt"] = halt
+            rec["order"] = None
+            rec["executed"] = False
+            return rec
         try:
             rec["exec"] = execute(governed, alias=alias)
             rec["executed"] = bool(rec["exec"].get("ok"))
@@ -616,12 +626,24 @@ class AgentLoop:
                       if plan.get("order") else None),
         }
         if self.armed:
-            try:
-                exec_result = self._execute_rule_plan(plan)
-                rec["exec"] = exec_result
-                rec["executed"] = exec_result is not None
-            except Exception as e:
-                rec["exec_error"] = str(e); rec["executed"] = False
+            # Risk halt (kill switch) is checked at the LAST safe point before
+            # any broker call. An acting plan is vetoed with a clean record;
+            # no order is placed and no broker receipt exists.
+            halt = pax_sim_tools.risk_halt_reason()
+            acts = bool(plan.get("order") or plan.get("flatten")
+                        or plan.get("cancel"))
+            if halt and acts:
+                rec["governor"] = f"VETO: {halt}"
+                rec["risk_halt"] = halt
+                rec["order"] = None
+                rec["executed"] = False
+            else:
+                try:
+                    exec_result = self._execute_rule_plan(plan)
+                    rec["exec"] = exec_result
+                    rec["executed"] = exec_result is not None
+                except Exception as e:
+                    rec["exec_error"] = str(e); rec["executed"] = False
 
         # SLOW (every llm_every ticks): LLM narrates + learns, off-thread.
         self._tick_n += 1

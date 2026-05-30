@@ -38,12 +38,56 @@ class SimSafetyError(RuntimeError):
     pass
 
 
+class SimKillSwitchError(SimSafetyError):
+    """Raised when the operator kill switch is engaged and a SIM order
+    placement is attempted anyway (defense-in-depth backstop)."""
+    pass
+
+
+# Operator kill switch: presence of this file under the agent learn dir is a
+# hard risk-halt. It blocks NEW SIM order placement before any broker call.
+KILL_SWITCH_NAME = "KILL_SWITCH"
+
+
+def kill_switch_path(learn_dir: Optional[Path] = None) -> Path:
+    base = Path(learn_dir) if learn_dir else LEARN_DIR
+    return base / KILL_SWITCH_NAME
+
+
+def kill_switch_active(learn_dir: Optional[Path] = None) -> bool:
+    """True when the operator kill switch file exists. Deterministic; the
+    only input is the presence of ``<learn_dir>/KILL_SWITCH``."""
+    try:
+        return kill_switch_path(learn_dir).exists()
+    except OSError:
+        return False
+
+
+def risk_halt_reason(learn_dir: Optional[Path] = None) -> Optional[str]:
+    """Single reason code for a risk halt, or None. Today the only halt is
+    the kill switch; the signature leaves room for future halts."""
+    return "kill_switch_active" if kill_switch_active(learn_dir) else None
+
+
 def ensure_sim_safe() -> None:
     """Refuse to act if live trading is enabled. Paper-only, always."""
     if os.environ.get("BOOKMAP_ALLOW_TRADING") == "1":
         raise SimSafetyError(
             "pax_sim_tools refuses to run with BOOKMAP_ALLOW_TRADING=1; "
             "this surface is paper-only.")
+
+
+def ensure_not_halted() -> None:
+    """Backstop: refuse to PLACE a SIM order while the kill switch is on.
+
+    The agent governor blocks first and records a clean veto; this wall
+    guarantees that even a stray/future caller cannot place a SIM order while
+    halted. It does NOT block flatten/cancel -- those reduce risk."""
+    reason = risk_halt_reason()
+    if reason:
+        raise SimKillSwitchError(
+            f"{reason}: SIM order placement halted; remove "
+            f"{kill_switch_path()} to resume.")
 
 
 def _engine(alias: str = DEFAULT_ALIAS,
@@ -67,6 +111,7 @@ def sim_place_bracket(side: str, qty: int, entry_limit: float,
     """Place a sim bracket. ``side`` is 'buy'/'sell' (or S_BUY/S_SELL).
     ``entry_stop`` set => resting STOP-LIMIT entry; else plain limit."""
     ensure_sim_safe()
+    ensure_not_halted()
     s = S_BUY if str(side).lower() in ("buy", "long", S_BUY) else S_SELL
     eng = _engine(alias)
     ids = eng.place_bracket(

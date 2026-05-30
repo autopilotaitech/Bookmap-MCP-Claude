@@ -97,3 +97,31 @@ def test_append_line_capped_rotates(tmp_path):
     lines = [l for l in f.read_text(encoding="utf-8").splitlines() if l.strip()]
     assert len(lines) < 200                 # bounded (rotated), not 400 -> no leak
     assert lines[-1].endswith("399")        # newest retained
+
+
+# --- kill switch (risk halt) -----------------------------------------------
+
+def test_kill_switch_helpers_detect_file(tmp_path):
+    assert pax_sim_tools.kill_switch_active(tmp_path) is False
+    assert pax_sim_tools.risk_halt_reason(tmp_path) is None
+    (tmp_path / pax_sim_tools.KILL_SWITCH_NAME).write_text("stop", encoding="utf-8")
+    assert pax_sim_tools.kill_switch_active(tmp_path) is True
+    assert pax_sim_tools.risk_halt_reason(tmp_path) == "kill_switch_active"
+
+
+def test_kill_switch_backstop_blocks_place_bracket(monkeypatch, tmp_path):
+    # Defense-in-depth: even a direct call to sim_place_bracket must refuse
+    # before touching the broker when the kill switch is engaged.
+    monkeypatch.delenv("BOOKMAP_ALLOW_TRADING", raising=False)  # isolate from live-gate
+    monkeypatch.setattr(pax_sim_tools, "LEARN_DIR", tmp_path)
+    (tmp_path / "KILL_SWITCH").write_text("stop", encoding="utf-8")
+    with pytest.raises(pax_sim_tools.SimKillSwitchError):
+        pax_sim_tools.sim_place_bracket(
+            side="buy", qty=1, entry_limit=30340.0, stop_loss=30330.0,
+            take_profits=[30350.0], entry_stop=30340.0)
+
+
+def test_no_kill_switch_does_not_block_helper(tmp_path):
+    # Absence of the file is the only "go" condition.
+    assert pax_sim_tools.risk_halt_reason(tmp_path) is None
+    assert pax_sim_tools.kill_switch_active(tmp_path) is False
