@@ -68,7 +68,25 @@ _FLAT_STATUS: Dict[str, Any] = {"position": {"size": 0}, "losers_today": 0,
                                 "realized_today_usd": 0.0}
 
 
-def _snapshot_of(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _replay_input_of(record: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Return (replay_input_dict_or_None, malformed). ``malformed`` is True when
+    a ``replay_input`` key is present but not a dict."""
+    ri = record.get("replay_input")
+    if isinstance(ri, dict):
+        return ri, False
+    if ri is not None:
+        return None, True
+    return None, False
+
+
+def _snapshot_of(record: Dict[str, Any],
+                 ri: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    # Prefer the embedded compact replay snapshot (live logs); fall back to the
+    # legacy fixture shape (top-level snapshot/snap).
+    if ri is not None:
+        v = ri.get("snapshot")
+        if isinstance(v, dict) and v:
+            return v
     for key in ("snapshot", "snap"):
         v = record.get(key)
         if isinstance(v, dict) and v:
@@ -76,7 +94,12 @@ def _snapshot_of(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _status_of(record: Dict[str, Any]) -> Dict[str, Any]:
+def _status_of(record: Dict[str, Any],
+               ri: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if ri is not None:
+        v = ri.get("status")
+        if isinstance(v, dict):
+            return v
     for key in ("status", "sim_status"):
         v = record.get(key)
         if isinstance(v, dict):
@@ -87,6 +110,17 @@ def _status_of(record: Dict[str, Any]) -> Dict[str, Any]:
 def _recorded_halt(record: Dict[str, Any]) -> Optional[str]:
     code = record.get("risk_halt_code") or record.get("risk_halt")
     return str(code) if code else None
+
+
+def _op_field(ri: Optional[Dict[str, Any]], record: Dict[str, Any],
+              key: str, default: Any) -> Any:
+    """Resolve an operational gate field: replay_input first, then a legacy
+    top-level record field, then the default."""
+    if ri is not None and key in ri:
+        return ri.get(key)
+    if key in record:
+        return record.get(key)
+    return default
 
 
 def _num(x: Any) -> Optional[float]:
@@ -115,9 +149,15 @@ def _market_age_sec(snap: Dict[str, Any], now_ms: int) -> Optional[float]:
     return None
 
 
-def _now_from(record: Dict[str, Any], snap: Dict[str, Any]) -> Tuple[Any, int]:
-    """Deterministic replay clock from ts_ms (UTC); never reads wall-clock."""
-    ts = record.get("ts_ms")
+def _now_from(record: Dict[str, Any], snap: Dict[str, Any],
+              ri: Optional[Dict[str, Any]] = None) -> Tuple[Any, int]:
+    """Deterministic replay clock from ts_ms (UTC); never reads wall-clock.
+    Prefers replay_input.now_ms, then record.ts_ms, then snapshot timestamps."""
+    ts = None
+    if ri is not None:
+        ts = ri.get("now_ms")
+    if ts is None:
+        ts = record.get("ts_ms")
     if ts is None:
         ts = snap.get("marketDataAsOfMs") or snap.get("composedAtMs") or 0
     try:
@@ -186,8 +226,18 @@ def replay_records(records: List[Dict[str, Any]],
     risk_halt_divergence_count = 0
     op_replayed = 0                                # entries the gate was run on
     op_missing_fields = 0                          # entries skipped: no mkt ts
+    replay_input_count = 0                          # records carrying replay_input
+    malformed_replay_input = 0                      # present but not a dict
+    replay_input_version_counts: Counter = Counter()
 
     for idx, rec in enumerate(records):
+        ri, ri_malformed = _replay_input_of(rec)
+        if ri_malformed:
+            malformed_replay_input += 1
+        if ri is not None:
+            replay_input_count += 1
+            replay_input_version_counts[str(ri.get("version"))] += 1
+
         recorded_action = rec.get("action")
         if recorded_action is not None:
             recorded_action_counts[str(recorded_action)] += 1
@@ -195,12 +245,12 @@ def replay_records(records: List[Dict[str, Any]],
         if halt:
             risk_halt_counts[halt] += 1
 
-        snap = _snapshot_of(rec)
+        snap = _snapshot_of(rec, ri)
         if snap is None:
             continue
         usable += 1
-        status = _status_of(rec)
-        now_dt, ts_ms = _now_from(rec, snap)
+        status = _status_of(rec, ri)
+        now_dt, ts_ms = _now_from(rec, snap, ri)
         try:
             plan = pax_loop.decide(snap, status, now_dt, ts_ms)
         except Exception as exc:   # a malformed snapshot must not crash replay
@@ -226,18 +276,24 @@ def replay_records(records: List[Dict[str, Any]],
         # ---- Layer 2: optional operational risk-gate replay (entry plans) ----
         if not plan.get("order"):
             continue   # gate is entry-only; non-entry plans are not gated
-        market_age = _market_age_sec(snap, ts_ms)
+        # Operational fields: prefer the embedded replay_input (what the live
+        # system actually saw), then legacy top-level record fields, then derive
+        # market age from the snapshot timestamp.
+        if ri is not None and "market_age_sec" in ri:
+            market_age = _num(ri.get("market_age_sec"))
+        else:
+            market_age = _market_age_sec(snap, ts_ms)
         if market_age is None:
             # No real market timestamp -> cannot prove freshness without faking
             # it; do NOT run the gate (fail-closed faking is exactly what we are
             # avoiding here). Counted as a limitation instead.
             op_missing_fields += 1
             continue
-        kill_active = bool(rec.get("kill_switch_active")) \
-            if "kill_switch_active" in rec else False
-        hb_age = _num(rec.get("heartbeat_age_sec")) \
-            if "heartbeat_age_sec" in rec else None
-        sim_ok = bool(rec.get("sim_broker_ok")) if "sim_broker_ok" in rec \
+        kill_active = bool(_op_field(ri, rec, "kill_switch_active", False))
+        hb_raw = _op_field(ri, rec, "heartbeat_age_sec", None)
+        hb_age = _num(hb_raw) if hb_raw is not None else None
+        sim_raw = _op_field(ri, rec, "sim_broker_ok", None)
+        sim_ok = bool(sim_raw) if sim_raw is not None \
             else (not status.get("_status_error"))
         gate = pax_risk_gate.evaluate_entry_gate(
             now_ms=ts_ms, kill_switch_active=kill_active,
@@ -274,6 +330,14 @@ def replay_records(records: List[Dict[str, Any]],
             f"operational risk gate not replayed for {op_missing_fields} entry "
             "record(s) due to missing fields (no real market-freshness "
             "timestamp); not faked into a pass/fail.")
+    if malformed_replay_input:
+        limitations.append(
+            f"{malformed_replay_input} record(s) had a malformed replay_input "
+            "(not a dict); ignored and fell back to legacy/record fields.")
+    if replay_input_count == 0 and len(records) > 0:
+        limitations.append(
+            "no record carried replay_input: these are pre-replay-input logs "
+            "(summarized only); future logs embed replay_input for full replay.")
     limitations.append("SIM-only deterministic replay: no orders, no LLM, no "
                        "live Bookmap; no market-edge claim.")
 
@@ -298,6 +362,10 @@ def replay_records(records: List[Dict[str, Any]],
         "risk_halt_divergences": risk_halt_divergences,
         "divergence_count": divergence_count,
         "divergences": divergences,
+        "replay_input_count": replay_input_count,
+        "malformed_replay_input": malformed_replay_input,
+        "replay_input_version_counts": dict(sorted(
+            replay_input_version_counts.items())),
         "deterministic_config": DETERMINISTIC_CONFIG,
         "limitations": limitations,
     }
@@ -337,6 +405,9 @@ def replay_file(input_path: Path, *, limit: Optional[int] = None,
             "risk_halt_divergences": [],
             "divergence_count": 0,
             "divergences": [],
+            "replay_input_count": 0,
+            "malformed_replay_input": 0,
+            "replay_input_version_counts": {},
             "deterministic_config": DETERMINISTIC_CONFIG,
             "limitations": [f"input unreadable: {type(exc).__name__}: {exc}"],
         }

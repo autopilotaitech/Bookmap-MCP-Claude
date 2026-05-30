@@ -110,6 +110,126 @@ def _market_age_sec(snap: Dict[str, Any], now_ms: int) -> Optional[float]:
     return None
 
 
+# --------------------------------------------------------------------------- #
+# Compact replay input (embedded in every heartbeat so live logs are           #
+# replay-grade: enough to re-run pax_loop.decide + pax_risk_gate, nothing more) #
+# --------------------------------------------------------------------------- #
+
+REPLAY_INPUT_VERSION = 1
+_REPLAY_MAX_LEVELS = 12
+_REPLAY_MAX_WORKING = 12
+_REPLAY_MAX_FILLS = 30
+_REPLAY_MAX_STR = 200
+# Snapshot flow keys actually read by pax_loop/pax_brain (decide path only).
+_REPLAY_FLOW_KEYS = ("regime", "biasScore", "biasTrajectory", "ofiZ", "cvdDeltaZ")
+_REPLAY_MKT_TS_KEYS = ("marketDataAsOfMs", "marketAsOfMs", "composedAtMs",
+                       "ageMs", "snapshot_age_ms")
+
+
+def _trunc_str(value: Any, n: int = _REPLAY_MAX_STR) -> str:
+    s = str(value)
+    return s if len(s) <= n else s[:n]
+
+
+def _compact_level(lvl: Dict[str, Any]) -> Dict[str, Any]:
+    comps = lvl.get("components")
+    return {
+        "label": lvl.get("label"),
+        "price": lvl.get("price"),
+        "distance": lvl.get("distance"),
+        "proximity": lvl.get("proximity"),
+        "decision": lvl.get("decision"),
+        "confidence": lvl.get("confidence"),
+        # only ps_rot is read downstream (rotation veto); drop the rest.
+        "components": ({"ps_rot": comps.get("ps_rot")}
+                       if isinstance(comps, dict) else {}),
+    }
+
+
+def _compact_snapshot(snap: Dict[str, Any]) -> Dict[str, Any]:
+    """Minimal deterministic snapshot carrying ONLY the fields pax_loop.decide /
+    pax_brain read, plus the market-freshness timestamp. No orderbook depth, no
+    trade tape, no screenshots, no secrets/tokens, no huge arrays."""
+    snap = snap or {}
+    ol = snap.get("or_levels") or {}
+    flow = snap.get("flow") or {}
+    tape = snap.get("tape_flow") or {}
+    trend = snap.get("trend_signal") or {}
+    ifl = snap.get("institutional_flow") or {}
+    conv = snap.get("conviction") or {}
+    book = snap.get("book") or {}
+    ses = snap.get("session") or {}
+    news = (snap.get("gates") or {}).get("news") or {}
+    levels = [_compact_level(l) for l in (ol.get("levels") or [])
+              if isinstance(l, dict)][:_REPLAY_MAX_LEVELS]
+    out: Dict[str, Any] = {
+        "health": snap.get("health"),
+        "book": {"mid": book.get("mid")},
+        "session": {"anchorMode": ses.get("anchorMode"), "code": ses.get("code")},
+        "or_day_ledger": {"session_type":
+                          (snap.get("or_day_ledger") or {}).get("session_type")},
+        "gates": {"news": {"blocked": bool(news.get("blocked"))}},
+        "flow": {k: flow.get(k) for k in _REPLAY_FLOW_KEYS if k in flow},
+        "tape_flow": {k: tape.get(k) for k in ("deltaScore", "deltaLabel")
+                      if k in tape},
+        "trend_signal": ({"kind": trend.get("kind")} if trend else {}),
+        "institutional_flow": {k: ifl.get(k) for k in ("weighted_vote", "regime")
+                               if k in ifl},
+        "conviction": {k: conv.get(k) for k in ("score", "trend") if k in conv},
+        "or_levels": {
+            "orHigh": ol.get("orHigh"), "orLow": ol.get("orLow"),
+            "orWidthPts": ol.get("orWidthPts"),
+            "inProximity": ol.get("inProximity"),
+            "middleLock": ol.get("middleLock"),
+            "levels": levels,
+        },
+    }
+    for k in _REPLAY_MKT_TS_KEYS:
+        if snap.get(k) is not None:
+            out[k] = snap.get(k)
+    return out
+
+
+def _compact_status(st: Dict[str, Any]) -> Dict[str, Any]:
+    """Minimal SIM status carrying only what pax_loop / pax_risk_gate read."""
+    st = st or {}
+    pos = st.get("position") or {}
+    out: Dict[str, Any] = {
+        "position": {"size": pos.get("size")},
+        "working": [{k: w.get(k) for k in ("role", "side", "qty", "status")}
+                    for w in (st.get("working") or [])
+                    if isinstance(w, dict)][:_REPLAY_MAX_WORKING],
+        "fills_today": [{k: f.get(k) for k in ("role", "filled_ms", "side")}
+                        for f in (st.get("fills_today") or [])
+                        if isinstance(f, dict)][:_REPLAY_MAX_FILLS],
+        "losers_today": st.get("losers_today"),
+        "realized_today_usd": st.get("realized_today_usd"),
+    }
+    if st.get("_status_error") is not None:
+        out["_status_error"] = _trunc_str(st.get("_status_error"))
+    return out
+
+
+def build_replay_input(snap: Dict[str, Any], st: Dict[str, Any], now_ms: int,
+                       *, market_age_sec: Optional[float],
+                       heartbeat_age_sec: Optional[float],
+                       sim_broker_ok: bool,
+                       kill_switch_active: bool) -> Dict[str, Any]:
+    """Compact, JSON-serializable replay block embedded in each heartbeat so a
+    future live agent-loop.jsonl can fully replay the decision path + the
+    operational risk gate (see pax_agent_replay)."""
+    return {
+        "version": REPLAY_INPUT_VERSION,
+        "snapshot": _compact_snapshot(snap),
+        "status": _compact_status(st),
+        "now_ms": int(now_ms),
+        "market_age_sec": market_age_sec,
+        "heartbeat_age_sec": heartbeat_age_sec,
+        "sim_broker_ok": bool(sim_broker_ok),
+        "kill_switch_active": bool(kill_switch_active),
+    }
+
+
 def _apply_risk_halt(rec: Dict[str, Any], result: "pax_risk_gate.RiskGateResult"
                      ) -> None:
     """Stamp a blocked-gate result onto an agent-loop record (unified shape).
@@ -671,6 +791,13 @@ class AgentLoop:
         plan = pax_loop.decide(
             snap, st, now, now_ms, expectancy_stats=self._expectancy_stats,
             runtime_policy=runtime_policy)
+        # Operational inputs computed once: reused by the armed gate below AND
+        # embedded in replay_input so the line is fully self-replayable.
+        ks_active = pax_sim_tools.kill_switch_active()
+        mkt_age = _market_age_sec(snap, now_ms)
+        hb_age = self._heartbeat_age_sec(now_ms)
+        sim_ok = not st.get("_status_error")
+
         o = plan.get("order") or {}
         rec: Dict[str, Any] = {
             "ts_ms": now_ms, "heartbeat": True, "armed": self.armed,
@@ -685,6 +812,10 @@ class AgentLoop:
             "order": ({k: o.get(k) for k in
                        ("side", "entry_stop", "entry_limit", "stop_loss", "tps", "qty")}
                       if plan.get("order") else None),
+            "replay_input": build_replay_input(
+                snap, st, now_ms, market_age_sec=mkt_age,
+                heartbeat_age_sec=hb_age, sim_broker_ok=sim_ok,
+                kill_switch_active=ks_active),
         }
         if self.armed:
             # Operational risk gate at the LAST safe point before any broker
@@ -699,15 +830,15 @@ class AgentLoop:
             if is_entry:
                 halt = pax_risk_gate.evaluate_entry_gate(
                     now_ms=now_ms,
-                    kill_switch_active=pax_sim_tools.kill_switch_active(),
-                    heartbeat_age_sec=self._heartbeat_age_sec(now_ms),
-                    market_age_sec=_market_age_sec(snap, now_ms),
-                    sim_broker_ok=not st.get("_status_error"),
+                    kill_switch_active=ks_active,
+                    heartbeat_age_sec=hb_age,
+                    market_age_sec=mkt_age,
+                    sim_broker_ok=sim_ok,
                     session=pax_risk_gate.session_counters_from_status(st),
                     config=self._risk_config)
                 if halt.allowed:
                     halt = None
-            elif is_exit and pax_sim_tools.kill_switch_active():
+            elif is_exit and ks_active:
                 halt = pax_risk_gate.kill_switch_result(now_ms)
             if halt is not None:
                 _apply_risk_halt(rec, halt)

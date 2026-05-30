@@ -591,6 +591,14 @@ class OverviewQueries:
         return {"heartbeat_stale": hb_stale, "market_stale": market_stale,
                 "sim_broker_unavailable": not sim_reachable}
 
+    def _replay_readiness_recent(self, limit: int = 80) -> Dict[str, Any]:
+        """Replay-readiness of the recent agent feed (cheap; counts only).
+        Reuses pax_session_report.compute_replay_readiness (local import avoids
+        an import cycle)."""
+        from . import pax_session_report
+        return pax_session_report.compute_replay_readiness(
+            self.agent_feed(limit=limit))
+
     def _last_risk_halt_record(self, limit: int = 200) -> Optional[Dict[str, Any]]:
         """Most recent agent-loop record that carried an enforced risk halt."""
         for rec in reversed(self.agent_feed(limit=limit)):
@@ -699,6 +707,7 @@ class OverviewQueries:
             halt_code, halt_message = (pax_risk_gate.SIM_BROKER_UNAVAILABLE,
                                        "SIM broker DB unavailable")
         last_halt = self._last_risk_halt_record()
+        rr_recent = self._replay_readiness_recent()
 
         return {
             "service": "pax_overview_ui",
@@ -714,6 +723,11 @@ class OverviewQueries:
             "risk_halt_code": halt_code,
             "risk_halt_message": halt_message,
             "last_risk_halt_record": last_halt,
+            "replay_readiness": {
+                "replay_input_recent": rr_recent["replay_input_records"],
+                "replay_input_pct_recent": rr_recent["replay_input_pct"],
+                "replay_input_version": rr_recent["latest_replay_input_version"],
+            },
             "evaluation_level": eval_level,
             "live_blocked": live_blocked,
         }
@@ -839,6 +853,17 @@ class OverviewQueries:
 
         wr_status, wr_msg = self._session_report_path_status()
         add("session_report_writable", wr_status, wr_msg)
+
+        # Replay auditability (WARN only -- never a safety blocker for arming).
+        rr = self._replay_readiness_recent()
+        ri_recent = rr["replay_input_records"]
+        ri_pct = rr["replay_input_pct"]
+        ri_ok = ri_recent > 0 and ri_pct >= 50.0
+        add("replay_input_present", "pass" if ri_ok else "warn",
+            (f"recent heartbeats are replay-grade ({ri_recent} records, "
+             f"{ri_pct}% replay_input)") if ri_ok
+            else ("recent heartbeats lack replay_input -- logs are summarized "
+                  "only (auditability, not a safety blocker)"))
 
         return {
             "can_arm": len(fails) == 0,

@@ -528,3 +528,85 @@ def test_call_claude_json_prompt_via_stdin(monkeypatch):
     assert captured["input"] and "HUGE_PROMPT_TOKEN" in captured["input"], \
         "prompt must be piped via stdin"
     assert "-p" in captured["args"]
+
+
+# ---- STAGE 1: compact replay_input embedded in heartbeat records ----
+
+def test_build_replay_input_has_required_fields():
+    s, st = snap(), status()
+    ri = A.build_replay_input(s, st, NOW_MS, market_age_sec=1.2,
+                              heartbeat_age_sec=3.0, sim_broker_ok=True,
+                              kill_switch_active=False)
+    assert ri["version"] == A.REPLAY_INPUT_VERSION
+    assert ri["now_ms"] == NOW_MS
+    assert ri["market_age_sec"] == 1.2 and ri["heartbeat_age_sec"] == 3.0
+    assert ri["sim_broker_ok"] is True and ri["kill_switch_active"] is False
+    cs = ri["snapshot"]
+    assert cs["health"] == "ok"
+    assert cs["book"]["mid"] == 30339.0
+    assert "marketDataAsOfMs" in cs
+    assert cs["session"]["anchorMode"] == "LIVE"
+    assert cs["or_day_ledger"]["session_type"] == "ETH"
+    assert cs["gates"]["news"]["blocked"] is False
+    ol = cs["or_levels"]
+    assert ol["orHigh"] == 30340.0 and ol["orLow"] == 30325.5
+    assert ol["inProximity"] is True and ol["middleLock"] is False
+    lvl = ol["levels"][0]
+    for k in ("label", "price", "distance", "proximity", "decision",
+              "confidence", "components"):
+        assert k in lvl
+    assert lvl["components"]["ps_rot"] == "NONE"
+    cstatus = ri["status"]
+    assert cstatus["position"]["size"] == 0
+    assert "working" in cstatus and "fills_today" in cstatus
+    assert "losers_today" in cstatus and "realized_today_usd" in cstatus
+
+
+def test_replay_input_omits_huge_fields_and_secrets():
+    s = snap()
+    s["orderbook"] = {"bids": [[i, i] for i in range(500)]}
+    s["trades"] = [{"price": i, "size": 1} for i in range(500)]
+    s["screenshot"] = "data:image/png;base64," + "Q" * 50000
+    s["token"] = "SECRET-TOKEN-123"
+    s["book"]["bids"] = [[i, i] for i in range(300)]
+    s["book"]["asks"] = [[i, i] for i in range(300)]
+    ri = A.build_replay_input(s, status(), NOW_MS, market_age_sec=1.0,
+                              heartbeat_age_sec=1.0, sim_broker_ok=True,
+                              kill_switch_active=False)
+    blob = json.dumps(ri)
+    for forbidden in ("SECRET-TOKEN-123", "screenshot", "QQQQQQQQ", "trades"):
+        assert forbidden not in blob
+    assert ri["snapshot"]["book"] == {"mid": 30339.0}
+    assert "orderbook" not in ri["snapshot"]
+
+
+def test_replay_input_truncates_arrays():
+    s = snap()
+    s["or_levels"]["levels"] = [
+        {"label": f"L{i}", "price": i, "distance": i, "proximity": True,
+         "decision": "WAIT", "confidence": 0.1, "components": {"ps_rot": "NONE"}}
+        for i in range(100)]
+    st = status()
+    st["working"] = [{"role": "ENTRY", "side": "buy"} for _ in range(100)]
+    st["fills_today"] = [{"role": "TP", "filled_ms": i} for i in range(200)]
+    ri = A.build_replay_input(s, st, NOW_MS, market_age_sec=1.0,
+                              heartbeat_age_sec=1.0, sim_broker_ok=True,
+                              kill_switch_active=False)
+    assert len(ri["snapshot"]["or_levels"]["levels"]) == A._REPLAY_MAX_LEVELS
+    assert len(ri["status"]["working"]) == A._REPLAY_MAX_WORKING
+    assert len(ri["status"]["fills_today"]) == A._REPLAY_MAX_FILLS
+
+
+def test_cycle_once_writes_replay_input(monkeypatch, tmp_path):
+    monkeypatch.setattr(A, "_fetch_snapshot", lambda *a, **k: snap())
+    monkeypatch.setattr(pax_sim_tools, "sim_status", lambda *a, **k: status())
+    monkeypatch.setattr(pax_sim_tools, "LEARN_DIR", tmp_path)
+    monkeypatch.setattr(A, "AGENT_LOG", tmp_path / "loop.jsonl")
+    loop = A.AgentLoop(interval_sec=15)
+    rec = loop._cycle_once()
+    assert "replay_input" in rec
+    line = (tmp_path / "loop.jsonl").read_text(encoding="utf-8").strip()
+    parsed = json.loads(line)
+    assert parsed["replay_input"]["version"] == A.REPLAY_INPUT_VERSION
+    assert parsed["replay_input"]["snapshot"]["or_levels"]["orHigh"] == 30340.0
+    assert len(line) < 16384, f"heartbeat line too large: {len(line)} bytes"

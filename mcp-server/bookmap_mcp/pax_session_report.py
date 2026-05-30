@@ -23,11 +23,57 @@ from typing import Any, Dict, List, Optional
 from . import pax_freshness
 
 
+def compute_replay_readiness(feed: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """How replay-grade the log is: counts of records carrying a compact
+    ``replay_input`` block. Pure, cheap (no replay run) -- the operator can see
+    whether future logs can be fully audited. Records predating replay_input are
+    summarized only.
+    """
+    feed = feed or []
+    total = len(feed)
+    have = 0
+    malformed_ri = 0
+    latest_version: Optional[int] = None
+    for rec in feed:
+        if not isinstance(rec, dict):
+            continue
+        ri = rec.get("replay_input")
+        if isinstance(ri, dict):
+            have += 1
+            v = ri.get("version")
+            if isinstance(v, int):
+                latest_version = v if latest_version is None else max(latest_version, v)
+        elif ri is not None:
+            malformed_ri += 1
+    dict_total = sum(1 for r in feed if isinstance(r, dict))
+    missing = max(0, dict_total - have - malformed_ri)
+    pct = round(100.0 * have / dict_total, 1) if dict_total else 0.0
+    if total == 0:
+        note = "no records"
+    elif have == 0:
+        note = ("pre-replay-input logs: summarized only; future heartbeats embed "
+                "replay_input for full decision + risk-gate replay")
+    elif have == dict_total:
+        note = "all records replay-grade"
+    else:
+        note = "mixed: some records predate replay_input (summarized only)"
+    return {
+        "total_records": total,
+        "replay_input_records": have,
+        "replay_input_pct": pct,
+        "missing_replay_input": missing,
+        "malformed_replay_input": malformed_ri,
+        "latest_replay_input_version": latest_version,
+        "note": note,
+    }
+
+
 def build_session_report(*,
                          feed: List[Dict[str, Any]],
                          equity: Dict[str, Any],
                          errors: List[Dict[str, Any]],
                          eval_state: Optional[Dict[str, Any]] = None,
+                         replay_summary: Optional[Dict[str, Any]] = None,
                          now_ms: Optional[int] = None) -> Dict[str, Any]:
     """Assemble the report from already-loaded records. Pure function."""
     feed = feed or []
@@ -131,6 +177,8 @@ def build_session_report(*,
             "malformed_records": malformed,
             "stale_data_blocks": stale_data_blocks,
         },
+        "replay_readiness": compute_replay_readiness(feed),
+        "replay_summary": replay_summary,
         "evaluation_state": eval_state,
     }
 
@@ -151,12 +199,18 @@ def gather_and_write(*,
                      sim_db: Path,
                      learn_dir: Optional[Path] = None,
                      out_path: Optional[Path] = None,
-                     archive: bool = False) -> Path:
+                     archive: bool = False,
+                     replay_summary: bool = False) -> Path:
     """Read live data via OverviewQueries, build the report, write JSON.
 
     When ``archive`` is set, ALSO writes a timestamped copy under
     ``<out_dir>/sessions/`` so a session history accumulates. Archive-write
-    failure never prevents the canonical write."""
+    failure never prevents the canonical write.
+
+    When ``replay_summary`` is set, runs the deterministic ``pax_agent_replay``
+    over the agent-loop log and embeds a SMALL summary (counts only). The
+    canonical report's replay_readiness metrics are always present and cheap;
+    this opt-in adds the heavier full replay pass."""
     from .overview_ui import OverviewQueries  # local import: avoid cycle at import time
 
     q = OverviewQueries(journal, sim_db, learn_dir=learn_dir)
@@ -183,8 +237,21 @@ def gather_and_write(*,
     except Exception:
         eval_state = None
 
+    rsummary = None
+    if replay_summary:
+        try:
+            from . import pax_agent_replay
+            full = pax_agent_replay.replay_file(learn / "agent-loop.jsonl")
+            rsummary = {k: full.get(k) for k in (
+                "event_count", "usable_snapshot_count", "decisions_generated",
+                "replay_input_count", "replay_input_version_counts",
+                "op_gate_replayed_count", "op_gate_missing_fields_count",
+                "divergence_count", "risk_halt_divergence_count")}
+        except Exception as exc:
+            rsummary = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+
     report = build_session_report(feed=feed, equity=equity, errors=errors,
-                                  eval_state=eval_state)
+                                  eval_state=eval_state, replay_summary=rsummary)
     out = Path(out_path) if out_path else (learn / "session-report.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     body = json.dumps(report, indent=2, default=str)
@@ -212,6 +279,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", type=Path, default=None)
     p.add_argument("--archive", action="store_true",
                    help="Also write a timestamped copy under <out_dir>/sessions/.")
+    p.add_argument("--replay-summary", action="store_true",
+                   help="Run pax_agent_replay on the agent log and embed a "
+                        "small replay summary (slower; readiness metrics are "
+                        "always included regardless).")
     return p
 
 
@@ -219,7 +290,8 @@ def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
     out = gather_and_write(journal=args.journal, sim_db=args.sim_db,
                            learn_dir=args.learn_dir, out_path=args.out,
-                           archive=args.archive)
+                           archive=args.archive,
+                           replay_summary=args.replay_summary)
     print(f"session report written: {out}")
     return 0
 

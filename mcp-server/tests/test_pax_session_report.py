@@ -150,3 +150,56 @@ def test_paxi_stop_writes_session_report_before_kill():
     assert block.index("popd") < block.index("call :stop_processes_only")
     # failure-tolerant: stop block does not 'exit /b 1' on report failure
     assert "exit /b 1" not in block.split("call :stop_processes_only")[0]
+
+
+# ── STAGE 3: replay readiness in session report ────────────────────────────
+
+def _ri(version=1):
+    return {"version": version, "snapshot": {"health": "ok"},
+            "status": {"position": {"size": 0}}, "now_ms": 1,
+            "market_age_sec": 1.0, "heartbeat_age_sec": 1.0,
+            "sim_broker_ok": True, "kill_switch_active": False}
+
+
+def test_replay_readiness_counts_records():
+    feed = [
+        {"ts_ms": 1, "action": "NONE", "replay_input": _ri()},
+        {"ts_ms": 2, "action": "NONE", "replay_input": _ri()},
+        {"ts_ms": 3, "action": "NONE"},                       # missing
+    ]
+    rep = sr.build_session_report(feed=feed, equity={}, errors=[], now_ms=9)
+    rr = rep["replay_readiness"]
+    assert rr["total_records"] == 3
+    assert rr["replay_input_records"] == 2
+    assert rr["missing_replay_input"] == 1
+    assert rr["replay_input_pct"] == 66.7
+    assert rr["latest_replay_input_version"] == 1
+    assert "mixed" in rr["note"]
+
+
+def test_replay_readiness_counts_malformed():
+    feed = [{"ts_ms": 1, "replay_input": "nope"},
+            {"ts_ms": 2, "replay_input": _ri()}]
+    rr = sr.build_session_report(feed=feed, equity={}, errors=[])["replay_readiness"]
+    assert rr["malformed_replay_input"] == 1
+    assert rr["replay_input_records"] == 1
+
+
+def test_replay_readiness_empty_feed_safe():
+    rr = sr.build_session_report(feed=[], equity={}, errors=[])["replay_readiness"]
+    assert rr["total_records"] == 0
+    assert rr["replay_input_records"] == 0
+    assert rr["replay_input_pct"] == 0.0
+    assert rr["note"] == "no records"
+
+
+def test_replay_readiness_pre_replay_input_note():
+    feed = [{"ts_ms": 1, "action": "NONE"}]
+    rr = sr.build_session_report(feed=feed, equity={}, errors=[])["replay_readiness"]
+    assert rr["replay_input_records"] == 0
+    assert "pre-replay-input" in rr["note"]
+
+
+def test_replay_summary_optional_field_default_none():
+    rep = sr.build_session_report(feed=[], equity={}, errors=[])
+    assert rep["replay_summary"] is None

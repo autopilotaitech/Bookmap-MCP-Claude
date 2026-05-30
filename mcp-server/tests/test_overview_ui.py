@@ -515,7 +515,8 @@ def _fresh_journal(tmp_path):
     return db
 
 
-def _green_arming(tmp_path, *, scorecard=True, kill_switch=False):
+def _green_arming(tmp_path, *, scorecard=True, kill_switch=False,
+                  replay_input=False):
     """A fully-green arming setup: fresh snapshot, fresh heartbeat, valid SIM
     DB, optional scorecard."""
     from bookmap_mcp.sim_engine import SimEngine
@@ -523,9 +524,13 @@ def _green_arming(tmp_path, *, scorecard=True, kill_switch=False):
     db = tmp_path / "sim.db"
     SimEngine(alias="NQM6", db_path=db, eod_close_hour_ct=None)
     now = int(time.time() * 1000)
-    files = {"agent-loop.jsonl":
-             json.dumps({"ts_ms": now, "heartbeat": True, "armed": False,
-                         "action": "NONE"}) + "\n"}
+    hb = {"ts_ms": now, "heartbeat": True, "armed": False, "action": "NONE"}
+    if replay_input:
+        hb["replay_input"] = {"version": 1, "snapshot": {"health": "ok"},
+                              "status": {"position": {"size": 0}}, "now_ms": now,
+                              "market_age_sec": 1.0, "heartbeat_age_sec": 1.0,
+                              "sim_broker_ok": True, "kill_switch_active": False}
+    files = {"agent-loop.jsonl": json.dumps(hb) + "\n"}
     if scorecard:
         files["scorecard.json"] = json.dumps(
             {"setups": [{"setup": "A|LONG|OR-H|ETH", "n": 5,
@@ -692,3 +697,40 @@ def test_html_page_constant_has_dashboard_panels():
     # Charts are hand-drawn SVG -- no external chart library dependency.
     assert "<svg" in _PAGE_HTML
     assert "<script src=" not in _PAGE_HTML, "must stay self-contained (no CDN)"
+
+
+# ── STAGE 4: replay readiness in health + arming_check ─────────────────────
+
+def test_health_exposes_replay_readiness(tmp_path):
+    q = _green_arming(tmp_path, replay_input=True)
+    h = q.health()
+    assert "replay_readiness" in h
+    rr = h["replay_readiness"]
+    assert rr["replay_input_recent"] >= 1
+    assert rr["replay_input_pct_recent"] == 100.0
+    assert rr["replay_input_version"] == 1
+
+
+def test_health_replay_readiness_old_logs_no_crash(tmp_path):
+    q = _green_arming(tmp_path, replay_input=False)
+    h = q.health()                              # old logs, no replay_input
+    rr = h["replay_readiness"]
+    assert rr["replay_input_recent"] == 0
+    assert rr["replay_input_pct_recent"] == 0.0
+    assert rr["replay_input_version"] is None
+
+
+def test_arming_check_warns_when_replay_input_missing(tmp_path):
+    q = _green_arming(tmp_path, replay_input=False)
+    a = q.arming_check()
+    assert "replay_input_present" in a["warnings"]
+    assert "replay_input_present" not in a["blocking_codes"]
+    assert a["can_arm"] is True                 # auditability is not a blocker
+
+
+def test_arming_check_replay_input_present_passes(tmp_path):
+    q = _green_arming(tmp_path, replay_input=True)
+    a = q.arming_check()
+    chk = [c for c in a["checks"] if c["code"] == "replay_input_present"][0]
+    assert chk["status"] == "pass"
+    assert "replay_input_present" not in a["warnings"]

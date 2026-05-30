@@ -64,17 +64,25 @@ legal/risk, capital, latency, exchange-failure, and manual approval controls.
   timestamp) -> `replayed_risk_halt_counts` / `op_gate_replayed_count` /
   `op_gate_missing_fields_count` / `risk_halt_divergence_count`; missing fields
   are a limitation, never faked.
+- replay-grade live logs: `pax_sim_agent._cycle_once` embeds a compact
+  `replay_input` (version 1) in every heartbeat -- pruned snapshot (only fields
+  pax_loop/pax_brain read) + pruned status + now_ms + market/heartbeat ages +
+  sim_broker_ok + kill_switch_active; no depth/tape/screenshots/tokens, arrays
+  truncated (~1 KB/line). `pax_agent_replay` consumes `replay_input` first
+  (legacy fixture shape still supported) -> `replay_input_count` /
+  `replay_input_version_counts` / `malformed_replay_input`. Session report +
+  `/api/health` expose `replay_readiness`; `/api/arming_check` warns (never
+  blocks) on missing `replay_input`.
 
 ### Active Next Phase
 
-Replay/validation/arming readiness is DONE -- see the checkpoint above and
-`docs/PAX_RUNBOOK.md`. Remaining prototype-grade items:
+Replay-grade logging + readiness surfacing is DONE -- see the checkpoint above
+and `docs/PAX_RUNBOOK.md`. Remaining prototype-grade items:
 
 1. Wire consecutive-loss / R / drawdown counters to the live SIM path (the
    status payload lacks them; gates are unit-tested but report `unavailable`).
-2. The live `agent-loop.jsonl` does not embed snapshots, so decision-path replay
-   only fully exercises snapshot-embedding fixtures (honest limitation, not
-   faked). A snapshot-embedding heartbeat writer would unlock real-log replay.
+2. Old `agent-loop.jsonl` lines (pre-`replay_input`) are summarized only -- a
+   one-time backfill is not provided (honest limitation, not faked).
 3. This is SIM-only; live remains hard-blocked. No market-edge validation yet.
 
 Keep this narrow. Do not rebuild replay, research, learning, or strategy logic.

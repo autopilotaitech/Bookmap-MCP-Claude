@@ -224,3 +224,79 @@ def test_replay_does_not_call_broker(monkeypatch):
     monkeypatch.setattr(T, "sim_place_bracket", boom, raising=False)
     rep = R.replay_file(FIX / "clean_eligible_entry.jsonl", now_ms=1)
     assert rep["decisions_generated"] == 1
+
+
+# ── STAGE 2: replay consumes embedded replay_input ─────────────────────────
+
+def test_replay_input_fixture_fully_replays_decision_and_op_gate():
+    rep = R.replay_file(FIX / "replay_input_entry.jsonl", now_ms=1)
+    assert rep["replay_input_count"] == 1
+    assert rep["replay_input_version_counts"] == {"1": 1}
+    assert rep["usable_snapshot_count"] == 1
+    assert rep["action_counts"] == {"PLACE_LONG": 1}
+    assert rep["op_gate_replayed_count"] == 1          # gate ran from replay_input
+    assert rep["op_gate_missing_fields_count"] == 0
+    # fresh embedded market_age -> gate allows -> no replayed halt.
+    assert rep["replayed_risk_halt_counts"] == {}
+
+
+def test_replay_input_stale_market_replays_from_embedded_age():
+    rep = R.replay_file(FIX / "replay_input_stale_market.jsonl", now_ms=1)
+    # the embedded market_age_sec=60 (not a snapshot ts diff) drives the gate.
+    assert rep["replayed_risk_halt_counts"].get("stale_market_data") == 1
+    assert rep["op_gate_replayed_count"] == 1
+    assert rep["risk_halt_divergence_count"] == 0      # recorded == replayed
+
+
+def test_old_fixture_still_works_without_replay_input():
+    rep = R.replay_file(FIX / "clean_eligible_entry.jsonl", now_ms=1)
+    assert rep["replay_input_count"] == 0
+    assert rep["action_counts"] == {"PLACE_LONG": 1}
+    assert any("pre-replay-input logs" in s for s in rep["limitations"])
+
+
+def test_malformed_replay_input_counted_not_crashed():
+    recs = [
+        {"ts_ms": 1, "replay_input": "not-a-dict", "snapshot": {"health": "ok"},
+         "action": "NONE"},
+        {"ts_ms": 2, "replay_input": [1, 2, 3], "snapshot": {"health": "ok"}},
+    ]
+    rep = R.replay_records(recs, now_ms=1)
+    assert rep["malformed_replay_input"] == 2
+    assert rep["replay_input_count"] == 0
+    # fell back to the top-level snapshot, so decisions still ran.
+    assert rep["decisions_generated"] == 2
+    assert any("malformed replay_input" in s for s in rep["limitations"])
+
+
+def test_op_gate_uses_replay_input_heartbeat_and_market_age():
+    from bookmap_mcp import pax_sim_agent as AGENT
+    snap = {"health": "ok", "book": {"mid": 30339.0},
+            "marketDataAsOfMs": 1779900000000,
+            "session": {"anchorMode": "LIVE", "code": "ACTIVE"},
+            "or_day_ledger": {"session_type": "ETH"},
+            "gates": {"news": {"blocked": False}}, "flow": {},
+            "or_levels": {"orHigh": 30340.0, "orLow": 30325.5, "orWidthPts": 14.5,
+                          "inProximity": True, "middleLock": False,
+                          "levels": [{"label": "OR-H", "price": 30340.0,
+                                      "distance": 1.0, "proximity": True,
+                                      "decision": "ENTER_LONG_FOLLOW",
+                                      "confidence": 0.6,
+                                      "components": {"ps_rot": "NONE"}}]}}
+    flat = {"position": {"size": 0}, "fills_today": [], "working": [],
+            "realized_today_usd": 0.0}
+    # Embedded heartbeat_age is stale -> gate replays stale_heartbeat even though
+    # the snapshot market timestamp is fresh.
+    ri = AGENT.build_replay_input(snap, flat, 1779900000000,
+                                  market_age_sec=1.0, heartbeat_age_sec=90.0,
+                                  sim_broker_ok=True, kill_switch_active=False)
+    rec = {"ts_ms": 1779900000000, "action": "PLACE_LONG", "replay_input": ri}
+    rep = R.replay_records([rec], now_ms=1)
+    assert rep["replayed_risk_halt_counts"].get("stale_heartbeat") == 1
+
+
+def test_replay_input_output_deterministic_except_generated_ms():
+    a = R.replay_file(FIX / "replay_input_entry.jsonl", now_ms=11)
+    b = R.replay_file(FIX / "replay_input_entry.jsonl", now_ms=22)
+    a.pop("generated_ms"); b.pop("generated_ms")
+    assert json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)

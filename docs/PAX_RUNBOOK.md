@@ -252,13 +252,30 @@ python -m bookmap_mcp.pax_agent_replay --input path\to\agent-loop.jsonl ^
     --output reports\agent-replay.json --limit 1000
 ```
 
-A record is replayable only if it embeds a market snapshot under `snapshot` /
-`snap`. The live `agent-loop.jsonl` heartbeat does NOT embed snapshots, so real
-logs are summarized (recorded actions/risk-halts counted) but their decisions
-cannot be re-derived -- the report says so honestly via `usable_snapshot_count`
-and a `limitations` note (nothing is faked). Snapshot-embedding fixtures under
-`mcp-server/tests/fixtures/pax_replay/` exercise the full path. Output is
-byte-stable except `generated_ms`.
+**Future live logs are replay-grade.** Every heartbeat written by
+`pax_sim_agent._cycle_once` now embeds a compact `replay_input` block
+(`version`, a pruned `snapshot` with only the fields `pax_loop.decide` /
+`pax_brain` read, a pruned `status`, `now_ms`, `market_age_sec`,
+`heartbeat_age_sec`, `sim_broker_ok`, `kill_switch_active`). It excludes raw
+orderbook depth, the trade tape, screenshots, and tokens, and truncates arrays,
+so a heartbeat line stays small (~1 KB). `pax_agent_replay` consumes
+`replay_input` first, so a live `agent-loop.jsonl` replays the decision path AND
+the operational risk gate with no special fixture format:
+
+```cmd
+python -m bookmap_mcp.pax_agent_replay ^
+    --input D:\BookmapLogs\pax-agent\agent-loop.jsonl ^
+    --output reports\agent-replay.json
+```
+
+**Old logs without `replay_input` are summarized only** -- their recorded
+actions/risk-halts are still counted, but decisions cannot be re-derived; the
+report says so via `usable_snapshot_count`, `replay_input_count`, and a
+`limitations` note ("pre-replay-input logs: summarized only"). Nothing is faked.
+The report also carries `replay_input_count`, `replay_input_version_counts`, and
+`malformed_replay_input`. The legacy fixture shape (top-level `snapshot`/`snap`)
+under `mcp-server/tests/fixtures/pax_replay/` is still supported, alongside the
+new `replay_input_*.jsonl` fixtures. Output is byte-stable except `generated_ms`.
 
 Replay has **two layers**, both pure (no orders, no LLM, no live Bookmap):
 
@@ -268,10 +285,12 @@ Replay has **two layers**, both pure (no orders, no LLM, no live Bookmap):
    halts read from the log.
 2. **Optional operational risk-gate replay** -- re-runs
    `pax_risk_gate.evaluate_entry_gate` ONLY for entry plans that carry a real
-   market-freshness timestamp (`marketDataAsOfMs` / `marketAsOfMs` / `ageMs`).
-   It reads `kill_switch_active`, `heartbeat_age_sec`, and `sim_broker_ok` from
-   the record when present (safe defaults otherwise) and the session counters
-   from `status`. Results land in `replayed_risk_halt_counts`,
+   market-freshness signal. It prefers the embedded `replay_input`
+   (`market_age_sec`, `heartbeat_age_sec`, `sim_broker_ok`,
+   `kill_switch_active` -- exactly what the live system saw), then legacy
+   top-level record fields, then derives market age from the snapshot timestamp
+   (`marketDataAsOfMs` / `marketAsOfMs` / `ageMs`). Session counters come from
+   `status`. Results land in `replayed_risk_halt_counts`,
    `op_gate_replayed_count`, and `risk_halt_divergence_count` (recorded halt vs
    replayed halt). Entry records WITHOUT a real market timestamp are NOT gated
    -- they are counted in `op_gate_missing_fields_count` and a `limitations`
@@ -298,14 +317,23 @@ read-only at `GET /api/promotion_report` (freshness-enveloped).
 ```bash
 python -m bookmap_mcp.pax_session_report
 # writes D:\BookmapLogs\pax-agent\session-report.json
+python -m bookmap_mcp.pax_session_report --replay-summary   # + embed a small replay pass
 ```
 
 Contents: decisions by action, executions, blocked decisions, risk/veto
 events, **enforced risk halts** (`risk_halts`: total count, `by_code`,
 `kill_switch` / `stale_data` / `sim_broker` / `session_limits` sub-counts, and
 the recent halt list), PnL/win-rate, setup stats, model calls, errors,
-malformed-record count, stale-data block count, and a snapshot of
-`evaluation_state`.
+malformed-record count, stale-data block count, **`replay_readiness`**
+(`total_records`, `replay_input_records`, `replay_input_pct`,
+`missing_replay_input`, `malformed_replay_input`,
+`latest_replay_input_version`, `note`), and a snapshot of `evaluation_state`.
+`replay_readiness` is always cheap (counts only); `--replay-summary` additionally
+runs `pax_agent_replay` over the log and embeds a small `replay_summary`. The
+same readiness (over the recent feed) appears in `/api/health.replay_readiness`
+(`replay_input_recent`, `replay_input_pct_recent`, `replay_input_version`) and
+as a WARN-only `replay_input_present` check in `/api/arming_check` -- missing
+`replay_input` is an auditability gap, never an arming blocker.
 
 ## Tests
 
