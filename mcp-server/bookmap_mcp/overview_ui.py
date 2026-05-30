@@ -83,7 +83,49 @@ class OverviewQueries:
             f"file:{self.sim_db_path.as_posix()}?mode=ro",
             uri=True, timeout=2.0)
         c.row_factory = sqlite3.Row
+        # Validate it is a real, readable SIM DB before handing it to callers. A
+        # corrupt/locked/non-SIM file connects lazily but raises on first query;
+        # catching it here means every consumer degrades to empty instead of
+        # crashing (the structured reporter is sim_broker_preflight()).
+        try:
+            c.execute("SELECT 1 FROM orders LIMIT 1").fetchone()
+        except sqlite3.Error:
+            c.close()
+            return None
         return c
+
+    def sim_broker_preflight(self) -> Dict[str, Any]:
+        """Read-only health probe of the configured SIM broker DB.
+
+        Opens it read-only and runs a minimal schema query (``SELECT COUNT(*)
+        FROM orders``) so a corrupt, locked, unreadable, or non-SIM DB is
+        reported unavailable instead of merely 'file exists'. No writes, never
+        raises. Returns {openable, readable, error, source_path}.
+        ``reachable`` for health = openable AND readable."""
+        sp = str(self.sim_db_path) if self.sim_db_path else None
+        if self.sim_db_path is None:
+            return {"openable": False, "readable": False,
+                    "error": "no sim_db_path configured", "source_path": None}
+        if not self.sim_db_path.exists():
+            return {"openable": False, "readable": False,
+                    "error": "sim db file does not exist", "source_path": sp}
+        c = None
+        try:
+            c = sqlite3.connect(
+                f"file:{self.sim_db_path.as_posix()}?mode=ro",
+                uri=True, timeout=2.0)
+            # Minimal safe read: proves a real, readable sqlite DB carrying the
+            # SIM schema (the orders table the broker reads/writes). A corrupt
+            # file raises DatabaseError; a non-SIM DB raises 'no such table'.
+            c.execute("SELECT COUNT(*) FROM orders").fetchone()
+            return {"openable": True, "readable": True, "error": None,
+                    "source_path": sp}
+        except sqlite3.Error as e:
+            return {"openable": c is not None, "readable": False,
+                    "error": f"{type(e).__name__}: {e}"[:200], "source_path": sp}
+        finally:
+            if c is not None:
+                c.close()
 
     # ─── status / heartbeat ─────────────────────────────────────────
 
@@ -538,8 +580,8 @@ class OverviewQueries:
         snap_ms = self._journal_max_ms("snapshots")
         market_stale = bool(
             pax_freshness.staleness(snap_ms, "market", now)["is_stale"])
-        sim_reachable = (self.sim_db_path is not None
-                         and Path(self.sim_db_path).exists())
+        pf = self.sim_broker_preflight()
+        sim_reachable = bool(pf["openable"] and pf["readable"])
         return {"heartbeat_stale": hb_stale, "market_stale": market_stale,
                 "sim_broker_unavailable": not sim_reachable}
 
@@ -597,10 +639,15 @@ class OverviewQueries:
         sim_ms = self._sim_max_ms("placed_ms")
         sources["sim_db"] = pax_freshness.staleness(sim_ms, "sim_db", now)
         sources["sim_db"]["source"] = "sim_db"
-        sources["sim_db"]["reachable"] = (self.sim_db_path is not None
-                                          and Path(self.sim_db_path).exists())
-        sources["sim_db"]["source_path"] = (str(self.sim_db_path)
-                                            if self.sim_db_path else None)
+        # Reachability is a real read-only preflight (openable AND a minimal
+        # schema query succeeds), not mere file existence -- a corrupt/locked/
+        # non-SIM DB is reported unavailable with its error.
+        pf = self.sim_broker_preflight()
+        sources["sim_db"]["reachable"] = bool(pf["openable"] and pf["readable"])
+        sources["sim_db"]["openable"] = pf["openable"]
+        sources["sim_db"]["readable"] = pf["readable"]
+        sources["sim_db"]["error"] = pf["error"]
+        sources["sim_db"]["source_path"] = pf["source_path"]
 
         hb_ms, mode = self._heartbeat_mode()
         sources["heartbeat"] = pax_freshness.staleness(hb_ms, "heartbeat", now)

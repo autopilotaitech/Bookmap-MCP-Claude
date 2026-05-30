@@ -22,11 +22,15 @@ def snap(dec="ENTER_LONG_FOLLOW", conf=0.6, label="OR-H", price=30340.0,
     lvl = {"label": label, "price": price, "distance": price - mid,
            "proximity": True, "decision": dec, "confidence": conf,
            "components": {"ps_rot": "NONE"}}
-    # asOfMs: a fresh market timestamp by default so the operational risk gate
-    # (stale_market_data) sees live data. Tests that exercise stale-market
-    # blocking pass an old as_of_ms.
+    # marketDataAsOfMs: a fresh real-feed timestamp by default so the operational
+    # risk gate (stale_market_data) sees live data. Tests that exercise stale-
+    # market blocking pass an old as_of_ms; tests for compose-time-only pass it
+    # via composedAtMs and drop marketDataAsOfMs.
     return {"health": health, "book": {"mid": mid},
-            "asOfMs": int(time.time() * 1000) if as_of_ms is None else as_of_ms,
+            "marketDataAsOfMs": (int(time.time() * 1000) if as_of_ms is None
+                                 else as_of_ms),
+            "marketFreshnessSource": "trend_analyzer.updatedAtMs",
+            "composedAtMs": int(time.time() * 1000),
             "session": {"anchorMode": anchor, "code": code},
             "or_day_ledger": {"session_type": "ETH"},
             "gates": {"news": {"blocked": news}}, "flow": {},
@@ -397,12 +401,38 @@ def test_stale_market_blocks_armed_entry(monkeypatch, tmp_path):
 def test_missing_market_timestamp_blocks_armed_entry(monkeypatch, tmp_path):
     calls = []
     s = snap()
-    s.pop("asOfMs")                                  # cannot prove freshness
+    s.pop("marketDataAsOfMs")                         # cannot prove freshness
     loop = _armed_loop(monkeypatch, tmp_path, s, status(), calls)
     rec = loop._cycle_once()
     assert calls == []
     assert rec["risk_halt"] == "stale_market_data"
     assert "cannot prove" in rec["risk_halt_message"].lower()
+
+
+def test_compose_time_only_blocks_armed_entry(monkeypatch, tmp_path):
+    # composedAtMs is a fresh dashboard wall-clock, but there is NO real market
+    # timestamp -> must NOT be treated as freshness -> block (fail closed).
+    calls = []
+    s = snap()
+    s.pop("marketDataAsOfMs")
+    s.pop("marketFreshnessSource", None)
+    s["composedAtMs"] = int(time.time() * 1000)      # fresh compose time only
+    loop = _armed_loop(monkeypatch, tmp_path, s, status(), calls)
+    rec = loop._cycle_once()
+    assert calls == []
+    assert rec["risk_halt"] == "stale_market_data"
+
+
+def test_market_age_ignores_compose_time():
+    now = 1_900_000_000_000
+    # Only compose time present -> _market_age_sec returns None (fail closed),
+    # never an age derived from compose time.
+    s = {"composedAtMs": now - 1000, "snapshotComposedMs": now - 1000,
+         "asOfMs": now - 1000}
+    assert A._market_age_sec(s, now) is None
+    # Real feed timestamp present -> age derives from it.
+    s2 = {"marketDataAsOfMs": now - 4000, "composedAtMs": now}
+    assert A._market_age_sec(s2, now) == 4.0
 
 
 def test_sim_broker_unavailable_blocks_armed_entry(monkeypatch, tmp_path):

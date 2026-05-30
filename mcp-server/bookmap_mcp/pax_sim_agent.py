@@ -88,13 +88,18 @@ def _snapshot_is_stale(snap: Dict[str, Any]) -> bool:
 
 
 def _market_age_sec(snap: Dict[str, Any], now_ms: int) -> Optional[float]:
-    """Seconds since the snapshot's market data was composed, or None when no
-    market timestamp is present (the risk gate fails closed on None).
+    """Seconds since the snapshot's MARKET/FEED data was last fresh, or None
+    when no real market timestamp exists (the risk gate fails closed on None).
 
-    Prefers ``asOfMs`` (epoch-ms compose time emitted by dashboard.fetch_snapshot);
-    falls back to an explicit ``ageMs`` / ``snapshot_age_ms`` if a producer ever
-    supplies one. No reliable timestamp -> None -> cannot prove freshness."""
-    as_of = _f(snap.get("asOfMs"))
+    Prefers ``marketDataAsOfMs`` / ``marketAsOfMs`` (bridge/feed timestamps that
+    stop advancing when the feed stalls). Falls back to an explicit real
+    data-age field (``ageMs`` / ``snapshot_age_ms``). It NEVER uses dashboard
+    compose time (``composedAtMs`` / ``snapshotComposedMs`` / legacy ``asOfMs``)
+    as market freshness -- compose time only proves the dashboard kept composing,
+    not that the underlying feed is live."""
+    as_of = _f(snap.get("marketDataAsOfMs"))
+    if as_of is None:
+        as_of = _f(snap.get("marketAsOfMs"))
     if as_of is not None:
         return max(0.0, (now_ms - as_of) / 1000.0)
     age_ms = _f(snap.get("ageMs"))

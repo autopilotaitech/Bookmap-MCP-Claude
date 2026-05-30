@@ -131,11 +131,19 @@ Precedence (first hit wins) and block codes:
 1. `kill_switch_active`   -- `KILL_SWITCH` file present.
 2. `stale_heartbeat`      -- prior heartbeat older than the heartbeat budget
    (30s default). First cycle bootstraps (no prior beat -> not stale).
-3. `stale_market_data`    -- snapshot `asOfMs` older than the market budget
-   (15s default), OR no market timestamp at all (fail-closed: cannot prove
-   freshness -> block).
-4. `sim_broker_unavailable` -- the SIM status read raised (DB unopenable).
-   The order path also fails closed at `sim_place_bracket` (no fake execution).
+3. `stale_market_data`    -- the snapshot's `marketDataAsOfMs` (a BRIDGE/FEED
+   timestamp: `trend_analyzer.updatedAtMs` -> recent trade `nanos` ->
+   `orderbook.generatedNanos`, picked by `dashboard.compute_market_freshness`)
+   older than the market budget (15s default), OR no real market timestamp at
+   all (fail-closed: cannot prove freshness -> block). The dashboard's own
+   compose wall-clock (`composedAtMs`) is diagnostics ONLY and is never used as
+   market freshness -- a frozen bridge keeps compose time advancing.
+4. `sim_broker_unavailable` -- the SIM status read raised (DB unopenable), or
+   `/api/health`'s read-only broker preflight (`OverviewQueries.sim_broker_preflight`:
+   open read-only + `SELECT COUNT(*) FROM orders`) found the DB missing,
+   corrupt, locked, or non-SIM. `sources.sim_db` carries `openable` / `readable`
+   / `error`, not just file-exists. The order path also fails closed at
+   `sim_place_bracket` (no fake execution).
 5. session limits -- `max_trades_reached`, `max_consecutive_losses_reached`,
    `max_loss_reached`, `max_drawdown_reached`.
 

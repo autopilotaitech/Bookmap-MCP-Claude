@@ -443,6 +443,60 @@ def test_evaluation_state_includes_operational_blockers(tmp_path, populated_jour
     assert env["live_blocked"] is True
 
 
+def test_sim_broker_preflight_missing_db(tmp_path, populated_journal):
+    learn = _learn(tmp_path)
+    q = OverviewQueries(populated_journal,
+                        sim_db_path=tmp_path / "nope.db", learn_dir=learn)
+    pf = q.sim_broker_preflight()
+    assert pf["openable"] is False and pf["readable"] is False
+    assert pf["error"]
+    assert q.health()["sources"]["sim_db"]["reachable"] is False
+
+
+def test_sim_broker_preflight_corrupt_db_unavailable(tmp_path, populated_journal):
+    learn = _learn(tmp_path)
+    bad = tmp_path / "corrupt.db"
+    bad.write_bytes(b"this is definitely not a sqlite database " * 16)
+    q = OverviewQueries(populated_journal, sim_db_path=bad, learn_dir=learn)
+    pf = q.sim_broker_preflight()
+    assert pf["readable"] is False
+    assert pf["error"]                       # surfaced, not crashed
+    h = q.health()                           # must not crash
+    assert h["up"] is True
+    assert h["sources"]["sim_db"]["reachable"] is False
+    assert h["sources"]["sim_db"]["error"]
+
+
+def test_sim_broker_preflight_valid_db_ok(tmp_path, populated_journal):
+    from bookmap_mcp.sim_engine import SimEngine
+    db = tmp_path / "sim.db"
+    SimEngine(alias="NQM6", db_path=db, eod_close_hour_ct=None)  # creates schema
+    learn = _learn(tmp_path)
+    q = OverviewQueries(populated_journal, sim_db_path=db, learn_dir=learn)
+    pf = q.sim_broker_preflight()
+    assert pf["openable"] is True and pf["readable"] is True
+    assert pf["error"] is None
+    assert q.health()["sources"]["sim_db"]["reachable"] is True
+
+
+def test_evaluation_state_blocks_on_broker_unavailable(tmp_path, populated_journal):
+    now = int(time.time() * 1000)
+    bad = tmp_path / "corrupt.db"
+    bad.write_bytes(b"not a database")
+    learn = _learn(tmp_path, **{
+        "agent-loop.jsonl":
+            json.dumps({"ts_ms": now, "heartbeat": True, "armed": True,
+                        "action": "NONE"}) + "\n",
+        "scorecard.json": json.dumps({"setups": []}),
+        "runtime-policy.json": json.dumps({})})
+    q = OverviewQueries(populated_journal, sim_db_path=bad, learn_dir=learn)
+    env = q.evaluation_state()
+    codes = [b["code"] for b in env["operational_blockers"]]
+    assert "sim_broker_unavailable" in codes
+    assert env["risk_halt_active"] is True
+    assert env["live_blocked"] is True
+
+
 def test_api_health_endpoint_200(live_server):
     host, port = live_server
     status, body = _get(host, port, "/api/health")

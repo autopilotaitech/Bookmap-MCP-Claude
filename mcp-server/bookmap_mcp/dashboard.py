@@ -5225,6 +5225,53 @@ def cached_fetch_snapshot() -> Dict[str, Any]:
         return snap
 
 
+def compute_market_freshness(trend_analyzer: Any, book: Any,
+                             trades: Any) -> Dict[str, Any]:
+    """Best timestamp PROVING live market/feed freshness (epoch ms), distinct
+    from dashboard compose time.
+
+    A frozen bridge keeps the dashboard composing fresh snapshots from STALE
+    inputs; compose time would mask that. The timestamps below all originate in
+    the BRIDGE/FEED, so they stop advancing when the feed stalls.
+
+    Priority (first valid wins):
+      1. ``trend_analyzer.updatedAtMs`` -- bridge wall-clock; advances while the
+         bridge serves data (proves transport/feed liveness).
+      2. most recent trade event -- ``trades[].nanos`` -> ms (real market
+         activity).
+      3. ``book.generatedNanos`` -- bridge orderbook-generation time -> ms.
+
+    Returns ``{"ms", "source", "reason"}``. ``ms`` is None (with ``reason``)
+    when no real feed timestamp exists, so the downstream risk gate fails
+    closed. Pure: no I/O, no clock read."""
+    def _pos_int(x: Any) -> Optional[int]:
+        try:
+            v = int(float(x))
+        except (TypeError, ValueError):
+            return None
+        return v if v > 0 else None
+
+    ta = trend_analyzer if isinstance(trend_analyzer, dict) else {}
+    upd = _pos_int(ta.get("updatedAtMs"))
+    if upd is not None:
+        return {"ms": upd, "source": "trend_analyzer.updatedAtMs", "reason": None}
+
+    if isinstance(trades, list):
+        ns = [_pos_int(t.get("nanos")) for t in trades if isinstance(t, dict)]
+        ns = [n for n in ns if n is not None]
+        if ns:
+            return {"ms": max(ns) // 1_000_000,
+                    "source": "recent_trade.nanos", "reason": None}
+
+    bk = book if isinstance(book, dict) else {}
+    gen = _pos_int(bk.get("generatedNanos"))
+    if gen is not None:
+        return {"ms": gen // 1_000_000,
+                "source": "orderbook.generatedNanos", "reason": None}
+
+    return {"ms": None, "source": None, "reason": "no_market_feed_timestamp"}
+
+
 def _compose_alias_snapshot(c, cfg, alias: str,
                             ping: Dict[str, Any],
                             instruments: Dict[str, Any],
@@ -5267,14 +5314,21 @@ def _compose_alias_snapshot(c, cfg, alias: str,
     else:
         vwap = vwap_from_trades(trade_list); vwap_source = "ring_buffer_fallback"
 
+    _mf = compute_market_freshness(trend_obj, book, trade_list)
     snap: Dict[str, Any] = {
         "health": "ok",
         "ts": now_et.isoformat(timespec="seconds"),
-        # Epoch-ms compose time of THIS snapshot. Timezone-free market-freshness
-        # source for downstream gates (pax_risk_gate stale_market_data): if the
-        # dashboard/bridge feed freezes, asOfMs stops advancing. Truthful, not
-        # invented -- it is the wall-clock at which this payload was assembled.
-        "asOfMs": int(time.time() * 1000),
+        # composedAtMs: dashboard wall-clock at which THIS snapshot was assembled.
+        # DIAGNOSTICS ONLY -- it advances even if the bridge/feed is frozen, so it
+        # MUST NOT be used as market-data freshness. See compute_market_freshness.
+        "composedAtMs": int(time.time() * 1000),
+        # marketDataAsOfMs: best available BRIDGE/FEED timestamp proving market
+        # data freshness (epoch ms), or null when none exists -> downstream gate
+        # fails closed. marketFreshnessSource names its origin; marketFreshnessReason
+        # is set only when no real feed timestamp was available.
+        "marketDataAsOfMs": _mf["ms"],
+        "marketFreshnessSource": _mf["source"],
+        "marketFreshnessReason": _mf["reason"],
         # Top-level mirror of gates.session so consumers (Heatwave parser,
         # journals, debug UIs) don't have to drill into gates. The session
         # anchor is operator-driven via the OpenRange indicator settings
