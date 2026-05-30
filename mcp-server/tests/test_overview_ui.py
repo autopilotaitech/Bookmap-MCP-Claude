@@ -143,6 +143,140 @@ def test_agent_feed_uses_current_contiguous_heartbeat_epoch(tmp_path, populated_
     assert summary["armed"] is False
 
 
+def test_current_session_hides_old_sim_fills_and_pnl(tmp_path, populated_journal):
+    import sqlite3
+    from bookmap_mcp.sim_engine import SimEngine
+
+    db = tmp_path / "sim.db"
+    SimEngine(alias="NQM6.CME@RITHMIC", db_path=db, eod_close_hour_ct=None)
+    old = int(time.time() * 1000) - 86_400_000
+    with sqlite3.connect(db) as c:
+        c.execute(
+            "INSERT INTO orders(alias, side, type, qty, status, placed_ms, "
+            "filled_ms, filled_price, filled_qty, role, reason) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            ("NQM6.CME@RITHMIC", "BUY", "LIMIT", 1, "FILLED",
+             old - 1000, old, 30000.0, 1, "ENTRY", "old session"))
+        c.execute(
+            "UPDATE positions SET realized_pnl=?, updated_ms=? WHERE alias=?",
+            (520.0, old, "NQM6.CME@RITHMIC"))
+    now = int(time.time() * 1000)
+    hb = {
+        "ts_ms": now, "heartbeat": True, "armed": False, "action": "NONE",
+        "replay_input": {
+            "version": 1,
+            "snapshot": {"marketDataAsOfMs": now},
+            "status": {
+                "position": {"size": 0, "avg_price": 0.0},
+                "working": [], "fills_today": [],
+                "realized_today_usd": 0.0,
+            },
+            "now_ms": now,
+            "market_age_sec": 0.0,
+            "heartbeat_age_sec": 0.0,
+            "sim_broker_ok": True,
+            "kill_switch_active": False,
+        },
+    }
+    learn = _learn(tmp_path, **{"agent-loop.jsonl": json.dumps(hb) + "\n"})
+    q = OverviewQueries(populated_journal, sim_db_path=db, learn_dir=learn)
+
+    assert q.enveloped("fills")["items"] == []
+    assert q.enveloped("equity")["realized"] == 0.0
+    summary = q.agent_summary()
+    assert summary["realized"] == 0.0
+    assert summary["wins"] == 0
+    assert summary["losses"] == 0
+    assert summary["position"]["realized_pnl"] == 0.0
+    assert summary["position"]["cumulative_realized_pnl"] == 520.0
+
+
+def test_health_market_uses_agent_replay_input_when_journal_stale(
+        tmp_path, populated_journal):
+    from bookmap_mcp.sim_engine import SimEngine
+
+    db = tmp_path / "sim.db"
+    SimEngine(alias="NQM6.CME@RITHMIC", db_path=db, eod_close_hour_ct=None)
+    now = int(time.time() * 1000)
+    hb = {
+        "ts_ms": now, "heartbeat": True, "armed": False, "action": "NONE",
+        "replay_input": {
+            "version": 1,
+            "snapshot": {"marketDataAsOfMs": now},
+            "status": {"position": {"size": 0}},
+            "now_ms": now,
+            "market_age_sec": 0.0,
+            "heartbeat_age_sec": 0.0,
+            "sim_broker_ok": True,
+            "kill_switch_active": False,
+        },
+    }
+    learn = _learn(tmp_path, **{"agent-loop.jsonl": json.dumps(hb) + "\n"})
+    q = OverviewQueries(populated_journal, sim_db_path=db, learn_dir=learn)
+
+    h = q.health()
+    assert h["sources"]["market"]["is_stale"] is False
+    assert h["sources"]["market"]["freshness_source"] == (
+        "heartbeat.replay_input.snapshot.marketDataAsOfMs")
+    assert h["risk_halt_code"] is None
+    assert h["sources"]["sim_db"]["is_stale"] is False
+
+
+def test_trade_state_explains_position_orders_decision_and_risk(
+        tmp_path, populated_journal):
+    from bookmap_mcp.sim_engine import SimEngine
+
+    db = tmp_path / "sim.db"
+    SimEngine(alias="NQM6.CME@RITHMIC", db_path=db, eod_close_hour_ct=None)
+    now = int(time.time() * 1000)
+    working = [
+        {"role": "ENTRY", "side": "BUY", "type": "STOP_LIMIT", "qty": 2,
+         "stop_price": 30350.0, "limit_price": 30350.25},
+        {"role": "STOP", "side": "SELL", "type": "STOP_LIMIT", "qty": 2,
+         "stop_price": 30320.0, "limit_price": 30319.75},
+        {"role": "TP", "side": "SELL", "type": "LIMIT", "qty": 1,
+         "limit_price": 30375.0},
+    ]
+    hb = {
+        "ts_ms": now, "heartbeat": True, "armed": True,
+        "action": "PLACE_LONG", "baseline_state": "ENTER",
+        "governor": "ok", "rationale": "test long read",
+        "setup_type": "OR_BREAK", "mid": 30345.0,
+        "order": {"side": "BUY", "qty": 2},
+        "replay_input": {
+            "version": 1,
+            "snapshot": {"marketDataAsOfMs": now},
+            "status": {
+                "position": {"size": 2, "avg_price": 30345.0},
+                "working": working,
+                "fills_today": [],
+                "losers_today": 1,
+                "realized_today_usd": -25.0,
+            },
+            "now_ms": now,
+            "market_age_sec": 0.0,
+            "heartbeat_age_sec": 0.0,
+            "sim_broker_ok": True,
+            "kill_switch_active": False,
+        },
+    }
+    learn = _learn(tmp_path, **{"agent-loop.jsonl": json.dumps(hb) + "\n"})
+    q = OverviewQueries(populated_journal, sim_db_path=db, learn_dir=learn)
+    ts = q.enveloped("trade_state")
+
+    assert ts["position"]["side"] == "LONG"
+    assert ts["position"]["size"] == 2
+    assert len(ts["orders"]["entries"]) == 1
+    assert len(ts["orders"]["stops"]) == 1
+    assert len(ts["orders"]["targets"]) == 1
+    assert ts["orders"]["trail_status"] == "not_configured"
+    assert ts["decision"]["action"] == "PLACE_LONG"
+    assert ts["decision"]["long_reads"] == 1
+    assert ts["risk"]["losers_today"] == 1
+    assert ts["risk"]["realized_today_usd"] == -25.0
+    assert ts["_meta"]["source"] == "heartbeat"
+
+
 def test_learning_status_reads_persisted_artifacts(tmp_path, populated_journal):
     learn = tmp_path / "learn"
     learn.mkdir()
@@ -689,11 +823,12 @@ def test_html_page_constant_has_dashboard_panels():
     """Independent check on the page template — the quant-desk panels and the
     self-contained SVG equity chart renderer are present."""
     for marker in ('id="stats"', 'id="equity"', 'id="feed"', 'id="calib"',
-                   'id="settings"', '/api/cron_status',
+                   'id="settings"', '/api/trade_state',
                    '/api/learning_status',
                    'id="lessons"', 'id="working"', 'id="fills"',
                    'function equityChart', 'function bars('):
         assert marker in _PAGE_HTML, f"missing dashboard panel: {marker}"
+    assert "/api/cron_status" not in _PAGE_HTML
     # Charts are hand-drawn SVG -- no external chart library dependency.
     assert "<svg" in _PAGE_HTML
     assert "<script src=" not in _PAGE_HTML, "must stay self-contained (no CDN)"

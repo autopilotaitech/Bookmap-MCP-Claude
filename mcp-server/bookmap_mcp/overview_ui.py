@@ -165,15 +165,36 @@ class OverviewQueries:
 
     def current_position(self) -> Optional[Dict[str, Any]]:
         c = self._sim()
+        status, status_ts = self._latest_agent_status()
+        agent_pos = status.get("position") if isinstance(status, dict) else None
         if c is None: return None
         try:
             row = c.execute("SELECT * FROM positions ORDER BY updated_ms DESC "
                               "LIMIT 1").fetchone()
-            return dict(row) if row else None
+            out = dict(row) if row else {}
+            if isinstance(agent_pos, dict):
+                # The positions table is cumulative for the SIM DB. During a
+                # fresh playback/observe session that makes the UI show old P&L
+                # as current. Prefer the latest heartbeat's session-scoped SIM
+                # status for the current operator view, while preserving the
+                # cumulative value for audit.
+                if "realized_pnl" in out:
+                    out["cumulative_realized_pnl"] = out["realized_pnl"]
+                out["size"] = agent_pos.get("size", out.get("size", 0))
+                out["avg_price"] = agent_pos.get("avg_price", out.get("avg_price", 0.0))
+                out["realized_pnl"] = status.get(
+                    "realized_today_usd", out.get("realized_pnl", 0.0))
+                out["session_status_ts_ms"] = status_ts
+                out["session_source"] = "latest_agent_replay_input"
+            return out if out else None
         finally:
             c.close()
 
     def working_orders(self) -> List[Dict[str, Any]]:
+        status, _status_ts = self._latest_agent_status()
+        working = status.get("working") if isinstance(status, dict) else None
+        if isinstance(working, list):
+            return [w for w in working if isinstance(w, dict)]
         c = self._sim()
         if c is None: return []
         try:
@@ -288,6 +309,121 @@ class OverviewQueries:
             prev_ts = ts
         return list(reversed(current))
 
+    def _active_session_bounds(self) -> Tuple[Optional[int], Optional[int]]:
+        feed = self.agent_feed(limit=500)
+        if not feed:
+            return None, None
+        first = int(feed[0].get("ts_ms") or 0) or None
+        last = int(feed[-1].get("ts_ms") or 0) or None
+        return first, last
+
+    def _latest_agent_status(self) -> Tuple[Dict[str, Any], Optional[int]]:
+        feed = self.agent_feed(limit=20)
+        for rec in reversed(feed):
+            ri = rec.get("replay_input")
+            if isinstance(ri, dict) and isinstance(ri.get("status"), dict):
+                return ri["status"], int(rec.get("ts_ms") or 0) or None
+        return {}, None
+
+    def _latest_agent_market_ms(self) -> Tuple[Optional[int], Optional[str]]:
+        feed = self.agent_feed(limit=20)
+        for rec in reversed(feed):
+            ri = rec.get("replay_input")
+            snap = ri.get("snapshot") if isinstance(ri, dict) else None
+            if not isinstance(snap, dict):
+                continue
+            for key in ("marketDataAsOfMs", "marketAsOfMs"):
+                try:
+                    val = int(snap.get(key) or 0)
+                except (TypeError, ValueError):
+                    val = 0
+                if val > 0:
+                    return val, f"heartbeat.replay_input.snapshot.{key}"
+        return None, None
+
+    def trade_state(self) -> Dict[str, Any]:
+        """Current-session operator state for the dashboard.
+
+        This is deliberately session-scoped. The SIM DB is cumulative; the
+        operator panel must answer what the active bot session is doing now,
+        not replay old fills as if they belong to the current playback.
+        """
+        feed = self.agent_feed(limit=500)
+        start, last_ts = self._active_session_bounds()
+        status, status_ts = self._latest_agent_status()
+        last = feed[-1] if feed else None
+        position = self.current_position() or {}
+        working = self.working_orders()
+        fills = self.recent_fills(limit=12, since_ms=start)
+        equity = self.equity_curve(since_ms=start)
+
+        stops = [o for o in working if str(o.get("role") or "").upper() == "STOP"]
+        targets = [o for o in working if str(o.get("role") or "").upper() == "TP"]
+        entries = [o for o in working if str(o.get("role") or "").upper() == "ENTRY"]
+        vetoes = [r for r in feed
+                  if str(r.get("governor") or "").startswith("VETO")
+                  or r.get("risk_halt") or r.get("risk_halt_code")]
+        executed = [r for r in feed if r.get("executed")]
+        long_reads = sum(1 for r in feed if "LONG" in str(r.get("action") or ""))
+        short_reads = sum(1 for r in feed if "SHORT" in str(r.get("action") or ""))
+        size = int(position.get("size") or 0)
+        side = "LONG" if size > 0 else "SHORT" if size < 0 else "FLAT"
+        last_order = last.get("order") if isinstance(last, dict) else None
+        replay_status = status if isinstance(status, dict) else {}
+        return {
+            "session": {
+                "start_ms": start,
+                "last_ms": last_ts,
+                "heartbeat_status_ms": status_ts,
+                "cycles": len(feed),
+                "armed": bool(last.get("armed")) if last else False,
+            },
+            "position": {
+                **position,
+                "side": side,
+                "session_realized_pnl": equity.get("realized", 0.0),
+            },
+            "orders": {
+                "working": working,
+                "entries": entries,
+                "stops": stops,
+                "targets": targets,
+                "trail_status": "not_configured",
+                "last_order": last_order,
+            },
+            "fills": fills,
+            "pnl": {
+                "realized": equity.get("realized", 0.0),
+                "wins": equity.get("wins", 0),
+                "losses": equity.get("losses", 0),
+                "points": equity.get("points", []),
+            },
+            "decision": {
+                "last": last,
+                "action": last.get("action") if last else None,
+                "baseline_state": last.get("baseline_state") if last else None,
+                "governor": last.get("governor") if last else None,
+                "rationale": last.get("rationale") if last else None,
+                "setup_type": last.get("setup_type") if last else None,
+                "level": last.get("level") if last else None,
+                "mid": last.get("mid") if last else None,
+                "long_reads": long_reads,
+                "short_reads": short_reads,
+                "executed_count": len(executed),
+                "veto_count": len(vetoes),
+                "last_veto": vetoes[-1] if vetoes else None,
+            },
+            "risk": {
+                "kill_switch_active": self.kill_switch_active(),
+                "risk_halt_active": bool(vetoes and vetoes[-1].get("risk_halt")),
+                "last_risk_halt": vetoes[-1] if vetoes else None,
+                "losers_today": replay_status.get("losers_today"),
+                "realized_today_usd": replay_status.get("realized_today_usd"),
+                "working_stop_count": len(stops),
+                "working_target_count": len(targets),
+            },
+        }
+
     def calibration(self) -> Dict[str, Any]:
         try:
             return json.loads((self.learn_dir / "calibration.json").read_text(
@@ -329,15 +465,22 @@ class OverviewQueries:
         except OSError:
             return []
 
-    def equity_curve(self, limit: int = 1000) -> Dict[str, Any]:
+    def equity_curve(self, limit: int = 1000,
+                     since_ms: Optional[int] = None) -> Dict[str, Any]:
         c = self._sim()
         if c is None:
             return {"points": [], "realized": 0.0}
         try:
+            where = "WHERE kind='POSITION_UPDATE'"
+            params: List[Any] = []
+            if since_ms is not None:
+                where += " AND ts_ms>=?"
+                params.append(int(since_ms))
+            params.append(limit)
             rows = c.execute(
                 "SELECT ts_ms, json_extract(payload,'$.realized_delta') AS rd "
-                "FROM events WHERE kind='POSITION_UPDATE' ORDER BY ts_ms LIMIT ?",
-                (limit,)).fetchall()
+                f"FROM events {where} ORDER BY ts_ms LIMIT ?",
+                tuple(params)).fetchall()
             cum = 0.0
             pts: List[Dict[str, Any]] = []
             wins = losses = 0
@@ -354,15 +497,22 @@ class OverviewQueries:
         finally:
             c.close()
 
-    def recent_fills(self, limit: int = 30) -> List[Dict[str, Any]]:
+    def recent_fills(self, limit: int = 30,
+                     since_ms: Optional[int] = None) -> List[Dict[str, Any]]:
         c = self._sim()
         if c is None:
             return []
         try:
+            where = "WHERE status='FILLED'"
+            params: List[Any] = []
+            if since_ms is not None:
+                where += " AND filled_ms>=?"
+                params.append(int(since_ms))
+            params.append(limit)
             rows = c.execute(
                 "SELECT id, side, type, qty, filled_price, filled_ms, role, "
-                "reason, decision_tag FROM orders WHERE status='FILLED' "
-                "ORDER BY filled_ms DESC LIMIT ?", (limit,)).fetchall()
+                f"reason, decision_tag FROM orders {where} "
+                "ORDER BY filled_ms DESC LIMIT ?", tuple(params)).fetchall()
             return [dict(r) for r in rows]
         except sqlite3.OperationalError:
             return []
@@ -372,11 +522,12 @@ class OverviewQueries:
     def agent_summary(self) -> Dict[str, Any]:
         from collections import Counter
         feed = self.agent_feed(limit=500)
+        session_start = int(feed[0].get("ts_ms") or 0) if feed else None
         acts: Counter = Counter(f.get("action") or "?" for f in feed)
         executed = sum(1 for f in feed if f.get("executed"))
         vetoes = sum(1 for f in feed if str(f.get("governor") or "").startswith("VETO"))
         deviations = sum(1 for f in feed if f.get("deviates"))
-        eq = self.equity_curve()
+        eq = self.equity_curve(since_ms=session_start)
         pos = self.current_position()
         last = feed[-1] if feed else None
         armed = bool(last.get("armed")) if last else False
@@ -485,25 +636,31 @@ class OverviewQueries:
                 data, source="journal", source_path=jp,
                 updated_at_ms=self._journal_max_ms("snapshots"))
         if name == "position":
+            _start, last = self._active_session_bounds()
             return pax_freshness.envelope(
-                self.current_position(), source="sim_db", source_path=sp,
-                updated_at_ms=self._sim_max_ms("filled_ms"))
+                self.current_position(), source="sim_db_session",
+                source_path=sp, updated_at_ms=last or self._sim_max_ms("filled_ms"))
         if name == "working":
             return pax_freshness.envelope(
                 self.working_orders(), source="sim_db", source_path=sp,
                 updated_at_ms=self._sim_max_ms(
                     "placed_ms", "WHERE status IN ('WORKING','TRIGGERED')"))
         if name == "fills":
+            start, last = self._active_session_bounds()
+            fills = self.recent_fills(since_ms=start)
+            fill_ts = max((int(f.get("filled_ms") or 0) for f in fills),
+                          default=0) or None
             return pax_freshness.envelope(
-                self.recent_fills(), source="sim_db", source_path=sp,
-                updated_at_ms=self._sim_max_ms("filled_ms",
-                                               "WHERE status='FILLED'"))
+                fills, source="sim_db_session", source_path=sp,
+                updated_at_ms=fill_ts or last)
         if name == "equity":
-            eq = self.equity_curve()
+            start, last = self._active_session_bounds()
+            eq = self.equity_curve(since_ms=start)
             pts = eq.get("points") or []
             last_ts = pts[-1]["ts"] if pts else None
-            return pax_freshness.envelope(eq, source="sim_db", source_path=sp,
-                                          updated_at_ms=last_ts)
+            return pax_freshness.envelope(
+                eq, source="sim_db_session", source_path=sp,
+                updated_at_ms=last_ts or last)
         if name == "daily_stats":
             return pax_freshness.envelope(
                 self.daily_stats(), source="journal", source_path=jp,
@@ -561,6 +718,12 @@ class OverviewQueries:
                 self.lessons(), source="learn_file",
                 source_path=str(self.learn_dir / "sim_lessons.md"),
                 updated_at_ms=_mtime_ms(self.learn_dir / "sim_lessons.md"))
+        if name == "trade_state":
+            ts, mode = self._heartbeat_mode()
+            return pax_freshness.envelope(
+                self.trade_state(), source="heartbeat",
+                source_path=str(self.learn_dir / "agent-loop.jsonl"),
+                updated_at_ms=ts, mode=mode)
         if name == "cron_status":
             return pax_freshness.envelope(self.cron_status(),
                                           source="task_scheduler",
@@ -583,7 +746,8 @@ class OverviewQueries:
         now = pax_freshness.now_ms() if now is None else now
         hb_ms, _mode = self._heartbeat_mode()
         hb_stale = bool(pax_freshness.staleness(hb_ms, "heartbeat", now)["is_stale"])
-        snap_ms = self._journal_max_ms("snapshots")
+        agent_market_ms, _agent_market_source = self._latest_agent_market_ms()
+        snap_ms = agent_market_ms or self._journal_max_ms("snapshots")
         market_stale = bool(
             pax_freshness.staleness(snap_ms, "market", now)["is_stale"])
         pf = self.sim_broker_preflight()
@@ -645,18 +809,28 @@ class OverviewQueries:
         now = pax_freshness.now_ms()
         sources: Dict[str, Any] = {}
 
-        snap_ms = self._journal_max_ms("snapshots")
+        agent_market_ms, agent_market_source = self._latest_agent_market_ms()
+        snap_ms = agent_market_ms or self._journal_max_ms("snapshots")
         sources["market"] = pax_freshness.staleness(snap_ms, "market", now)
         sources["market"]["source"] = "market"
-        sources["market"]["source_path"] = str(self.journal_path)
+        sources["market"]["source_path"] = (
+            str(self.learn_dir / "agent-loop.jsonl")
+            if agent_market_ms else str(self.journal_path))
+        sources["market"]["freshness_source"] = (
+            agent_market_source or "journal.snapshots.MAX(ts_ms)")
 
-        sim_ms = self._sim_max_ms("placed_ms")
-        sources["sim_db"] = pax_freshness.staleness(sim_ms, "sim_db", now)
-        sources["sim_db"]["source"] = "sim_db"
         # Reachability is a real read-only preflight (openable AND a minimal
         # schema query succeeds), not mere file existence -- a corrupt/locked/
         # non-SIM DB is reported unavailable with its error.
         pf = self.sim_broker_preflight()
+        sim_reachable = bool(pf["openable"] and pf["readable"])
+        # SIM DB is event-driven; "no new orders" must not make the broker look
+        # stale during observe/playback. A successful preflight is current
+        # evidence that the broker DB is usable. Order/fill endpoints carry
+        # their own session-scoped timestamps.
+        sim_ms = now if sim_reachable else self._sim_max_ms("placed_ms")
+        sources["sim_db"] = pax_freshness.staleness(sim_ms, "sim_db", now)
+        sources["sim_db"]["source"] = "sim_db"
         sources["sim_db"]["reachable"] = bool(pf["openable"] and pf["readable"])
         sources["sim_db"]["openable"] = pf["openable"]
         sources["sim_db"]["readable"] = pf["readable"]
@@ -977,7 +1151,7 @@ def _build_handler(queries: OverviewQueries) -> type:
                     "/api/agent_feed", "/api/cron_status", "/api/calibration",
                     "/api/learning_scorecard", "/api/runtime_policy",
                     "/api/learning_status", "/api/equity", "/api/fills",
-                    "/api/lessons",
+                    "/api/lessons", "/api/trade_state",
                 }
                 if path in _ENVELOPED:
                     return _json_response(self,
@@ -1093,7 +1267,7 @@ _PAGE_HTML = """<!doctype html>
         <div id="calib"></div>
       </div>
       <div class="card gap">
-        <div class="ttl">Settings</div>
+        <div class="ttl">Runtime &amp; risk state</div>
         <div id="settings" class="mono">loading...</div>
       </div>
       <div class="card gap">
@@ -1171,12 +1345,38 @@ function feedRow(r){
     (r.armed?'<b>['+'ARMED'+']</b> ':'')+esc(a)+(why?' <span class="why">'+why+'</span>':'')+'</div>';
 }
 
+function runtimeState(ts,health){
+  const p=(ts&&ts.position)||{}, o=(ts&&ts.orders)||{}, d=(ts&&ts.decision)||{}, r=(ts&&ts.risk)||{};
+  const side=p.side||'FLAT';
+  const sideCls=side==='LONG'?'pos':side==='SHORT'?'neg':'mut';
+  const stopTxt=(o.stops||[]).map(x=>(x.stop_price||x.limit_price||'--')+' x'+(x.qty||'')).join(', ') || 'none';
+  const tpTxt=(o.targets||[]).map(x=>(x.limit_price||'--')+' x'+(x.qty||'')).join(', ') || 'none';
+  const entryTxt=(o.entries||[]).map(x=>esc(x.side||'')+' '+esc(x.type||'')+' '+(x.limit_price||x.stop_price||'--')).join(', ') || 'none';
+  const halt=(health&&health.risk_halt_active)?(health.risk_halt_code||'active'):'clear';
+  return '<div><b>mode</b> '+esc(((ts.session||{}).armed?'ARMED SIM':'observe'))+
+    ' &middot; <b>live</b> blocked &middot; <b>risk</b> '+esc(halt)+'</div>'+
+    '<div><b>position</b> <span class="'+sideCls+'">'+esc(side)+' '+(p.size||0)+'</span>'+
+    (p.avg_price?(' @ '+Number(p.avg_price).toFixed(2)):'')+
+    ' &middot; session P&L '+money(p.session_realized_pnl||0)+'</div>'+
+    '<div><b>entry</b> '+entryTxt+'</div>'+
+    '<div><b>stop</b> '+esc(stopTxt)+' &middot; <b>targets</b> '+esc(tpTxt)+
+    ' &middot; <b>trail</b> '+esc(o.trail_status||'unknown')+'</div>'+
+    '<div><b>last decision</b> '+esc(d.action||'--')+' / '+esc(d.baseline_state||'--')+
+    ' / '+esc(d.governor||'--')+'</div>'+
+    '<div class="mut">'+esc(d.rationale||'no rationale')+'</div>'+
+    '<div><b>reads</b> long '+(d.long_reads||0)+' &middot; short '+(d.short_reads||0)+
+    ' &middot; executed '+(d.executed_count||0)+' &middot; veto '+(d.veto_count||0)+'</div>'+
+    '<div><b>risk counters</b> losers '+esc(r.losers_today==null?'--':r.losers_today)+
+    ' &middot; realized_today '+money(r.realized_today_usd||0)+
+    ' &middot; working stops '+(r.working_stop_count||0)+'</div>';
+}
+
 async function refresh(){
   try{
-    const [sum,feed,calib,eq,fills,pos,working,cron,learn]=await Promise.all([
+    const [sum,feed,calib,eq,fills,pos,working,learn,ts,health]=await Promise.all([
       J('/api/agent_summary'),J('/api/agent_feed'),J('/api/calibration'),
       J('/api/equity'),J('/api/fills'),J('/api/position'),J('/api/working'),
-      J('/api/cron_status'),J('/api/learning_status')]);
+      J('/api/learning_status'),J('/api/trade_state'),J('/api/health')]);
 
     const sm=meta(sum);
     const stale=!!sm.is_stale, mode=sm.mode||(sum.armed?'armed':'observe');
@@ -1205,22 +1405,9 @@ async function refresh(){
     $('equity').innerHTML=equityChart(eq.points);
     const feedArr=arr(feed);
     $('feed').innerHTML=feedArr.slice().reverse().map(feedRow).join('')||'<div class="mut">waiting for agent...</div>';
-    if(cron && cron.installed){
-      const hidden = String(cron.execute||'').toLowerCase().indexOf('pythonw.exe')>=0;
-      const mode = String(cron.arguments||'').indexOf('--armed')>=0 ? 'ARMED' : 'observe';
-      $('settings').innerHTML =
-        '<div><span class="dot '+(cron.state==='Running'?'on':'')+'"></span>'+
-        'cron '+esc(cron.state)+' &middot; '+mode+'</div>'+
-        '<div>next: '+esc(cron.nextRunTime||'--')+' &middot; last result: '+esc(cron.lastTaskResult)+'</div>'+
-        '<div>runner: '+(hidden?'hidden pythonw':'visible python')+'</div>'+
-        '<div class="mut">'+esc(cron.arguments||'')+'</div>'+
-        '<div>learning: '+(learn.setup_count||0)+' setup buckets &middot; '+
-        (learn.suggestion_count||0)+' runtime suggestions</div>';
-    }else{
-      $('settings').innerHTML='<div class="mut">PaxAgentCron not installed</div>'+
-        '<div>learning: '+(learn.setup_count||0)+' setup buckets &middot; '+
-        (learn.suggestion_count||0)+' runtime suggestions</div>';
-    }
+    $('settings').innerHTML=runtimeState(ts,health)+
+      '<div class="mut">learning: '+(learn.setup_count||0)+' setup buckets &middot; '+
+      (learn.suggestion_count||0)+' runtime suggestions</div>';
 
     $('calib').innerHTML=
       '<div style="display:flex;gap:8px;margin-bottom:10px">'+
