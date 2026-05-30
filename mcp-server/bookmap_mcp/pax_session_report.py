@@ -37,6 +37,8 @@ def build_session_report(*,
     vetoes: List[Dict[str, Any]] = []
     executions: List[Dict[str, Any]] = []
     blocked: List[Dict[str, Any]] = []
+    risk_halts: List[Dict[str, Any]] = []
+    halt_codes: Counter = Counter()
     malformed = 0
 
     for rec in feed:
@@ -55,10 +57,23 @@ def build_session_report(*,
                            "reason": gov})
             blocked.append({"ts_ms": rec.get("ts_ms"), "action": act,
                             "reason": gov})
+        halt_code = rec.get("risk_halt_code") or rec.get("risk_halt")
+        if halt_code:
+            halt_codes[str(halt_code)] += 1
+            risk_halts.append({"ts_ms": rec.get("ts_ms"), "action": act,
+                               "code": str(halt_code),
+                               "message": rec.get("risk_halt_message")})
         if rec.get("executed") and rec.get("order"):
             executions.append({"ts_ms": rec.get("ts_ms"), "action": act,
                                "setup_type": rec.get("setup_type"),
                                "order": rec.get("order")})
+
+    # Categorize enforced operational halts (pax_risk_gate vocabulary).
+    _STALE_CODES = ("stale_heartbeat", "stale_market_data")
+    _SESSION_CODES = ("max_trades_reached", "max_consecutive_losses_reached",
+                      "max_loss_reached", "max_drawdown_reached")
+    stale_data_blocks = sum(halt_codes.get(c, 0) for c in _STALE_CODES)
+    session_limit_blocks = sum(halt_codes.get(c, 0) for c in _SESSION_CODES)
 
     wins = int(equity.get("wins") or 0)
     losses = int(equity.get("losses") or 0)
@@ -90,6 +105,15 @@ def build_session_report(*,
             "veto_count": len(vetoes),
             "list": vetoes[-50:],
         },
+        "risk_halts": {
+            "count": len(risk_halts),
+            "by_code": dict(halt_codes),
+            "kill_switch": halt_codes.get("kill_switch_active", 0),
+            "stale_data": stale_data_blocks,
+            "sim_broker": halt_codes.get("sim_broker_unavailable", 0),
+            "session_limits": session_limit_blocks,
+            "recent": risk_halts[-50:],
+        },
         "pnl": {
             "realized_usd": equity.get("realized", 0.0),
             "wins": wins,
@@ -105,6 +129,7 @@ def build_session_report(*,
         },
         "stale_data_events": {
             "malformed_records": malformed,
+            "stale_data_blocks": stale_data_blocks,
         },
         "evaluation_state": eval_state,
     }

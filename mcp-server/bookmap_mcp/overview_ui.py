@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import pax_freshness, pax_roles, pax_eval_state
+from . import pax_freshness, pax_roles, pax_eval_state, pax_risk_gate
 
 
 def _mtime_ms(path: Path) -> Optional[int]:
@@ -529,11 +529,39 @@ class OverviewQueries:
     def kill_switch_active(self) -> bool:
         return (self.learn_dir / "KILL_SWITCH").exists()
 
+    def _ops_status(self, now: Optional[int] = None) -> Dict[str, Any]:
+        """Operational freshness/availability flags shared by eval + health,
+        keyed to the same staleness budgets the live gate uses."""
+        now = pax_freshness.now_ms() if now is None else now
+        hb_ms, _mode = self._heartbeat_mode()
+        hb_stale = bool(pax_freshness.staleness(hb_ms, "heartbeat", now)["is_stale"])
+        snap_ms = self._journal_max_ms("snapshots")
+        market_stale = bool(
+            pax_freshness.staleness(snap_ms, "market", now)["is_stale"])
+        sim_reachable = (self.sim_db_path is not None
+                         and Path(self.sim_db_path).exists())
+        return {"heartbeat_stale": hb_stale, "market_stale": market_stale,
+                "sim_broker_unavailable": not sim_reachable}
+
+    def _last_risk_halt_record(self, limit: int = 200) -> Optional[Dict[str, Any]]:
+        """Most recent agent-loop record that carried an enforced risk halt."""
+        for rec in reversed(self.agent_feed(limit=limit)):
+            code = rec.get("risk_halt_code") or rec.get("risk_halt")
+            if code:
+                return {"ts_ms": rec.get("ts_ms"), "risk_halt_code": code,
+                        "risk_halt_message": rec.get("risk_halt_message"),
+                        "governor": rec.get("governor")}
+        return None
+
     def evaluation_state(self) -> Dict[str, Any]:
         summary = self.agent_summary()
         eq = self.equity_curve()
         ts, _mode = self._heartbeat_mode()
-        hb_stale = bool(pax_freshness.staleness(ts, "heartbeat")["is_stale"])
+        # Restriction is driven by CURRENT operational state (real-time stale /
+        # broker flags), never a historical halt record -- a past max_trades
+        # block must not pin the next session into restriction.
+        ops = self._ops_status()
+        hb_stale = ops["heartbeat_stale"]
         state = pax_eval_state.compute_eval_state(
             scorecard=self.learning_scorecard(),
             runtime_policy=self.runtime_policy(),
@@ -544,8 +572,7 @@ class OverviewQueries:
                 "wins": eq.get("wins"),
                 "losses": eq.get("losses"),
             },
-            ops={"heartbeat_stale": hb_stale,
-                 "malformed_count": 0},
+            ops={**ops, "malformed_count": 0},
             kill_switch_active=self.kill_switch_active(),
         )
         return pax_freshness.envelope(
@@ -598,6 +625,28 @@ class OverviewQueries:
         except Exception:
             eval_level, live_blocked = None, True
 
+        # Enforced operational risk-halt summary. Same vocabulary + precedence
+        # as pax_risk_gate so health, eval, and the live gate agree on truth.
+        ks = self.kill_switch_active()
+        hb_stale = bool(sources["heartbeat"].get("is_stale"))
+        market_stale = bool(sources["market"].get("is_stale"))
+        broker_unavailable = not bool(sources["sim_db"].get("reachable"))
+        halt_code: Optional[str] = None
+        halt_message: Optional[str] = None
+        if ks:
+            halt_code, halt_message = (pax_risk_gate.KILL_SWITCH,
+                                       "operator kill switch engaged")
+        elif hb_stale:
+            halt_code, halt_message = (pax_risk_gate.STALE_HEARTBEAT,
+                                       "agent heartbeat stale")
+        elif market_stale:
+            halt_code, halt_message = (pax_risk_gate.STALE_MARKET,
+                                       "market data stale")
+        elif broker_unavailable:
+            halt_code, halt_message = (pax_risk_gate.SIM_BROKER_UNAVAILABLE,
+                                       "SIM broker DB unavailable")
+        last_halt = self._last_risk_halt_record()
+
         return {
             "service": "pax_overview_ui",
             "up": True,
@@ -607,7 +656,11 @@ class OverviewQueries:
             "sources": sources,
             "is_stale": agg["is_stale"],
             "stale_sources": agg["stale_sources"],
-            "kill_switch_active": self.kill_switch_active(),
+            "kill_switch_active": ks,
+            "risk_halt_active": halt_code is not None,
+            "risk_halt_code": halt_code,
+            "risk_halt_message": halt_message,
+            "last_risk_halt_record": last_halt,
             "evaluation_level": eval_level,
             "live_blocked": live_blocked,
         }

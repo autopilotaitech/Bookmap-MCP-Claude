@@ -116,6 +116,69 @@ Remove the file to resume. Flatten/cancel (risk-reducing) are not blocked by
 the backstop. **This does NOT enable live trading** -- live remains hard-blocked
 (see "Live trading blockers"); the kill switch only stops SIM placement.
 
+### Enforced operational risk gates (before SIM entry placement)
+
+`pax_risk_gate.py` is the unified, pure, deterministic operational halt gate. It
+sits at the LAST safe point before SIM placement in both the rule heartbeat
+(`pax_sim_agent.AgentLoop._cycle_once`, armed) and the LLM path
+(`pax_sim_agent.decide_cycle`). It applies to NEW ENTRY placement only --
+risk-reducing flatten/cancel are never blocked (the kill switch is the sole
+exception that halts an acting plan). The LLM cannot override it
+(`llm_overrode_risk` is always false). It never unlocks live trading.
+
+Precedence (first hit wins) and block codes:
+
+1. `kill_switch_active`   -- `KILL_SWITCH` file present.
+2. `stale_heartbeat`      -- prior heartbeat older than the heartbeat budget
+   (30s default). First cycle bootstraps (no prior beat -> not stale).
+3. `stale_market_data`    -- snapshot `asOfMs` older than the market budget
+   (15s default), OR no market timestamp at all (fail-closed: cannot prove
+   freshness -> block).
+4. `sim_broker_unavailable` -- the SIM status read raised (DB unopenable).
+   The order path also fails closed at `sim_place_bracket` (no fake execution).
+5. session limits -- `max_trades_reached`, `max_consecutive_losses_reached`,
+   `max_loss_reached`, `max_drawdown_reached`.
+
+Every block writes a clean unified audit record (no broker receipt):
+`governor` = `VETO: <code>`, `risk_halt` / `risk_halt_code` = `<code>`,
+`risk_halt_message`, `risk_halt_detail` (counters + config used),
+`executed` = false, `order` = null, `llm_overrode_risk` = false.
+
+Config (env overrides; defaults are conservative-but-not-blocking for SIM):
+
+| env var                       | default | gate                          |
+|-------------------------------|---------|-------------------------------|
+| `PAX_STALE_SEC_HEARTBEAT`     | 30      | stale_heartbeat budget (s)    |
+| `PAX_STALE_SEC_MARKET`        | 15      | stale_market_data budget (s)  |
+| `PAX_RISK_MAX_TRADES`         | 40      | max entry fills per session   |
+| `PAX_RISK_MAX_CONSEC_LOSSES`  | 6       | max consecutive losses        |
+| `PAX_RISK_MAX_LOSS_USD`       | 2000    | max realized session loss USD |
+| `PAX_RISK_MAX_LOSS_R`         | (off)   | max realized session loss R   |
+| `PAX_RISK_MAX_DD_USD`         | (off)   | max session drawdown USD      |
+
+Set a `*_R` / `*_DD_USD` / `*_LOSS_USD` var to `off`/`none` to disable that gate.
+
+**Data-path honesty (do not pretend these are enforced live):** the SIM status
+payload (`SimEngine.snapshot`) exposes entry-fill count and `realized_today_usd`,
+so `max_trades_reached` and the USD `max_loss_reached` ARE wired to the live
+heartbeat. It does NOT expose a per-trade R, a running consecutive-loss streak,
+or a running drawdown, so `max_consecutive_losses_reached`, the R variant of
+`max_loss_reached`, and `max_drawdown_reached` are implemented and unit-tested
+in the pure gate but reported `unavailable` on the live path (see
+`risk_halt_detail.unavailable`) rather than faked. They activate the moment a
+caller supplies those counters.
+
+### Health / evaluation visibility
+
+`/api/health` surfaces the enforced halt truth: `risk_halt_active`,
+`risk_halt_code`, `risk_halt_message`, `last_risk_halt_record` (most recent
+enforced halt from the agent feed), per-source freshness, `kill_switch_active`,
+`live_blocked` (always true). `/api/evaluation_state` adds `operational_blockers`
+and `risk_halt_active`; a current stale heartbeat / stale market / unavailable
+SIM broker restricts an armed agent to `sim_restricted` (kill switch ->
+`observe_only`). With Bookmap closed (weekend), expect `market`/`heartbeat`
+stale and `risk_halt_active=true` -- that is correct, not a bug.
+
 ## Replay and research (existing, deterministic, no orders)
 
 These already exist; this work did not duplicate them.
@@ -143,8 +206,11 @@ python -m bookmap_mcp.pax_session_report
 ```
 
 Contents: decisions by action, executions, blocked decisions, risk/veto
-events, PnL/win-rate, setup stats, model calls, errors, malformed-record
-count, and a snapshot of `evaluation_state`.
+events, **enforced risk halts** (`risk_halts`: total count, `by_code`,
+`kill_switch` / `stale_data` / `sim_broker` / `session_limits` sub-counts, and
+the recent halt list), PnL/win-rate, setup stats, model calls, errors,
+malformed-record count, stale-data block count, and a snapshot of
+`evaluation_state`.
 
 ## Tests
 
@@ -179,10 +245,17 @@ python -m compileall -q bookmap_mcp                                       # synt
 
 ## Known limitations
 
+- This stack is **SIM-only production-hardening**, not live-validated. No claim
+  of market edge -- the gates are about not trading on stale/unsafe state, not
+  about being profitable.
 - Kill switch is **enforced before SIM order placement** (blocks new SIM
   brackets); it does not auto-flatten an open SIM position -- flatten manually
   if needed. It does not affect live trading, which is independently
   hard-blocked.
+- `max_consecutive_losses_reached`, the R variant of `max_loss_reached`, and
+  `max_drawdown_reached` are gate-complete and unit-tested but NOT wired to a
+  live counter (the SIM status payload lacks per-trade R / streak / drawdown).
+  They report `unavailable` live rather than fake a block.
 - List endpoints individually carry freshness via `_meta`; their stale budgets
   use the `sim_db` / `journal` source budgets.
 - Market/heartbeat staleness depends on the Bookmap bridge -> dashboard

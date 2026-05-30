@@ -5,6 +5,7 @@ dry or route through monkeypatched sim tools).
 """
 import datetime
 import json
+import time
 from pathlib import Path
 
 from bookmap_mcp import pax_sim_agent as A
@@ -17,11 +18,15 @@ NOW_MS = 1_900_000_000_000
 
 def snap(dec="ENTER_LONG_FOLLOW", conf=0.6, label="OR-H", price=30340.0,
          orH=30340.0, orL=30325.5, mid=30339.0, health="ok",
-         anchor="LIVE", code="ACTIVE", news=False):
+         anchor="LIVE", code="ACTIVE", news=False, as_of_ms=None):
     lvl = {"label": label, "price": price, "distance": price - mid,
            "proximity": True, "decision": dec, "confidence": conf,
            "components": {"ps_rot": "NONE"}}
+    # asOfMs: a fresh market timestamp by default so the operational risk gate
+    # (stale_market_data) sees live data. Tests that exercise stale-market
+    # blocking pass an old as_of_ms.
     return {"health": health, "book": {"mid": mid},
+            "asOfMs": int(time.time() * 1000) if as_of_ms is None else as_of_ms,
             "session": {"anchorMode": anchor, "code": code},
             "or_day_ledger": {"session_type": "ETH"},
             "gates": {"news": {"blocked": news}}, "flow": {},
@@ -340,6 +345,107 @@ def test_kill_switch_blocks_decide_cycle(monkeypatch, tmp_path):
     assert rec["order"] is None
     assert "lesson_added" not in rec                   # vetoed -> no lesson
     assert "should not be written" not in pax_sim_tools.read_lessons()
+
+
+def _armed_loop(monkeypatch, tmp_path, snap_obj, st_obj, calls):
+    monkeypatch.setattr(A, "_fetch_snapshot", lambda *a, **k: snap_obj)
+    monkeypatch.setattr(pax_sim_tools, "sim_status", lambda *a, **k: st_obj)
+    monkeypatch.setattr(pax_sim_tools, "LEARN_DIR", tmp_path)
+    monkeypatch.setattr(A, "AGENT_LOG", tmp_path / "loop.jsonl")
+    monkeypatch.setattr(pax_sim_tools, "sim_place_bracket",
+                        lambda **kw: calls.append(kw) or {"ok": True})
+    loop = A.AgentLoop(interval_sec=15)
+    loop.armed = True
+    return loop
+
+
+def test_stale_heartbeat_blocks_armed_entry(monkeypatch, tmp_path):
+    # A prior heartbeat older than the budget => stale runtime => no new entry.
+    calls = []
+    loop = _armed_loop(monkeypatch, tmp_path, snap(), status(), calls)
+    loop.last = {"ts_ms": int(time.time() * 1000) - 60_000}  # 60s ago > 30s
+    rec = loop._cycle_once()
+    assert calls == []
+    assert rec["governor"] == "VETO: stale_heartbeat"
+    assert rec["risk_halt"] == "stale_heartbeat"
+    assert rec["executed"] is False
+    assert rec["order"] is None
+    assert "exec" not in rec
+
+
+def test_fresh_heartbeat_allows_armed_entry(monkeypatch, tmp_path):
+    calls = []
+    loop = _armed_loop(monkeypatch, tmp_path, snap(), status(), calls)
+    loop.last = {"ts_ms": int(time.time() * 1000) - 5_000}  # 5s ago < 30s
+    rec = loop._cycle_once()
+    assert rec["executed"] is True and len(calls) == 1
+    assert "risk_halt" not in rec
+
+
+def test_stale_market_blocks_armed_entry(monkeypatch, tmp_path):
+    calls = []
+    old = int(time.time() * 1000) - 30_000          # 30s old market data > 15s
+    loop = _armed_loop(monkeypatch, tmp_path, snap(as_of_ms=old), status(), calls)
+    rec = loop._cycle_once()
+    assert calls == []
+    assert rec["governor"] == "VETO: stale_market_data"
+    assert rec["risk_halt"] == "stale_market_data"
+    assert rec["executed"] is False
+    assert rec["order"] is None
+
+
+def test_missing_market_timestamp_blocks_armed_entry(monkeypatch, tmp_path):
+    calls = []
+    s = snap()
+    s.pop("asOfMs")                                  # cannot prove freshness
+    loop = _armed_loop(monkeypatch, tmp_path, s, status(), calls)
+    rec = loop._cycle_once()
+    assert calls == []
+    assert rec["risk_halt"] == "stale_market_data"
+    assert "cannot prove" in rec["risk_halt_message"].lower()
+
+
+def test_sim_broker_unavailable_blocks_armed_entry(monkeypatch, tmp_path):
+    calls = []
+    # sim_status raises -> _cycle_once records st with _status_error.
+    monkeypatch.setattr(A, "_fetch_snapshot", lambda *a, **k: snap())
+    def boom(*a, **k):
+        raise RuntimeError("db locked")
+    monkeypatch.setattr(pax_sim_tools, "sim_status", boom)
+    monkeypatch.setattr(pax_sim_tools, "LEARN_DIR", tmp_path)
+    monkeypatch.setattr(A, "AGENT_LOG", tmp_path / "loop.jsonl")
+    monkeypatch.setattr(pax_sim_tools, "sim_place_bracket",
+                        lambda **kw: calls.append(kw) or {"ok": True})
+    loop = A.AgentLoop(interval_sec=15)
+    loop.armed = True
+    rec = loop._cycle_once()
+    assert calls == []
+    assert rec["risk_halt"] == "sim_broker_unavailable"
+    assert rec["executed"] is False
+
+
+def test_max_trades_blocks_armed_entry(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setenv("PAX_RISK_MAX_TRADES", "2")
+    st = status()
+    st["fills_today"] = [{"role": "ENTRY"}, {"role": "ENTRY"}]  # 2 >= cap 2
+    loop = _armed_loop(monkeypatch, tmp_path, snap(), st, calls)
+    rec = loop._cycle_once()
+    assert calls == []
+    assert rec["risk_halt"] == "max_trades_reached"
+    assert rec["executed"] is False
+
+
+def test_max_session_loss_blocks_armed_entry(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setenv("PAX_RISK_MAX_LOSS_USD", "500")
+    st = status()
+    st["realized_today_usd"] = -600.0
+    loop = _armed_loop(monkeypatch, tmp_path, snap(), st, calls)
+    rec = loop._cycle_once()
+    assert calls == []
+    assert rec["risk_halt"] == "max_loss_reached"
+    assert rec["executed"] is False
 
 
 def test_no_kill_switch_allows_armed_execution(monkeypatch, tmp_path):

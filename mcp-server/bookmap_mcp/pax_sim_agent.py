@@ -36,6 +36,7 @@ from . import (
     pax_expectancy,
     pax_llm_provider,
     pax_loop,
+    pax_risk_gate,
     pax_runtime_policy,
     pax_sim_calibration,
     pax_sim_tools,
@@ -84,6 +85,31 @@ def _snapshot_is_stale(snap: Dict[str, Any]) -> bool:
         return False
     threshold = _f(snap.get("stale_threshold_ms")) or DEFAULT_STALE_SNAPSHOT_MS
     return age > threshold
+
+
+def _market_age_sec(snap: Dict[str, Any], now_ms: int) -> Optional[float]:
+    """Seconds since the snapshot's market data was composed, or None when no
+    market timestamp is present (the risk gate fails closed on None).
+
+    Prefers ``asOfMs`` (epoch-ms compose time emitted by dashboard.fetch_snapshot);
+    falls back to an explicit ``ageMs`` / ``snapshot_age_ms`` if a producer ever
+    supplies one. No reliable timestamp -> None -> cannot prove freshness."""
+    as_of = _f(snap.get("asOfMs"))
+    if as_of is not None:
+        return max(0.0, (now_ms - as_of) / 1000.0)
+    age_ms = _f(snap.get("ageMs"))
+    if age_ms is None:
+        age_ms = _f(snap.get("snapshot_age_ms"))
+    if age_ms is not None:
+        return max(0.0, age_ms / 1000.0)
+    return None
+
+
+def _apply_risk_halt(rec: Dict[str, Any], result: "pax_risk_gate.RiskGateResult"
+                     ) -> None:
+    """Stamp a blocked-gate result onto an agent-loop record (unified shape).
+    No broker call happened; no `exec` key is added."""
+    rec.update(result.as_record())
 
 
 def build_context(snap: Dict[str, Any], status: Dict[str, Any],
@@ -419,15 +445,29 @@ def decide_cycle(snap: Dict[str, Any], status: Dict[str, Any], now_dt, now_ms: i
                if governed.get("action") in ENTER_ACTIONS else None)
 
     if not dry:
-        acting = governed.get("action") in ENTER_ACTIONS + ("FLATTEN", "CANCEL_ENTRY")
-        halt = pax_sim_tools.risk_halt_reason() if acting else None
-        if halt:
-            # Kill switch engaged: block before execution, record a clean veto,
-            # write no lesson (a vetoed decision must not poison the prompt).
-            rec["governor"] = f"VETO: {halt}"
-            rec["risk_halt"] = halt
-            rec["order"] = None
-            rec["executed"] = False
+        gaction = governed.get("action")
+        is_entry = gaction in ENTER_ACTIONS
+        is_exit = gaction in ("FLATTEN", "CANCEL_ENTRY")
+        # Operational risk gate at the final pre-execution point. ENTRIES run the
+        # full gate (kill switch / stale heartbeat / stale market / sim broker /
+        # session limits). EXITS reduce risk -> only the kill switch may halt
+        # them. A blocked gate records a clean unified veto, writes no lesson (a
+        # vetoed decision must not poison the prompt), and never calls the broker.
+        halt = None
+        if is_entry:
+            halt = pax_risk_gate.evaluate_entry_gate(
+                now_ms=now_ms,
+                kill_switch_active=pax_sim_tools.kill_switch_active(),
+                heartbeat_age_sec=None,   # one-shot path: no prior beat to age
+                market_age_sec=_market_age_sec(snap, now_ms),
+                sim_broker_ok=not status.get("_status_error"),
+                session=pax_risk_gate.session_counters_from_status(status))
+            if halt.allowed:
+                halt = None
+        elif is_exit and pax_sim_tools.kill_switch_active():
+            halt = pax_risk_gate.kill_switch_result(now_ms)
+        if halt is not None:
+            _apply_risk_halt(rec, halt)
             return rec
         try:
             rec["exec"] = execute(governed, alias=alias)
@@ -509,6 +549,22 @@ class AgentLoop:
         self.cycles = 0
         self.started_ms: Optional[int] = None
         self.last: Optional[Dict[str, Any]] = None
+        # Operational risk-gate config (kill switch / stale data / session
+        # limits). Resolved once from env at construction; the gate itself is
+        # pure and deterministic.
+        self._risk_config = pax_risk_gate.load_config()
+
+    def _heartbeat_age_sec(self, now_ms: int) -> Optional[float]:
+        """Age of the PRIOR heartbeat record in seconds, or None on the first
+        cycle (bootstrapping -- the running loop is itself the current beat, so
+        there is nothing stale to prove)."""
+        last = self.last
+        if not isinstance(last, dict):
+            return None
+        ts = last.get("ts_ms")
+        if not ts:
+            return None
+        return max(0.0, (now_ms - int(ts)) / 1000.0)
 
     def _refresh_expectancy_stats(self, now_ms: int) -> None:
         if self.expectancy_path is None:
@@ -626,17 +682,30 @@ class AgentLoop:
                       if plan.get("order") else None),
         }
         if self.armed:
-            # Risk halt (kill switch) is checked at the LAST safe point before
-            # any broker call. An acting plan is vetoed with a clean record;
-            # no order is placed and no broker receipt exists.
-            halt = pax_sim_tools.risk_halt_reason()
-            acts = bool(plan.get("order") or plan.get("flatten")
-                        or plan.get("cancel"))
-            if halt and acts:
-                rec["governor"] = f"VETO: {halt}"
-                rec["risk_halt"] = halt
-                rec["order"] = None
-                rec["executed"] = False
+            # Operational risk gate at the LAST safe point before any broker
+            # call. ENTRIES run the full gate (kill switch / stale heartbeat /
+            # stale market / sim broker / session limits). EXITS reduce risk ->
+            # only the kill switch may halt them. A blocked gate writes a clean
+            # unified veto record; no order is placed and no broker receipt
+            # exists. The deterministic pax_loop governor already owns strategy.
+            is_entry = bool(plan.get("order"))
+            is_exit = bool(plan.get("flatten") or plan.get("cancel"))
+            halt = None
+            if is_entry:
+                halt = pax_risk_gate.evaluate_entry_gate(
+                    now_ms=now_ms,
+                    kill_switch_active=pax_sim_tools.kill_switch_active(),
+                    heartbeat_age_sec=self._heartbeat_age_sec(now_ms),
+                    market_age_sec=_market_age_sec(snap, now_ms),
+                    sim_broker_ok=not st.get("_status_error"),
+                    session=pax_risk_gate.session_counters_from_status(st),
+                    config=self._risk_config)
+                if halt.allowed:
+                    halt = None
+            elif is_exit and pax_sim_tools.kill_switch_active():
+                halt = pax_risk_gate.kill_switch_result(now_ms)
+            if halt is not None:
+                _apply_risk_halt(rec, halt)
             else:
                 try:
                     exec_result = self._execute_rule_plan(plan)

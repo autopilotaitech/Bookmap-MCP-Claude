@@ -98,8 +98,32 @@ def compute_eval_state(*,
     max_dd = _num(agent_stats.get("max_drawdown_r"))
     loss_streak = int(_num(agent_stats.get("loss_streak")))
 
-    ops_stale = bool(ops.get("is_stale") or ops.get("heartbeat_stale"))
+    # Operational blockers that prevent SIM candidate/armed execution. These
+    # mirror pax_risk_gate's halt codes so health / eval / the live gate all
+    # report the same truth. live trading stays hard-blocked regardless.
+    heartbeat_stale = bool(ops.get("heartbeat_stale"))
+    market_stale = bool(ops.get("market_stale"))
+    sim_broker_unavailable = bool(ops.get("sim_broker_unavailable"))
+    risk_halt_code = ops.get("risk_halt_code")
+    operational_blockers: List[Dict[str, Any]] = []
+    if heartbeat_stale:
+        operational_blockers.append({"code": "stale_heartbeat",
+                                     "message": "agent heartbeat stale"})
+    if market_stale:
+        operational_blockers.append({"code": "stale_market_data",
+                                     "message": "market data stale"})
+    if sim_broker_unavailable:
+        operational_blockers.append({"code": "sim_broker_unavailable",
+                                     "message": "sim broker DB unavailable"})
+    if risk_halt_code and risk_halt_code not in [b["code"] for b in operational_blockers]:
+        operational_blockers.append(
+            {"code": risk_halt_code,
+             "message": ops.get("risk_halt_message") or str(risk_halt_code)})
+
+    ops_stale = bool(ops.get("is_stale") or heartbeat_stale or market_stale
+                     or sim_broker_unavailable)
     malformed = int(_num(ops.get("malformed_count")))
+    risk_halt_active = bool(operational_blockers)
 
     requirements: List[str] = []
 
@@ -119,6 +143,11 @@ def compute_eval_state(*,
             "live_blocked": live_blocked,
             "live_block_reason": live_block_reason,
             "kill_switch_active": True,
+            "risk_halt_active": True,
+            "risk_halt_code": "kill_switch_active",
+            "operational_blockers": ([{"code": "kill_switch_active",
+                                       "message": "operator kill switch engaged"}]
+                                     + operational_blockers),
             "setup_eligibility": elig,
             "eligible_setup_count": 0,
             "requirements_for_next": ["clear the kill switch file"],
@@ -142,8 +171,10 @@ def compute_eval_state(*,
         if bad_ops or bad_perf:
             level = "sim_restricted"
             why = []
-            if ops_stale:
-                why.append("stale data/heartbeat")
+            for b in operational_blockers:
+                why.append(b["code"])
+            if ops.get("is_stale") and not operational_blockers:
+                why.append("stale data")
             if malformed > 0:
                 why.append(f"{malformed} malformed records")
             if max_dd <= t["max_drawdown_r"]:
@@ -184,6 +215,10 @@ def compute_eval_state(*,
         "live_blocked": live_blocked,
         "live_block_reason": live_block_reason,
         "kill_switch_active": False,
+        "risk_halt_active": risk_halt_active,
+        "risk_halt_code": (operational_blockers[0]["code"]
+                           if operational_blockers else None),
+        "operational_blockers": operational_blockers,
         "setup_eligibility": elig,
         "eligible_setup_count": len(eligible_setups),
         "inputs": {"armed": armed, "cycles": cycles, "executed": executed,

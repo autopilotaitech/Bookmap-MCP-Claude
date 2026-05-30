@@ -5270,6 +5270,11 @@ def _compose_alias_snapshot(c, cfg, alias: str,
     snap: Dict[str, Any] = {
         "health": "ok",
         "ts": now_et.isoformat(timespec="seconds"),
+        # Epoch-ms compose time of THIS snapshot. Timezone-free market-freshness
+        # source for downstream gates (pax_risk_gate stale_market_data): if the
+        # dashboard/bridge feed freezes, asOfMs stops advancing. Truthful, not
+        # invented -- it is the wall-clock at which this payload was assembled.
+        "asOfMs": int(time.time() * 1000),
         # Top-level mirror of gates.session so consumers (Heatwave parser,
         # journals, debug UIs) don't have to drill into gates. The session
         # anchor is operator-driven via the OpenRange indicator settings

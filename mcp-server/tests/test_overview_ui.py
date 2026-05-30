@@ -383,6 +383,66 @@ def test_kill_switch_surfaces_in_eval_and_health(tmp_path, populated_journal):
     assert q.health()["kill_switch_active"] is True
 
 
+def test_health_exposes_risk_halt_fields(tmp_path, populated_journal):
+    learn = _learn(tmp_path)
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    h = q.health()
+    for k in ("risk_halt_active", "risk_halt_code", "risk_halt_message",
+              "last_risk_halt_record"):
+        assert k in h
+    # No live Bookmap feed in this fixture -> heartbeat is stale -> health must
+    # report an enforced operational halt, never a null/blank stale source.
+    assert h["risk_halt_active"] is True
+    for src in h["sources"].values():
+        assert src.get("is_stale") is not None
+
+
+def test_health_reports_kill_switch_halt(tmp_path, populated_journal):
+    learn = _learn(tmp_path)
+    (learn / "KILL_SWITCH").write_text("stop", encoding="utf-8")
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    h = q.health()
+    assert h["kill_switch_active"] is True
+    assert h["risk_halt_active"] is True
+    assert h["risk_halt_code"] == "kill_switch_active"
+
+
+def test_health_surfaces_last_risk_halt_record(tmp_path, populated_journal):
+    now = int(time.time() * 1000)
+    learn = _learn(tmp_path, **{"agent-loop.jsonl":
+        json.dumps({"ts_ms": now, "heartbeat": True, "armed": True,
+                    "action": "PLACE_LONG", "governor": "VETO: max_trades_reached",
+                    "risk_halt": "max_trades_reached",
+                    "risk_halt_code": "max_trades_reached",
+                    "risk_halt_message": "trade cap hit",
+                    "executed": False, "order": None}) + "\n"})
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    rec = q.health()["last_risk_halt_record"]
+    assert rec is not None
+    assert rec["risk_halt_code"] == "max_trades_reached"
+
+
+def test_evaluation_state_includes_operational_blockers(tmp_path, populated_journal):
+    # Armed heartbeat but stale market (no live feed) -> restricted with an
+    # operational blocker, not promoted.
+    now = int(time.time() * 1000)
+    learn = _learn(tmp_path, **{
+        "agent-loop.jsonl":
+            json.dumps({"ts_ms": now, "heartbeat": True, "armed": True,
+                        "action": "NONE"}) + "\n",
+        "scorecard.json": json.dumps({"setups": []}),
+        "runtime-policy.json": json.dumps({})})
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    env = q.evaluation_state()
+    assert "operational_blockers" in env
+    assert "risk_halt_active" in env
+    # populated_journal has a stale snapshot timestamp -> market stale blocker.
+    codes = [b["code"] for b in env["operational_blockers"]]
+    assert "stale_market_data" in codes or "sim_broker_unavailable" in codes
+    assert env["level"] in ("observe_only", "sim_restricted")
+    assert env["live_blocked"] is True
+
+
 def test_api_health_endpoint_200(live_server):
     host, port = live_server
     status, body = _get(host, port, "/api/health")

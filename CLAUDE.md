@@ -41,19 +41,22 @@ legal/risk, capital, latency, exchange-failure, and manual approval controls.
 - `d0ca133` - enforced kill switch before SIM execution:
   `D:\BookmapLogs\pax-agent\KILL_SWITCH` blocks SIM order placement before any
   broker call; also guarded inside `pax_sim_tools.sim_place_bracket`.
+- stale-data + session-risk gates (`pax_risk_gate.py`): pure deterministic
+  operational HALT facade at the last pre-execution gate. ENTRIES only;
+  flatten/cancel never gated (kill switch excepted). Precedence
+  `kill_switch_active` -> `stale_heartbeat` -> `stale_market_data` ->
+  `sim_broker_unavailable` -> session limits. Fail-closed on missing market
+  timestamp; `dashboard.fetch_snapshot` emits `asOfMs`. Health/eval/session
+  report expose the same halt truth. LLM cannot override. 1186 tests pass.
 
 ### Active Next Phase
 
-Runtime risk enforcement before SIM entry placement:
+Operational hardening (stale-data + session-risk gates) is DONE -- see the
+checkpoint above and `docs/PAX_RUNBOOK.md`. Remaining prototype-grade items:
 
-1. Stale heartbeat blocks SIM entry.
-2. Stale market data blocks SIM entry.
-3. SIM broker/DB unavailable blocks claimed execution.
-4. Session limits block entry: max trades, max loss, max drawdown, max
-   consecutive losses where data exists.
-5. Every block writes a structured audit record.
-6. `/api/health`, `/api/evaluation_state`, and session reports expose the same
-   enforced truth.
+1. Wire consecutive-loss / R / drawdown counters to the live SIM path (the
+   status payload lacks them; gates are unit-tested but report `unavailable`).
+2. This is SIM-only; live remains hard-blocked. No market-edge validation yet.
 
 Keep this narrow. Do not rebuild replay, research, learning, or strategy logic.
 
@@ -143,6 +146,8 @@ versioned jar policy. Bookmap can hold old jars open.
 - `pax_sim_agent.py` - orchestrates observe/armed cycles and execution.
 - `pax_sim_tools.py` - SIM broker helper boundary and safety guards.
 - `pax_loop.py` - deterministic decision/governor path.
+- `pax_risk_gate.py` - pure operational HALT gate (kill switch / stale data /
+  session limits) at the final pre-SIM-placement point. Not a strategy brain.
 - `pax_brain.py` - pure setup/thesis selection, no I/O/model/broker.
 - `pax_expectancy.py`, `pax_trade_learning.py` - learned expectancy and SIM
   outcome scorecards.
