@@ -51,6 +51,7 @@ goto :eof
 :start_observe
 call :common_start || exit /b 1
 call :stop_processes_only
+if errorlevel 1 goto start_aborted
 echo [paxi] starting overview UI hidden on :%PORT%
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%PYW%' -ArgumentList @('-B','-u','-m','bookmap_mcp.overview_ui','--journal','%JOURNAL%','--sim-db','%SIMDB%','--port','%PORT%') -WorkingDirectory '%SRV%' -WindowStyle Hidden -RedirectStandardOutput '%LOGDIR%\overview-ui.out.log' -RedirectStandardError '%LOGDIR%\overview-ui.err.log'" >nul
 echo [paxi] starting autopilot OBSERVE hidden
@@ -61,6 +62,7 @@ exit /b 0
 :start_armed
 call :common_start || exit /b 1
 call :stop_processes_only
+if errorlevel 1 goto start_aborted
 echo [paxi] starting overview UI hidden on :%PORT%
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%PYW%' -ArgumentList @('-B','-u','-m','bookmap_mcp.overview_ui','--journal','%JOURNAL%','--sim-db','%SIMDB%','--port','%PORT%') -WorkingDirectory '%SRV%' -WindowStyle Hidden -RedirectStandardOutput '%LOGDIR%\overview-ui.out.log' -RedirectStandardError '%LOGDIR%\overview-ui.err.log'" >nul
 echo [paxi] starting autopilot ARMED hidden
@@ -68,44 +70,67 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath 
 echo [paxi] armed SIM mode up: http://127.0.0.1:%PORT%
 exit /b 0
 
+:start_aborted
+echo [paxi] ABORTED start: could not enumerate/stop existing PAX processes.
+echo [paxi] Refusing to launch a new loop so a DUPLICATE autopilot is not stacked
+echo [paxi] (duplicate loops show as paired armed/observe heartbeats in agent-loop.jsonl).
+echo [paxi] Likely cause: Get-CimInstance Access Denied. Run as the SAME user, NOT
+echo [paxi] elevated, or stop the stale process manually, then retry.
+exit /b 1
+
 :stop
 REM Write a session report BEFORE killing processes. Read-only (tails the agent
 REM log + reads the SIM/journal DBs read-only), runs synchronously in this
 REM console (no new/persistent terminal), and a failure here must NOT prevent
 REM the stop. --archive also keeps a timestamped copy under sessions\.
+REM NOTE: no literal ( ) inside these parenthesized blocks -- cmd miscounts
+REM them and dies with "... was unexpected at this time".
 if exist "%PY%" (
-  echo [paxi] writing session report (best-effort)...
+  echo [paxi] writing session report best-effort...
   pushd "%SRV%"
   "%PY%" -B -m bookmap_mcp.pax_session_report --archive --learn-dir "%LOGDIR%" --journal "%JOURNAL%" --sim-db "%SIMDB%" >> "%LOGDIR%\session-report.log" 2>&1
-  if errorlevel 1 echo [paxi] session report failed (continuing stop).
+  if errorlevel 1 echo [paxi] session report failed - continuing stop.
   popd
 )
 call :stop_processes_only
+set "STOPRC=%ERRORLEVEL%"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$t=Get-ScheduledTask -TaskName 'PaxAgentCron' -ErrorAction SilentlyContinue; if($t){Disable-ScheduledTask -TaskName 'PaxAgentCron' | Out-Null}" >nul 2>nul
+if not "%STOPRC%"=="0" (
+  echo [paxi] ERROR: stop could not confirm all PAX processes were stopped rc=%STOPRC%.
+  echo [paxi] A stale loop may still be running. Investigate before starting again.
+  exit /b %STOPRC%
+)
 echo [paxi] stopped PAX AI/autopilot/overview and disabled PaxAgentCron.
 exit /b 0
 
 :restart
 call :stop
+if errorlevel 1 (
+  echo [paxi] ABORTED restart: stop failed; not starting to avoid stacking a duplicate loop.
+  exit /b 1
+)
 call "%~f0" start
 exit /b %ERRORLEVEL%
 
 :status
 REM Match ONLY managed PAX python processes (incl. the LEGACY pax_daemon so a
-REM stale legacy process is visible). Scope is anchored to bookmap_mcp.<module>
-REM / -m pax_ai under python*, so Bookmap, OpenRange, the Java bridge, and Ollama
-REM are never matched. The PaxModule column distinguishes which one each is.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$task=Get-ScheduledTask -TaskName 'PaxAgentCron' -ErrorAction SilentlyContinue; if($task){Write-Host ('PaxAgentCron=' + $task.State)} else {Write-Host 'PaxAgentCron=not_installed'}; Get-CimInstance Win32_Process | Where-Object {($_.Name -like 'python*') -and ($_.CommandLine -match 'bookmap_mcp\.pax_agent_tick|bookmap_mcp\.pax_autopilot|bookmap_mcp\.pax_daemon|bookmap_mcp\.overview_ui| -m pax_ai')} | Select-Object @{N='PaxModule';E={if($_.CommandLine -match 'bookmap_mcp\.pax_agent_tick'){'pax_agent_tick'}elseif($_.CommandLine -match 'bookmap_mcp\.pax_autopilot'){'pax_autopilot'}elseif($_.CommandLine -match 'bookmap_mcp\.pax_daemon'){'pax_daemon-LEGACY'}elseif($_.CommandLine -match 'bookmap_mcp\.overview_ui'){'overview_ui'}elseif($_.CommandLine -match 'pax_ai'){'pax_ai'}else{'other'}}},ProcessId,Name,CommandLine | Format-Table -AutoSize"
-exit /b 0
+REM stale legacy process is visible). Enumeration runs via pax_processes.ps1,
+REM which FAILS LOUDLY (rc=3) if the process table cannot be read -- so an
+REM Access-Denied is never misread as "nothing running".
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$task=Get-ScheduledTask -TaskName 'PaxAgentCron' -ErrorAction SilentlyContinue; if($task){Write-Host ('PaxAgentCron=' + $task.State)} else {Write-Host 'PaxAgentCron=not_installed'}" 2>nul
+powershell -NoProfile -ExecutionPolicy Bypass -File "%REPO%\scripts\pax_processes.ps1" -Mode status
+if errorlevel 1 echo [paxi] WARNING: process enumeration FAILED (Access Denied?); status above may be incomplete.
+exit /b %ERRORLEVEL%
 
 :stop_processes_only
-REM Stop old visible window launchers by title, then force-kill known PAX modules.
-REM The module matcher includes the LEGACY pax_daemon so a stale legacy process
-REM is stoppable. Scope is anchored to bookmap_mcp.<module> / -m pax_ai under
-REM python*, so Bookmap, OpenRange, the Java bridge, and Ollama are never killed.
+REM Stop old visible window launchers by title (best-effort), then stop the
+REM managed PAX modules via pax_processes.ps1 which VERIFIES none remain and
+REM FAILS LOUDLY (rc=3 enumerate / rc=4 survivor) instead of silently
+REM succeeding. A silent failure here is exactly what let start/armed stack a
+REM SECOND autopilot loop onto the first.
 taskkill /FI "WINDOWTITLE eq Pax Daemon*" /T >nul 2>nul
 taskkill /FI "WINDOWTITLE eq Pax Manual Daemon*" /T >nul 2>nul
 taskkill /FI "WINDOWTITLE eq Pax Overview UI*" /T >nul 2>nul
 taskkill /FI "WINDOWTITLE eq Pax AI*" /T >nul 2>nul
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process | Where-Object {($_.Name -like 'python*') -and ($_.CommandLine -match 'bookmap_mcp\.pax_agent_tick|bookmap_mcp\.pax_autopilot|bookmap_mcp\.pax_daemon|bookmap_mcp\.overview_ui| -m pax_ai')} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}" >nul 2>nul
-exit /b 0
+powershell -NoProfile -ExecutionPolicy Bypass -File "%REPO%\scripts\pax_processes.ps1" -Mode stop
+exit /b %ERRORLEVEL%

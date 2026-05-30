@@ -65,6 +65,18 @@ TREND_MIN_CONVICTION = 0.35
 TREND_ENTRY_OFFSET_TICKS = 2
 
 
+def or_width_band(session_type: Optional[str]) -> tuple:
+    """(min, max) acceptable OR width in points for a session profile.
+
+    Single source of truth for the OR-width gate, shared so the dashboard HUD
+    (dashboard.pax_decision) and the SIM autopilot (decide() below) gate
+    identically and never diverge. Mirrors decide()'s `prof["width"]` lookup:
+    an unknown/empty session_type falls back to the ETH band."""
+    prof = PROFILE.get(session_type or "", PROFILE["ETH"])
+    lo, hi = prof["width"]
+    return (float(lo), float(hi))
+
+
 def working_entry(status: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     for w in (status.get("working") or []):
         if w.get("role") == "ENTRY":

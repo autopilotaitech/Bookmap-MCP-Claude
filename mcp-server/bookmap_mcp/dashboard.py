@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 from . import settings as _settings
 from . import or_session as _or_session
+from . import pax_loop as _pax_loop   # shared session-aware OR-width band (no cycle)
 from .bridge_client import BridgeClient, BridgeError
 from .config import BridgeConfig, MissingTokenError, _config_path as _bridge_config_path
 from .ifl_outcomes import update_ifl_outcomes
@@ -224,14 +225,31 @@ def _or_signal_globs() -> List[str]:
     return list(OR_SIGNAL_GLOBS)
 
 
-def _or_rows_by_symbol() -> Dict[str, Dict[str, Any]]:
+def _or_rows_by_symbol(now: Optional[dt.datetime] = None
+                       ) -> Dict[str, Dict[str, Any]]:
     """Index every OpenRange CSV under the configured log directory by its `symbol` column.
     Returns {symbol: latest_row}. The OpenRange addon writes one CSV per
     symbol; the `symbol` column inside the row is the authoritative key —
     filename safeSymbol normalization is more aggressive than the row's
     safeSymbol (filename strips [^A-Za-z0-9._-]; row only strips commas),
-    so matching on the column avoids drift."""
+    so matching on the column avoids drift.
+
+    ``now`` selects the OR SESSION WINDOW the rows are validated against. When
+    given (Bookmap replay: pass the tape/replay time), the session-window check
+    is ALWAYS applied against that instant — even when the test glob override is
+    active — so a replay-date row is accepted/rejected by the tape clock, not
+    today's wall clock. When ``now`` is None the legacy behavior holds: the glob
+    override bypasses the window (test fixtures), otherwise the current
+    wall-clock session window applies."""
     globs_overridden = tuple(OR_SIGNAL_GLOBS) != _DEFAULT_OR_SIGNAL_GLOBS
+
+    def _accept(row: Dict[str, Any]) -> bool:
+        if now is not None:
+            return _or_row_is_current_session(row, now)
+        if globs_overridden:
+            return True
+        return _or_row_is_current_session(row, None)
+
     candidates: List[str] = []
     for pat in _or_signal_globs():
         candidates.extend(glob.glob(pat))
@@ -246,7 +264,7 @@ def _or_rows_by_symbol() -> Dict[str, Dict[str, Any]]:
             continue
         last = None
         for row in reversed(rows):
-            if globs_overridden or _or_row_is_current_session(row):
+            if _accept(row):
                 last = row
                 break
         if last is None:
@@ -339,11 +357,14 @@ def _resolve_alias_symbol(alias: Optional[str],
 
 
 def _build_or_rows_by_alias(alias_list: List[str],
-                            instruments: Optional[Dict[str, Any]]
+                            instruments: Optional[Dict[str, Any]],
+                            now: Optional[dt.datetime] = None
                             ) -> Dict[str, Optional[Dict[str, Any]]]:
     """For each alias, find the OR CSV row matching its instrument symbol.
-    Reads CSVs once and reuses the index."""
-    by_symbol = _or_rows_by_symbol()
+    Reads CSVs once and reuses the index. ``now`` (tape/replay time) is passed
+    to ``_or_rows_by_symbol`` so the session window tracks the tape clock during
+    playback."""
+    by_symbol = _or_rows_by_symbol(now)
     out: Dict[str, Optional[Dict[str, Any]]] = {}
     for alias in alias_list:
         sym = _resolve_alias_symbol(alias, instruments)
@@ -4627,9 +4648,19 @@ def _pax_decision_core(snap: Dict[str, Any]) -> Dict[str, Any]:
                 "reasons": ["awaiting OR-Strategy CSV"], "components": components}
 
     ow = float(ol.get("orWidthPts") or 0)
-    components["or"] = {"high": ol.get("orHigh"), "low": ol.get("orLow"), "width": ow}
-    or_min = _settings.get("pax_min_or_width_pts")
-    or_max = _settings.get("pax_max_or_width_pts")
+    # Session-aware OR-width gate, sharing pax_loop's PROFILE band so the HUD and
+    # the SIM autopilot never disagree (Option C). The session_type is the same
+    # signal pax_loop.decide() reads. The MAX comes from the session band
+    # (ETH 25 / RTH 60); the MIN is the operator-tunable floor
+    # (pax_min_or_width_pts) raised to at least the session band's floor, so a
+    # too-narrow OR is still rejected and a Settings change still applies live.
+    stype = (snap.get("or_day_ledger") or {}).get("session_type") or "ETH"
+    band_lo, band_hi = _pax_loop.or_width_band(stype)
+    or_min = max(float(_settings.get("pax_min_or_width_pts")), band_lo)
+    or_max = band_hi
+    components["or"] = {"high": ol.get("orHigh"), "low": ol.get("orLow"),
+                        "width": ow, "session_type": stype,
+                        "width_band": [or_min, or_max]}
     if ow < or_min or ow > or_max:
         return {"decision": "STAND_DOWN", "size": 0,
                 "reason": f"OR width {ow:.1f} out of [{or_min},{or_max}]",
@@ -5272,6 +5303,43 @@ def compute_market_freshness(trend_analyzer: Any, book: Any,
     return {"ms": None, "source": None, "reason": "no_market_feed_timestamp"}
 
 
+def derive_tape_time_ms(book: Any, trades: Any) -> Optional[int]:
+    """TAPE/replay time (epoch ms) from the orderbook/trade stream, or None.
+
+    This is the clock that anchors the OR *session window* during Bookmap
+    replay/playback, where the tape is a PAST date but the dashboard wall clock
+    is today. It is DISTINCT from ``compute_market_freshness``: that function
+    accepts ``trend_analyzer.updatedAtMs`` (transport liveness) which advances on
+    the replay wall clock and therefore does NOT represent the original tape
+    date. Tape time must come only from real market-event timestamps.
+
+    Priority (first valid wins):
+      1. most recent ``trades[].nanos`` -> ms (real market activity).
+      2. ``book.generatedNanos`` -> ms (bridge orderbook-generation time).
+
+    ``composedAtMs`` (dashboard compose time) and ``trend_analyzer.updatedAtMs``
+    are wall-clock-ish and are NEVER used. Pure: no clock read, no I/O."""
+    def _pos_int(x: Any) -> Optional[int]:
+        try:
+            v = int(float(x))
+        except (TypeError, ValueError):
+            return None
+        return v if v > 0 else None
+
+    if isinstance(trades, list):
+        ns = [_pos_int(t.get("nanos")) for t in trades if isinstance(t, dict)]
+        ns = [n for n in ns if n is not None]
+        if ns:
+            return max(ns) // 1_000_000
+
+    bk = book if isinstance(book, dict) else {}
+    gen = _pos_int(bk.get("generatedNanos"))
+    if gen is not None:
+        return gen // 1_000_000
+
+    return None
+
+
 def _compose_alias_snapshot(c, cfg, alias: str,
                             ping: Dict[str, Any],
                             instruments: Dict[str, Any],
@@ -5315,6 +5383,41 @@ def _compose_alias_snapshot(c, cfg, alias: str,
         vwap = vwap_from_trades(trade_list); vwap_source = "ring_buffer_fallback"
 
     _mf = compute_market_freshness(trend_obj, book, trade_list)
+
+    # ── Bookmap replay/playback OR-session truth ──────────────────────────
+    # The OR row passed in was resolved against the dashboard WALL-CLOCK session
+    # (fetch_snapshot, pre-loop). In replay the tape date (book.generatedNanos /
+    # trade nanos) is a PAST date, so the wall-clock window rejects the valid
+    # replay-date OR row and PAX goes blind. When the tape clock is on a DIFFERENT
+    # calendar day than the wall clock, re-resolve the OR row against the TAPE
+    # session window and relabel the session from tape time. Live mode (tape ~=
+    # now, same date) is untouched: same row, same label, no extra CSV read.
+    session_for_alias = gates_shared.get("session", {})
+    tape_ms = derive_tape_time_ms(book if isinstance(book, dict) else {}, trade_list)
+    if tape_ms is not None:
+        anchor_tz_name = (gates_shared.get("session") or {}).get(
+            "anchorTimezone") or "America/Chicago"
+        try:
+            _or_tz = ZoneInfo(anchor_tz_name)
+        except Exception:
+            _or_tz = DISPLAY_TZ
+        tape_dt = dt.datetime.fromtimestamp(tape_ms / 1000.0, dt.timezone.utc)
+        wall_date = now_et.astimezone(_or_tz).date()
+        tape_date = tape_dt.astimezone(_or_tz).date()
+        if tape_date != wall_date:
+            sym = _resolve_alias_symbol(alias, instruments)
+            if sym:
+                tape_row = _or_rows_by_symbol(now=tape_dt).get(sym)
+                if tape_row is not None:
+                    or_row = tape_row
+            code, label = session_state(tape_dt)
+            session_for_alias = dict(gates_shared.get("session", {}))
+            session_for_alias["code"] = code
+            session_for_alias["label"] = label
+            session_for_alias["clockSource"] = "tape"
+            session_for_alias["tapeTimeMs"] = tape_ms
+            session_for_alias["tapeSessionDate"] = tape_date.isoformat()
+
     snap: Dict[str, Any] = {
         "health": "ok",
         "ts": now_et.isoformat(timespec="seconds"),
@@ -5333,7 +5436,7 @@ def _compose_alias_snapshot(c, cfg, alias: str,
         # journals, debug UIs) don't have to drill into gates. The session
         # anchor is operator-driven via the OpenRange indicator settings
         # (or_session.effective_session_anchor()).
-        "session": gates_shared.get("session", {}),
+        "session": session_for_alias,
         # Full OR-session-config payload exposed at top level so operator
         # UIs and tests can verify the lineage of the active session anchor.
         "or_session_config": _or_session.load_effective(),
@@ -5357,6 +5460,7 @@ def _compose_alias_snapshot(c, cfg, alias: str,
         },
         "gates": {
             **gates_shared,
+            "session": session_for_alias,
             "vwap_or": vwap_or_gate(book if isinstance(book, dict) and "_error" not in book else {}, vwap, or_row),
         },
     }
@@ -5377,6 +5481,14 @@ def _compose_alias_snapshot(c, cfg, alias: str,
     except Exception as exc:
         sys.stderr.write(f"[dashboard] _sync_magnet_levels({alias}) outer guard: "
                          f"{type(exc).__name__}: {exc}\n")
+    # or_day_ledger MUST be computed before pax_decision: pax_decision's
+    # session-aware OR-width gate reads or_day_ledger.session_type, and so does
+    # the SIM autopilot's pax_loop.decide. Computing it here (it only needs
+    # or_levels/session/book, already present) keeps the HUD gate and the
+    # autopilot gate on the SAME session band. Computing it later (the old
+    # order) made pax_decision default to ETH and re-introduce the divergence.
+    snap["or_day_ledger"] = _safe_call(
+        update_or_day_ledger, "update_or_day_ledger")
     snap["vwap_bias"] = _safe_call(compute_vwap_bias, "compute_vwap_bias")
     snap["vp_bias"]   = _safe_call(compute_vp_bias,   "compute_vp_bias")
     snap["decision"]  = _safe_call(trade_decision,    "trade_decision")
@@ -5389,8 +5501,6 @@ def _compose_alias_snapshot(c, cfg, alias: str,
         compute_institutional_flow, "compute_institutional_flow")
     snap["ifl_outcomes"] = _safe_call(
         update_ifl_outcomes, "update_ifl_outcomes")
-    snap["or_day_ledger"] = _safe_call(
-        update_or_day_ledger, "update_or_day_ledger")
     snap["or_level_crossings"] = _safe_call(
         update_or_level_crossings, "update_or_level_crossings")
     # Deterministic rich chart-signal emitter -> pax-ai-chart-signals.jsonl

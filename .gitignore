@@ -69,3 +69,6 @@ reports/calibration-*.json
 reports/policy-candidates-*.json
 reports/prompt-lessons-*.md
 reports/replay-*.json
+
+# Generated PAX replay/clock smoke + readiness reports (mcp-server)
+mcp-server/reports/
