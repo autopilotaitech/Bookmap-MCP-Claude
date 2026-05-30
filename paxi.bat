@@ -1,12 +1,18 @@
 @echo off
 REM Unified hidden manager for the Pax AI SIM stack.
 REM
+REM Preferred production runtime is `paxi.bat start|armed`, which launches
+REM `pax_autopilot` (the new pax_autopilot + pax_sim_agent + pax_risk_gate
+REM acceptance stack). The older `bookmap_mcp.pax_daemon` (pax_trader.decide_and_act
+REM path) is LEGACY and is NOT the production PAX path; stop/status still include
+REM it so a stale legacy process stays visible and stoppable.
+REM
 REM Usage:
 REM   paxi.bat start          hidden observe-mode autopilot + overview UI
 REM   paxi.bat armed          hidden armed SIM autopilot + overview UI
-REM   paxi.bat stop           stop autopilot/overview/old tick cron
+REM   paxi.bat stop           stop autopilot/overview/legacy pax_daemon/old tick cron
 REM   paxi.bat restart        stop then start observe mode
-REM   paxi.bat status         print matching processes and PaxAgentCron state
+REM   paxi.bat status         print matching PAX processes (incl. legacy pax_daemon)
 
 setlocal EnableExtensions
 
@@ -85,14 +91,21 @@ call "%~f0" start
 exit /b %ERRORLEVEL%
 
 :status
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$task=Get-ScheduledTask -TaskName 'PaxAgentCron' -ErrorAction SilentlyContinue; if($task){Write-Host ('PaxAgentCron=' + $task.State)} else {Write-Host 'PaxAgentCron=not_installed'}; Get-CimInstance Win32_Process | Where-Object {($_.Name -like 'python*') -and ($_.CommandLine -match 'bookmap_mcp\.pax_agent_tick|bookmap_mcp\.pax_autopilot|bookmap_mcp\.overview_ui|pax_ai')} | Select-Object ProcessId,Name,CommandLine | Format-Table -AutoSize"
+REM Match ONLY managed PAX python processes (incl. the LEGACY pax_daemon so a
+REM stale legacy process is visible). Scope is anchored to bookmap_mcp.<module>
+REM / -m pax_ai under python*, so Bookmap, OpenRange, the Java bridge, and Ollama
+REM are never matched. The PaxModule column distinguishes which one each is.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$task=Get-ScheduledTask -TaskName 'PaxAgentCron' -ErrorAction SilentlyContinue; if($task){Write-Host ('PaxAgentCron=' + $task.State)} else {Write-Host 'PaxAgentCron=not_installed'}; Get-CimInstance Win32_Process | Where-Object {($_.Name -like 'python*') -and ($_.CommandLine -match 'bookmap_mcp\.pax_agent_tick|bookmap_mcp\.pax_autopilot|bookmap_mcp\.pax_daemon|bookmap_mcp\.overview_ui| -m pax_ai')} | Select-Object @{N='PaxModule';E={if($_.CommandLine -match 'bookmap_mcp\.pax_agent_tick'){'pax_agent_tick'}elseif($_.CommandLine -match 'bookmap_mcp\.pax_autopilot'){'pax_autopilot'}elseif($_.CommandLine -match 'bookmap_mcp\.pax_daemon'){'pax_daemon-LEGACY'}elseif($_.CommandLine -match 'bookmap_mcp\.overview_ui'){'overview_ui'}elseif($_.CommandLine -match 'pax_ai'){'pax_ai'}else{'other'}}},ProcessId,Name,CommandLine | Format-Table -AutoSize"
 exit /b 0
 
 :stop_processes_only
 REM Stop old visible window launchers by title, then force-kill known PAX modules.
+REM The module matcher includes the LEGACY pax_daemon so a stale legacy process
+REM is stoppable. Scope is anchored to bookmap_mcp.<module> / -m pax_ai under
+REM python*, so Bookmap, OpenRange, the Java bridge, and Ollama are never killed.
 taskkill /FI "WINDOWTITLE eq Pax Daemon*" /T >nul 2>nul
 taskkill /FI "WINDOWTITLE eq Pax Manual Daemon*" /T >nul 2>nul
 taskkill /FI "WINDOWTITLE eq Pax Overview UI*" /T >nul 2>nul
 taskkill /FI "WINDOWTITLE eq Pax AI*" /T >nul 2>nul
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process | Where-Object {($_.Name -like 'python*') -and ($_.CommandLine -match 'bookmap_mcp\.pax_agent_tick|bookmap_mcp\.pax_autopilot|bookmap_mcp\.overview_ui| -m pax_ai')} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}" >nul 2>nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process | Where-Object {($_.Name -like 'python*') -and ($_.CommandLine -match 'bookmap_mcp\.pax_agent_tick|bookmap_mcp\.pax_autopilot|bookmap_mcp\.pax_daemon|bookmap_mcp\.overview_ui| -m pax_ai')} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}" >nul 2>nul
 exit /b 0

@@ -152,6 +152,69 @@ def test_paxi_stop_writes_session_report_before_kill():
     assert "exit /b 1" not in block.split("call :stop_processes_only")[0]
 
 
+def _paxi_text():
+    return (ROOT.parent / "paxi.bat").read_text(encoding="utf-8")
+
+
+def _paxi_label_block(label):
+    """Return the text of the :<label> section up to the next :label."""
+    import re
+    txt = _paxi_text()
+    start = txt.index("\n:" + label + "\n") if ("\n:" + label + "\n") in txt \
+        else txt.index("\n:" + label)
+    rest = txt[start + 1:]
+    m = re.search(r"\n:[a-zA-Z_]", rest)
+    return rest[:m.start()] if m else rest
+
+
+def test_paxi_status_and_stop_match_legacy_pax_daemon():
+    """status + stop must match the LEGACY bookmap_mcp.pax_daemon so a stale
+    legacy process is visible and stoppable."""
+    status = _paxi_label_block("status")
+    stop = _paxi_label_block("stop_processes_only")
+    assert "bookmap_mcp\\.pax_daemon" in status
+    assert "bookmap_mcp\\.pax_daemon" in stop
+    # the other managed modules stay matched too.
+    for mod in ("pax_agent_tick", "pax_autopilot", "overview_ui", "pax_ai"):
+        assert mod in status and mod in stop
+
+
+def _match_regexes(block):
+    """Every -match '<regex>' literal in a paxi.bat block (matcher, not comments)."""
+    import re
+    return re.findall(r"-match '([^']*)'", block)
+
+
+def test_paxi_scope_excludes_unrelated_processes():
+    """The process MATCHER (not comments) must not match Bookmap, OpenRange, the
+    Java bridge, or Ollama, and must stay anchored to python* + bookmap_mcp."""
+    for label in ("status", "stop_processes_only"):
+        block = _paxi_label_block(label)
+        regexes = _match_regexes(block)
+        assert regexes, f"{label} has no -match regex"
+        for rx in regexes:
+            low = rx.lower()
+            for forbidden in ("openrange", "ollama", "bridge", "com.bookmap",
+                              "java", "trendanalyzer"):
+                assert forbidden not in low, \
+                    f"{label} matcher must not match {forbidden}: {rx}"
+        # matcher is anchored to python processes only.
+        assert "'python*'" in block
+        # the legacy daemon is anchored to its module, not a bare 'pax'.
+        assert any("bookmap_mcp\\.pax_daemon" in rx for rx in regexes)
+
+
+def test_paxi_status_distinguishes_modules():
+    """status surfaces a per-process module label so the five PAX processes are
+    distinguishable (overview_ui / pax_autopilot / pax_agent_tick / pax_daemon /
+    pax_ai)."""
+    status = _paxi_label_block("status")
+    assert "PaxModule" in status
+    for tag in ("pax_agent_tick", "pax_autopilot", "pax_daemon-LEGACY",
+                "overview_ui", "pax_ai"):
+        assert tag in status
+
+
 # ── STAGE 3: replay readiness in session report ────────────────────────────
 
 def _ri(version=1):

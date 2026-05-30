@@ -1,6 +1,10 @@
 """Local SIM execution engine — never touches a live broker.
 
-Storage: SQLite at D:\\BookmapLogs\\pax-trades.db
+Storage: SQLite. The LIBRARY DEFAULT path is ``D:\\BookmapLogs\\pax-trades.db``
+(``DB_PATH`` below). NOTE: the managed PAX stack (``paxi.bat`` / overview UI /
+pax_autopilot) passes ``D:\\BookmapLogs\\pax-daemon-trades.db`` explicitly via
+``--sim-db`` / ``DEFAULT_SIM_DB`` -- so a process that constructs ``SimEngine``
+with no ``db_path`` reads the default file, NOT the managed-stack file.
   orders     working/filled/canceled orders with full lifecycle
   positions  per-alias position snapshot + realized/unrealized P&L
   events     audit trail of every state change
@@ -91,6 +95,9 @@ def session_risk_from_deltas(deltas: Iterable[float]) -> Dict[str, Any]:
 # ─── config ─────────────────────────────────────────────────────────────────
 
 LOG_DIR = Path(os.environ.get("PAX_LOG_DIR", r"D:\BookmapLogs"))
+# Library DEFAULT only. The managed PAX stack overrides this with
+# pax-daemon-trades.db (see paxi.bat SIMDB / pax_manual.DEFAULT_SIM_DB); do not
+# assume a no-arg SimEngine reads the managed-stack DB.
 DB_PATH = LOG_DIR / "pax-trades.db"
 
 NQ_TICK_VALUE_USD  = 5.0     # one NQ tick = $5

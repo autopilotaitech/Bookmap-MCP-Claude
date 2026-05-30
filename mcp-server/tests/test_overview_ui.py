@@ -795,3 +795,95 @@ def test_api_evidence_report_endpoint_200(live_server):
     assert data["evidence_grade"] in (
         "no_data", "logging_only", "replayable", "outcome_linked",
         "promotion_candidate")
+
+
+# --- Fix 3: arming_check fail-closed (mirror pax_acceptance strictness) -----
+
+_FRESH_SOURCES = {"heartbeat": {"is_stale": False},
+                  "market": {"is_stale": False},
+                  "sim_db": {"reachable": True}}
+
+
+def _q_for_arming(tmp_path):
+    learn = tmp_path / "learn"
+    learn.mkdir(exist_ok=True)
+    return OverviewQueries(tmp_path / "j.db", learn_dir=learn)
+
+
+def _arming_by(q, health, monkeypatch):
+    monkeypatch.setattr(q, "health", lambda: health)
+    a = q.arming_check()
+    return a, {c["code"]: c["status"] for c in a["checks"]}
+
+
+def test_arming_missing_sources_fails_heartbeat_and_market(monkeypatch, tmp_path):
+    q = _q_for_arming(tmp_path)
+    a, by = _arming_by(q, {"live_blocked": True}, monkeypatch)   # no sources
+    assert by["heartbeat_fresh"] == "fail"
+    assert by["market_data_fresh"] == "fail"
+    assert a["can_arm"] is False
+    assert a["live_blocked"] is True
+
+
+def test_arming_missing_heartbeat_source_fails(monkeypatch, tmp_path):
+    q = _q_for_arming(tmp_path)
+    health = {"live_blocked": True,
+              "sources": {"market": {"is_stale": False},
+                          "sim_db": {"reachable": True}}}   # heartbeat absent
+    a, by = _arming_by(q, health, monkeypatch)
+    assert by["heartbeat_fresh"] == "fail"
+    assert by["market_data_fresh"] == "pass"
+    assert a["can_arm"] is False
+
+
+def test_arming_missing_market_source_fails(monkeypatch, tmp_path):
+    q = _q_for_arming(tmp_path)
+    health = {"live_blocked": True,
+              "sources": {"heartbeat": {"is_stale": False},
+                          "sim_db": {"reachable": True}}}    # market absent
+    a, by = _arming_by(q, health, monkeypatch)
+    assert by["market_data_fresh"] == "fail"
+    assert by["heartbeat_fresh"] == "pass"
+    assert a["can_arm"] is False
+
+
+def test_arming_source_without_is_stale_flag_fails(monkeypatch, tmp_path):
+    q = _q_for_arming(tmp_path)
+    health = {"live_blocked": True,
+              "sources": {"heartbeat": {}, "market": {"is_stale": False},
+                          "sim_db": {"reachable": True}}}     # heartbeat lacks flag
+    a, by = _arming_by(q, health, monkeypatch)
+    assert by["heartbeat_fresh"] == "fail"
+
+
+def test_arming_missing_live_blocked_fails(monkeypatch, tmp_path):
+    q = _q_for_arming(tmp_path)
+    health = {"sources": _FRESH_SOURCES}                      # no live_blocked
+    a, by = _arming_by(q, health, monkeypatch)
+    assert by["live_hard_blocked"] == "fail"
+    assert any("live_blocked_unknown" in c["message"]
+               for c in a["checks"] if c["code"] == "live_hard_blocked")
+    assert a["can_arm"] is False
+
+
+def test_arming_live_blocked_false_fails(monkeypatch, tmp_path):
+    q = _q_for_arming(tmp_path)
+    health = {"live_blocked": False, "sources": _FRESH_SOURCES}
+    a, by = _arming_by(q, health, monkeypatch)
+    assert by["live_hard_blocked"] == "fail"
+    assert a["can_arm"] is False
+
+
+def test_arming_fresh_sources_and_live_true_are_non_failing(monkeypatch, tmp_path):
+    q = _q_for_arming(tmp_path)
+    health = {"live_blocked": True, "sources": _FRESH_SOURCES, "mode": "observe"}
+    a, by = _arming_by(q, health, monkeypatch)
+    assert by["heartbeat_fresh"] == "pass"
+    assert by["market_data_fresh"] == "pass"
+    assert by["sim_broker_ok"] == "pass"
+    assert by["live_hard_blocked"] == "pass"
+    # none of these blocking checks is in blocking_codes.
+    for code in ("heartbeat_fresh", "market_data_fresh", "sim_broker_ok",
+                 "live_hard_blocked"):
+        assert code not in a["blocking_codes"]
+    assert a["live_blocked"] is True

@@ -5666,7 +5666,7 @@ tr.row-heat { background: var(--row-bg, transparent) !important; }
 <div class="row" style="display:none;">
   <div class="card" id="sim-card" style="flex:2;border-left:3px solid #e0af68;padding:6px 10px;">
     <h2 style="display:flex;justify-content:space-between;align-items:center;margin:0;">
-      <span>Pax SIM trades <span class="muted" style="font-size:10px;font-weight:400;text-transform:none;letter-spacing:0;">local sim engine · no live broker · D:\BookmapLogs\pax-trades.db</span></span>
+      <span>Pax SIM trades <span class="muted" style="font-size:10px;font-weight:400;text-transform:none;letter-spacing:0;">local sim engine · no live broker · default D:\BookmapLogs\pax-trades.db (paxi-managed stack uses pax-daemon-trades.db)</span></span>
       <span id="sim-pnl"></span>
     </h2>
     <div id="sim-box" style="margin-top:4px;"></div>

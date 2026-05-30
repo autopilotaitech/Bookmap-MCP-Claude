@@ -817,7 +817,11 @@ class OverviewQueries:
                 "checked_ms": now,
             }
 
-        sources = h.get("sources") or {}
+        # FAIL-CLOSED: a missing/empty sources dict cannot prove freshness, so
+        # the heartbeat/market checks FAIL (must match pax_acceptance, which is
+        # also fail-closed). This is intentionally STRICTER than "is_stale=True".
+        sources = h.get("sources")
+        have_sources = isinstance(sources, dict) and bool(sources)
         checks: List[Dict[str, Any]] = []
         fails: List[str] = []
         warns: List[str] = []
@@ -833,35 +837,51 @@ class OverviewQueries:
             elif ok_status == "warn":
                 warns.append(code)
 
+        def _source_fresh(name: str):
+            """A source proves fresh ONLY when it is present, carries an
+            is_stale flag, and that flag is False. Missing source/flag -> fail."""
+            if not have_sources:
+                return False, "health has no sources dict -- cannot prove freshness"
+            src = sources.get(name)
+            if not isinstance(src, dict) or "is_stale" not in src:
+                return False, f"{name} source missing/unknown -- cannot prove freshness"
+            if src.get("is_stale"):
+                return False, f"{name} stale/absent"
+            return True, f"{name} fresh"
+
         ks = bool(h.get("kill_switch_active"))
         add("kill_switch_absent", "fail" if ks else "pass",
             "operator kill switch engaged" if ks else "no kill switch file",
             "remove the KILL_SWITCH file")
 
-        hb_stale = bool((sources.get("heartbeat") or {}).get("is_stale"))
-        add("heartbeat_fresh", "fail" if hb_stale else "pass",
-            "heartbeat stale/absent -- start observe mode and confirm a beat"
-            if hb_stale else "agent heartbeat fresh",
+        hb_ok, hb_msg = _source_fresh("heartbeat")
+        add("heartbeat_fresh", "pass" if hb_ok else "fail", hb_msg,
             "start PAX observe (paxi.bat start) and confirm a fresh heartbeat")
 
-        mk_stale = bool((sources.get("market") or {}).get("is_stale"))
-        add("market_data_fresh", "fail" if mk_stale else "pass",
-            "market data stale/absent (bridge/Bookmap feed down)"
-            if mk_stale else "market data fresh",
+        mk_ok, mk_msg = _source_fresh("market")
+        add("market_data_fresh", "pass" if mk_ok else "fail", mk_msg,
             "bring up Bookmap + bridge so market data is fresh")
 
-        sim_ok = bool((sources.get("sim_db") or {}).get("reachable"))
+        sim_ok = bool((sources or {}).get("sim_db", {}).get("reachable")
+                      if have_sources else False)
         add("sim_broker_ok", "pass" if sim_ok else "fail",
             "SIM broker openable+readable" if sim_ok
-            else ((sources.get("sim_db") or {}).get("error")
-                  or "SIM broker DB unavailable"),
+            else (((sources or {}).get("sim_db") or {}).get("error")
+                  if have_sources else "health has no sources dict")
+            or "SIM broker DB unavailable",
             "point PAX at a valid, readable SIM broker DB")
 
-        live_blocked = bool(h.get("live_blocked", True))
-        add("live_hard_blocked", "pass" if live_blocked else "fail",
-            "live trading hard-blocked (SIM only)" if live_blocked
-            else "LIVE NOT BLOCKED -- refuse to arm",
-            "restore the live hard-block before any arming")
+        # live_hard_blocked passes ONLY when health explicitly reports True.
+        lb = h.get("live_blocked")
+        if lb is True:
+            add("live_hard_blocked", "pass", "live trading hard-blocked (SIM only)")
+        elif lb is False:
+            add("live_hard_blocked", "fail", "LIVE NOT BLOCKED -- refuse to arm",
+                "restore the live hard-block before any arming")
+        else:
+            add("live_hard_blocked", "fail",
+                "live_blocked_unknown -- health did not report live_blocked",
+                "restore the live hard-block / repair the health surface")
 
         stale_required = [s for s in (h.get("stale_sources") or [])
                           if s in ("market", "heartbeat")]

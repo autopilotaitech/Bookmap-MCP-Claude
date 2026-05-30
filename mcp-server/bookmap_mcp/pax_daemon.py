@@ -1,4 +1,16 @@
-"""Phase 3: background paper-trading daemon.
+"""Phase 3: background paper-trading daemon. LEGACY -- not the production path.
+
+LEGACY STATUS (2026-05-30): this daemon drives the OLDER
+``pax_trader.decide_and_act`` path. It does NOT use the current PAX acceptance
+stack (``pax_autopilot`` + ``pax_sim_agent`` + ``pax_risk_gate``) -- the
+operational risk gate (kill switch / stale heartbeat / stale market / sim broker
+preflight / session-risk counters) is NOT enforced on this code path.
+
+The PREFERRED production runtime is ``paxi.bat start|armed``, which launches
+``pax_autopilot``. ``pax_daemon`` is kept for older tests/tools and replays, but
+should not be the production PAX path. ``paxi.bat stop`` / ``paxi.bat status``
+match ``bookmap_mcp.pax_daemon`` so a stale legacy process stays visible and
+stoppable.
 
 Runs unattended for months. Reads from a pluggable DataAdapter, drives the
 pure signal engine, advances a local SimEngine, and journals everything to
@@ -15,6 +27,7 @@ Safety:
 - Does not import the live-order MCP tools (test_daemon_lifecycle pins this
   by grepping the module source for the tool names).
 - SimEngine is local sqlite only (no HTTP).
+- LEGACY: does NOT enforce the pax_risk_gate acceptance stack (see above).
 """
 
 from __future__ import annotations
