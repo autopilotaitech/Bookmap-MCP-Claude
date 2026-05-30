@@ -734,3 +734,64 @@ def test_arming_check_replay_input_present_passes(tmp_path):
     chk = [c for c in a["checks"] if c["code"] == "replay_input_present"][0]
     assert chk["status"] == "pass"
     assert "replay_input_present" not in a["warnings"]
+
+
+# ── STAGE 3: evidence endpoints (read-only) ────────────────────────────────
+
+def test_evidence_report_missing_files_is_no_data(tmp_path, populated_journal):
+    learn = tmp_path / "learn"; learn.mkdir()
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    rep = q.evidence_report()
+    assert rep["evidence_grade"] == "no_data"
+    assert rep["live_blocked"] is True
+
+
+def test_evidence_report_candidate_grade(tmp_path, populated_journal):
+    now = int(time.time() * 1000)
+    ri = {"version": 1, "snapshot": {"health": "ok"},
+          "status": {"position": {"size": 0}}, "now_ms": now,
+          "market_age_sec": 1.0, "heartbeat_age_sec": 1.0,
+          "sim_broker_ok": True, "kill_switch_active": False}
+    learn = _learn(tmp_path, **{
+        "agent-loop.jsonl": json.dumps(
+            {"ts_ms": now, "heartbeat": True, "action": "NONE",
+             "replay_input": ri}) + "\n",
+        "scorecard.json": json.dumps(
+            {"min_samples": 30, "setups": [{"setup": "A|LONG|OR-H|ETH", "n": 40,
+             "mean_realized_r": 0.3, "hit_rate": 0.62}]})})
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    rep = q.evidence_report()
+    assert rep["evidence_grade"] == "promotion_candidate"
+    assert rep["setup_evidence"][0]["recommended_action"] == "candidate_for_paper_focus"
+
+
+def test_evidence_report_no_file_writes_from_get(tmp_path, populated_journal):
+    learn = tmp_path / "learn"; learn.mkdir()
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    before = sorted(p.name for p in learn.iterdir())
+    q.evidence_report()
+    q.health()
+    after = sorted(p.name for p in learn.iterdir())
+    assert before == after            # read-only: no files created
+
+
+def test_health_includes_compact_evidence(tmp_path, populated_journal):
+    learn = tmp_path / "learn"; learn.mkdir()
+    q = OverviewQueries(populated_journal, learn_dir=learn)
+    h = q.health()
+    assert "evidence" in h
+    for k in ("evidence_grade", "replay_input_pct", "candidate_setup_count",
+              "evidence_blockers"):
+        assert k in h["evidence"]
+    assert h["evidence"]["evidence_grade"] == "no_data"
+
+
+def test_api_evidence_report_endpoint_200(live_server):
+    host, port = live_server
+    status, body = _get(host, port, "/api/evidence_report")
+    assert status == 200
+    data = json.loads(body)
+    assert data["live_blocked"] is True
+    assert data["evidence_grade"] in (
+        "no_data", "logging_only", "replayable", "outcome_linked",
+        "promotion_candidate")

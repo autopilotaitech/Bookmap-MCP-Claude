@@ -121,6 +121,9 @@ amber dot, not a green/red "live" state.
   `warnings`, `required_actions`, `live_blocked` (always true).
 - `GET /api/promotion_report` -- honest per-setup promotion view (read-only,
   freshness-enveloped); `validated` is never auto-assigned.
+- `GET /api/evidence_report` -- evidence-quality report (read-only, cheap: no
+  full replay on a GET): `evidence_grade`, `setup_evidence`, `blockers`,
+  `next_required_data`, `live_blocked` (always true).
 - `GET /api/agent_feed` -- decision feed; each item carries a `roles` block
   (observer / strategist / risk / executor / auditor) derived read-only.
 - `GET /api/agent_summary`, `/api/equity`, `/api/fills`, `/api/working`,
@@ -312,6 +315,41 @@ lacks them -- never fabricated) and a status: `insufficient_sample` ->
 human + replay + paper-pass gate, and live stays hard-blocked. Also exposed
 read-only at `GET /api/promotion_report` (freshness-enveloped).
 
+### Evidence-quality report (new) -- "do I have enough usable evidence to tune?"
+
+```cmd
+python -m bookmap_mcp.pax_evidence_report ^
+    --agent-log D:\BookmapLogs\pax-agent\agent-loop.jsonl ^
+    --scorecard D:\BookmapLogs\pax-agent\scorecard.json ^
+    --session-report D:\BookmapLogs\pax-agent\session-report.json ^
+    --out D:\BookmapLogs\pax-agent\evidence-report.json
+# add --replay to also run pax_agent_replay and embed a small summary (slower)
+```
+
+`pax_evidence_report` is a thin layer over `pax_session_report.compute_replay_readiness`
+and `pax_promotion_report` -- it invents no profitability. It grades how much
+usable evidence exists (`evidence_grade`, worst -> best):
+
+| grade | meaning | what's still needed |
+|-------|---------|---------------------|
+| `no_data` | no agent records AND no scorecard | run PAX (`paxi.bat start`) |
+| `logging_only` | records exist but `replay_input` coverage too low (`< 50%`) and no outcomes | relaunch on the current build so heartbeats embed `replay_input` |
+| `replayable` | `replay_input` coverage sufficient, but no scorecard/outcomes | run armed SIM so `pax_trade_learning` writes `scorecard.json` |
+| `outcome_linked` | a scorecard/outcomes exist (decisions linked to R) | accumulate samples toward candidate gates |
+| `promotion_candidate` | `outcome_linked` AND >= 1 candidate setup | human + replay + paper-pass review (NOT automatic) |
+
+Report fields: `evidence_grade`, `blockers`, `warnings`, `next_required_data`,
+`replay_readiness`, `replay_summary` (only with `--replay`), `session_summary`,
+`scorecard_summary`, and a per-setup `setup_evidence` table
+(`evidence_status` insufficient/exploratory/candidate/blocked +
+`recommended_action` collect_more_data/review_manually/keep_observing/
+candidate_for_paper_focus/block_or_throttle + `missing_fields`). `live_blocked`
+is always true. **`promotion_candidate` is NOT `validated`** -- it means "worth a
+closer human look", never "cleared to trade". A compact summary (`evidence_grade`,
+`replay_input_pct`, `candidate_setup_count`, `evidence_blockers`) is in
+`/api/health.evidence` and the session report's `evidence_summary`; the full
+report (cheap, no replay on a GET) is at `GET /api/evidence_report`.
+
 ## Session report
 
 ```bash
@@ -327,7 +365,10 @@ the recent halt list), PnL/win-rate, setup stats, model calls, errors,
 malformed-record count, stale-data block count, **`replay_readiness`**
 (`total_records`, `replay_input_records`, `replay_input_pct`,
 `missing_replay_input`, `malformed_replay_input`,
-`latest_replay_input_version`, `note`), and a snapshot of `evaluation_state`.
+`latest_replay_input_version`, `note`), **`evidence_summary`** (`evidence_grade`,
+`replay_input_pct`, `candidate_setup_count`, `evidence_blockers`,
+`next_required_data` -- cheap, no replay run), and a snapshot of
+`evaluation_state`.
 `replay_readiness` is always cheap (counts only); `--replay-summary` additionally
 runs `pax_agent_replay` over the log and embeds a small `replay_summary`. The
 same readiness (over the recent feed) appears in `/api/health.replay_readiness`

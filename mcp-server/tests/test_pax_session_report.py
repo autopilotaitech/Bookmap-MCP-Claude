@@ -203,3 +203,40 @@ def test_replay_readiness_pre_replay_input_note():
 def test_replay_summary_optional_field_default_none():
     rep = sr.build_session_report(feed=[], equity={}, errors=[])
     assert rep["replay_summary"] is None
+
+
+# ── STAGE 4: evidence_summary in session report ────────────────────────────
+
+def _ri_rec(ts):
+    return {"ts_ms": ts, "heartbeat": True, "action": "NONE",
+            "replay_input": {"version": 1, "snapshot": {"health": "ok"},
+                             "status": {"position": {"size": 0}}, "now_ms": ts,
+                             "market_age_sec": 1.0, "heartbeat_age_sec": 1.0,
+                             "sim_broker_ok": True, "kill_switch_active": False}}
+
+
+def test_session_report_includes_evidence_summary():
+    feed = [_ri_rec(i) for i in range(3)]
+    sc = {"min_samples": 30, "setups": [{"setup": "A|LONG|OR-H|ETH", "n": 40,
+          "mean_realized_r": 0.3, "hit_rate": 0.62}]}
+    rep = sr.build_session_report(feed=feed, equity={}, errors=[],
+                                  scorecard=sc, now_ms=1)
+    es = rep["evidence_summary"]
+    assert es["evidence_grade"] == "promotion_candidate"
+    assert es["candidate_setup_count"] == 1
+    assert es["replay_input_pct"] == 100.0
+    assert "next_required_data" in es
+
+
+def test_session_report_evidence_summary_empty_feed_safe():
+    rep = sr.build_session_report(feed=[], equity={}, errors=[])
+    es = rep["evidence_summary"]
+    assert es["evidence_grade"] == "no_data"
+
+
+def test_session_report_evidence_no_scorecard_outcome():
+    feed = [_ri_rec(i) for i in range(3)]
+    rep = sr.build_session_report(feed=feed, equity={}, errors=[], now_ms=1)
+    # replay-grade logs but no scorecard -> replayable, candidate_count 0.
+    assert rep["evidence_summary"]["evidence_grade"] == "replayable"
+    assert rep["evidence_summary"]["candidate_setup_count"] == 0

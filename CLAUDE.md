@@ -73,6 +73,13 @@ legal/risk, capital, latency, exchange-failure, and manual approval controls.
   `replay_input_version_counts` / `malformed_replay_input`. Session report +
   `/api/health` expose `replay_readiness`; `/api/arming_check` warns (never
   blocks) on missing `replay_input`.
+- evidence quality: `pax_evidence_report.py` (thin layer over
+  `compute_replay_readiness` + `pax_promotion_report`) grades evidence
+  `no_data -> logging_only -> replayable -> outcome_linked -> promotion_candidate`,
+  emits a per-setup `setup_evidence` table (evidence_status + recommended_action
+  + missing_fields). Compact summary in `/api/health.evidence` + session report
+  `evidence_summary`; full report at `GET /api/evidence_report` (cheap, no replay
+  on a GET) + CLI (`--replay` opt-in). `candidate` is NOT `validated`.
 
 ### Active Next Phase
 
@@ -179,6 +186,9 @@ versioned jar policy. Bookmap can hold old jars open.
   over saved JSONL; no orders/LLM/live. Reuses the policy, not a new engine.
 - `pax_promotion_report.py` - honest per-setup promotion view over the SIM
   scorecard; reuses `pax_eval_state.setup_eligibility`. `validated` never auto.
+- `pax_evidence_report.py` - evidence-quality grading + per-setup evidence table;
+  thin layer over `compute_replay_readiness` + `pax_promotion_report`. No new
+  profitability logic; `candidate` != `validated`.
 - `pax_brain.py` - pure setup/thesis selection, no I/O/model/broker.
 - `pax_expectancy.py`, `pax_trade_learning.py` - learned expectancy and SIM
   outcome scorecards.

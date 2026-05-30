@@ -74,6 +74,7 @@ def build_session_report(*,
                          errors: List[Dict[str, Any]],
                          eval_state: Optional[Dict[str, Any]] = None,
                          replay_summary: Optional[Dict[str, Any]] = None,
+                         scorecard: Optional[Dict[str, Any]] = None,
                          now_ms: Optional[int] = None) -> Dict[str, Any]:
     """Assemble the report from already-loaded records. Pure function."""
     feed = feed or []
@@ -179,8 +180,29 @@ def build_session_report(*,
         },
         "replay_readiness": compute_replay_readiness(feed),
         "replay_summary": replay_summary,
+        "evidence_summary": _evidence_summary_for(feed, scorecard, now_ms),
         "evaluation_state": eval_state,
     }
+
+
+def _evidence_summary_for(feed: List[Dict[str, Any]],
+                          scorecard: Optional[Dict[str, Any]],
+                          now_ms: Optional[int]) -> Dict[str, Any]:
+    """Cheap evidence summary (no replay run). Lazy import breaks the
+    evidence<->session import cycle. Never raises into the report."""
+    try:
+        from . import pax_evidence_report
+        s = pax_evidence_report.compute_evidence_summary(
+            feed, scorecard, now_ms=now_ms)
+        return {
+            "evidence_grade": s["evidence_grade"],
+            "replay_input_pct": s["replay_input_pct"],
+            "candidate_setup_count": s["candidate_setup_count"],
+            "evidence_blockers": s["evidence_blockers"],
+            "next_required_data": s["next_required_data"],
+        }
+    except Exception as exc:   # never break the session report
+        return {"error": f"{type(exc).__name__}: {exc}"[:200]}
 
 
 def archive_path(out_path: Path, now_ms: int) -> Path:
@@ -251,7 +273,8 @@ def gather_and_write(*,
             rsummary = {"error": f"{type(exc).__name__}: {exc}"[:200]}
 
     report = build_session_report(feed=feed, equity=equity, errors=errors,
-                                  eval_state=eval_state, replay_summary=rsummary)
+                                  eval_state=eval_state, replay_summary=rsummary,
+                                  scorecard=q.learning_scorecard())
     out = Path(out_path) if out_path else (learn / "session-report.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     body = json.dumps(report, indent=2, default=str)

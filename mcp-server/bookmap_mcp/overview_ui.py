@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import (pax_freshness, pax_roles, pax_eval_state, pax_risk_gate,
-               pax_promotion_report)
+               pax_promotion_report, pax_evidence_report)
 
 
 def _mtime_ms(path: Path) -> Optional[int]:
@@ -708,6 +708,17 @@ class OverviewQueries:
                                        "SIM broker DB unavailable")
         last_halt = self._last_risk_halt_record()
         rr_recent = self._replay_readiness_recent()
+        try:
+            ev = self._evidence_summary()
+            evidence = {
+                "evidence_grade": ev["evidence_grade"],
+                "replay_input_pct": ev["replay_input_pct"],
+                "candidate_setup_count": ev["candidate_setup_count"],
+                "evidence_blockers": ev["evidence_blockers"],
+            }
+        except Exception:
+            evidence = {"evidence_grade": "no_data", "replay_input_pct": 0.0,
+                        "candidate_setup_count": 0, "evidence_blockers": 0}
 
         return {
             "service": "pax_overview_ui",
@@ -728,6 +739,7 @@ class OverviewQueries:
                 "replay_input_pct_recent": rr_recent["replay_input_pct"],
                 "replay_input_version": rr_recent["latest_replay_input_version"],
             },
+            "evidence": evidence,
             "evaluation_level": eval_level,
             "live_blocked": live_blocked,
         }
@@ -740,6 +752,24 @@ class OverviewQueries:
         eval-state eligibility). live trading stays hard-blocked."""
         return pax_promotion_report.build_promotion_report(
             self.learning_scorecard())
+
+    # ─── evidence quality (Stage 3, read-only) ──────────────────────
+
+    def evidence_report(self) -> Dict[str, Any]:
+        """Read-only evidence-quality report from the recent agent feed +
+        scorecard. CHEAP: no full replay pass on a GET (run the CLI with
+        --replay for that). Missing files degrade to no_data, never 500."""
+        feed = self.agent_feed(limit=2000)
+        return pax_evidence_report.build_evidence_report(
+            feed=feed, scorecard=self.learning_scorecard(),
+            input_paths={"agent_log": str(self.learn_dir / "agent-loop.jsonl"),
+                         "scorecard": str(self.learn_dir / "scorecard.json"),
+                         "replay_ran": False})
+
+    def _evidence_summary(self) -> Dict[str, Any]:
+        """Compact evidence summary for /api/health (cheap; no replay run)."""
+        return pax_evidence_report.compute_evidence_summary(
+            self.agent_feed(limit=2000), self.learning_scorecard())
 
     # ─── arming readiness (Stage 5, read-only go/no-go) ─────────────
 
@@ -941,6 +971,8 @@ def _build_handler(queries: OverviewQueries) -> type:
                 if path == "/api/promotion_report":
                     return _json_response(self,
                                           queries.enveloped("promotion_report"))
+                if path == "/api/evidence_report":
+                    return _json_response(self, queries.evidence_report())
                 return self.send_error(404, f"unknown path: {path}")
             except Exception as exc:   # pragma: no cover — defensive
                 return _json_response(self,
