@@ -300,3 +300,118 @@ def test_replay_input_output_deterministic_except_generated_ms():
     b = R.replay_file(FIX / "replay_input_entry.jsonl", now_ms=22)
     a.pop("generated_ms"); b.pop("generated_ms")
     assert json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
+# ── replay clock report (weekend/offline clock safety) ─────────────────────
+
+import datetime as _dt   # noqa: E402
+
+# A WEDNESDAY instant (2026-05-27 18:00 UTC == 13:00 CDT). Replaying this on a
+# Saturday must still resolve to Wednesday -- the helper reads no wall clock.
+_WED_MS = int(_dt.datetime(2026, 5, 27, 18, 0, 0,
+                           tzinfo=_dt.timezone.utc).timestamp() * 1000)
+
+
+def test_clock_report_fields_present():
+    rep = R.replay_file(FIX / "clean_eligible_entry.jsonl", now_ms=1)
+    assert rep["weekend_wall_clock_ignored"] is True
+    assert "replay_clock_source_counts" in rep
+    assert "first_replay_time_ct" in rep
+    assert "last_replay_time_ct" in rep
+    assert isinstance(rep["clock_limitations"], list)
+
+
+def test_clock_source_counts_record_ts():
+    recs = [{"ts_ms": _WED_MS, "snapshot": {"health": "ok"}, "action": "NONE"}]
+    rep = R.replay_records(recs, now_ms=1)
+    assert rep["replay_clock_source_counts"] == {"record.ts_ms": 1}
+
+
+def test_clock_source_counts_replay_input():
+    rep = R.replay_file(FIX / "replay_input_entry.jsonl", now_ms=1)
+    assert rep["replay_clock_source_counts"] == {"replay_input.now_ms": 1}
+
+
+def test_wednesday_ts_replayed_as_wednesday_not_today():
+    # PINNED: a record carrying only a Wednesday timestamp must classify/use
+    # Wednesday replay time regardless of the (possibly Saturday) run day.
+    recs = [{"ts_ms": _WED_MS, "snapshot": {"health": "ok"}, "action": "NONE"}]
+    rep = R.replay_records(recs, now_ms=1)
+    assert rep["first_replay_time_ct"].startswith("2026-05-27T13:00")
+    assert rep["last_replay_time_ct"].startswith("2026-05-27T13:00")
+
+
+def test_composed_only_record_has_no_replay_clock():
+    # composedAtMs is not a clock source -> source "none" + a clock limitation.
+    recs = [{"snapshot": {"health": "ok", "composedAtMs": _WED_MS},
+             "action": "NONE"}]
+    rep = R.replay_records(recs, now_ms=1)
+    assert rep["replay_clock_source_counts"].get("none") == 1
+    assert any("no real replay clock" in s.lower()
+               for s in rep["clock_limitations"])
+
+
+def test_clock_verdict_pass_for_clean_replay_input():
+    rep = R.replay_file(FIX / "replay_input_entry.jsonl", now_ms=1)
+    v = R.clock_report(rep)
+    assert v["overall"] == "pass"
+    assert v["replay_clock_ok"] is True
+    assert v["wall_clock_used"] is False
+    assert v["usable_records"] == 1
+    assert v["clock_source_counts"] == {"replay_input.now_ms": 1}
+    assert v["market_freshness_missing"] == 0
+    assert v["required_actions"] == []
+
+
+def test_clock_verdict_fail_when_no_usable_clock():
+    recs = [{"snapshot": {"health": "ok", "composedAtMs": _WED_MS},
+             "action": "NONE"}]
+    v = R.clock_report(R.replay_records(recs, now_ms=1))
+    assert v["overall"] == "fail"
+    assert v["replay_clock_ok"] is False
+    assert any("clock" in a.lower() for a in v["required_actions"])
+
+
+def test_clock_verdict_warn_when_market_freshness_missing():
+    # Entry decision but no real market timestamp -> gate not replayable.
+    ts = _WED_MS
+    rec = _entry_record(as_of=ts, ts=ts)
+    rec["snapshot"].pop("marketDataAsOfMs")
+    rec["snapshot"].pop("composedAtMs")
+    v = R.clock_report(R.replay_records([rec], now_ms=1))
+    assert v["overall"] == "warn"
+    assert v["replay_clock_ok"] is True       # the clock itself is fine
+    assert v["market_freshness_missing"] == 1
+
+
+def test_clock_verdict_fail_when_no_usable_records():
+    v = R.clock_report(R.replay_records([], now_ms=1))
+    assert v["overall"] == "fail"
+    assert v["usable_records"] == 0
+
+
+@pytest.mark.parametrize("fname,overall,ct_prefix", [
+    ("replay_clock_weekday_market.jsonl", "pass", "2026-05-27"),
+    ("replay_clock_weekend_wallclock_guard.jsonl", "pass", "2026-05-27"),
+    ("replay_clock_missing_market_ts.jsonl", "warn", "2026-05-27"),
+    ("replay_clock_composed_only.jsonl", "fail", None),
+])
+def test_replay_clock_fixtures(fname, overall, ct_prefix):
+    rep = R.replay_file(FIX / fname, now_ms=1)
+    v = R.clock_report(rep)
+    assert v["overall"] == overall
+    assert v["wall_clock_used"] is False
+    if ct_prefix is not None:
+        # Wednesday tape: replay time is Wednesday regardless of run day.
+        assert rep["first_replay_time_ct"].startswith(ct_prefix)
+
+
+def test_clock_report_deterministic():
+    a = R.replay_records(
+        [{"ts_ms": _WED_MS, "snapshot": {"health": "ok"}, "action": "NONE"}],
+        now_ms=5)
+    b = R.replay_records(
+        [{"ts_ms": _WED_MS, "snapshot": {"health": "ok"}, "action": "NONE"}],
+        now_ms=9)
+    a.pop("generated_ms"); b.pop("generated_ms")
+    assert json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)

@@ -266,10 +266,14 @@ class SimEngine:
             conn.close()
 
     def _log(self, c: sqlite3.Connection, kind: str,
-             order_id: Optional[int] = None, payload: Any = None) -> None:
+             order_id: Optional[int] = None, payload: Any = None,
+             ts_ms: Optional[int] = None) -> None:
+        # ts_ms lets the replay/fixture placement path stamp the recorded time
+        # instead of the wall clock; live callers omit it (default wall clock).
         c.execute("INSERT INTO events(ts_ms, alias, kind, order_id, payload) "
                   "VALUES(?,?,?,?,?)",
-                  (_now_ms(), self.alias, kind, order_id,
+                  (int(ts_ms) if ts_ms is not None else _now_ms(),
+                   self.alias, kind, order_id,
                    json.dumps(payload, default=str) if payload is not None else None))
 
     # ─── place orders ────────────────────────────────────────────────────
@@ -278,32 +282,41 @@ class SimEngine:
                     tif_sec: float = 90.0, reason: str = "",
                     role: str = "ENTRY", parent_id: Optional[int] = None,
                     decision_tag: Optional[str] = None,
-                    armed_after_parent_fill: bool = False) -> int:
+                    armed_after_parent_fill: bool = False,
+                    now_ms: Optional[int] = None) -> int:
         return self._place(side=side, qty=qty, type_=OT_LIMIT,
                            limit=limit, stop=None,
                            tif_sec=tif_sec, reason=reason, role=role,
                            parent_id=parent_id, decision_tag=decision_tag,
-                           armed_after_parent_fill=armed_after_parent_fill)
+                           armed_after_parent_fill=armed_after_parent_fill,
+                           now_ms=now_ms)
 
     def place_stop_limit(self, side: str, qty: int, stop: float, limit: float,
                          tif_sec: float = 90.0, reason: str = "",
                          role: str = "ENTRY", parent_id: Optional[int] = None,
                          decision_tag: Optional[str] = None,
-                         armed_after_parent_fill: bool = False) -> int:
+                         armed_after_parent_fill: bool = False,
+                         now_ms: Optional[int] = None) -> int:
         return self._place(side=side, qty=qty, type_=OT_STOP_LIMIT,
                            limit=limit, stop=stop,
                            tif_sec=tif_sec, reason=reason, role=role,
                            parent_id=parent_id, decision_tag=decision_tag,
-                           armed_after_parent_fill=armed_after_parent_fill)
+                           armed_after_parent_fill=armed_after_parent_fill,
+                           now_ms=now_ms)
 
     def _place(self, side: str, qty: int, type_: str,
                limit: Optional[float], stop: Optional[float],
                tif_sec: float, reason: str, role: str,
                parent_id: Optional[int],
                decision_tag: Optional[str],
-               armed_after_parent_fill: bool = False) -> int:
+               armed_after_parent_fill: bool = False,
+               now_ms: Optional[int] = None) -> int:
+        """``now_ms`` overrides the placement timestamp for deterministic
+        replay/fixtures (placed_ms + the PLACE event ts). Live callers omit it
+        and get the wall clock -- the live SIM path is unchanged."""
         if side not in (S_BUY, S_SELL): raise ValueError("side")
         if qty <= 0: raise ValueError("qty>0")
+        placed = int(now_ms) if now_ms is not None else _now_ms()
         with self._lock, self._conn() as c:
             cur = c.execute(
                 "INSERT INTO orders(alias, parent_id, side, type, qty, "
@@ -313,25 +326,30 @@ class SimEngine:
                 (self.alias, parent_id, side, type_, qty,
                  limit, stop,
                  ST_WORKING,
-                 _now_ms(), tif_sec, reason, role, decision_tag,
+                 placed, tif_sec, reason, role, decision_tag,
                  1 if armed_after_parent_fill else 0))
             oid = cur.lastrowid
             self._log(c, "PLACE", oid,
                       {"side": side, "type": type_, "qty": qty,
                        "limit": limit, "stop": stop,
                        "reason": reason, "role": role,
-                       "armed_after_parent_fill": bool(armed_after_parent_fill)})
+                       "armed_after_parent_fill": bool(armed_after_parent_fill)},
+                      ts_ms=now_ms)
         return oid
 
     def place_bracket(self, side: str, qty: int,
                       entry_stop: Optional[float], entry_limit: float,
                       stop_loss: float, take_profits: List[float],
                       decision_tag: Optional[str] = None,
-                      reason: str = "") -> Dict[str, Any]:
+                      reason: str = "",
+                      now_ms: Optional[int] = None) -> Dict[str, Any]:
         """Convenience: place an entry + protective stop + N take-profit limits.
 
         TPs and stop are placed but only ARM after the entry fills (handled
         inside tick()).  Returns the dict of order IDs.
+
+        ``now_ms`` overrides the placement timestamp for all entry + child
+        orders (deterministic replay/fixtures); live callers omit it.
         """
         # Entry is independently executable (armed_after_parent_fill=False).
         if entry_stop is not None:
@@ -339,12 +357,14 @@ class SimEngine:
                                              stop=entry_stop, limit=entry_limit,
                                              role="ENTRY", reason=reason,
                                              decision_tag=decision_tag,
-                                             armed_after_parent_fill=False)
+                                             armed_after_parent_fill=False,
+                                             now_ms=now_ms)
         else:
             entry_id = self.place_limit(side=side, qty=qty, limit=entry_limit,
                                         role="ENTRY", reason=reason,
                                         decision_tag=decision_tag,
-                                        armed_after_parent_fill=False)
+                                        armed_after_parent_fill=False,
+                                        now_ms=now_ms)
         # SL and TPs are bracket children — armed only after the parent entry fills.
         exit_side = S_SELL if side == S_BUY else S_BUY
         stop_id = self.place_stop_limit(
@@ -352,7 +372,7 @@ class SimEngine:
             limit=stop_loss + (-self.tick_size if exit_side == S_SELL else self.tick_size),
             role="STOP", reason="bracket stop-loss", parent_id=entry_id,
             tif_sec=24*3600, decision_tag=decision_tag,
-            armed_after_parent_fill=True)
+            armed_after_parent_fill=True, now_ms=now_ms)
         # Equal scale-out across TPs
         tp_ids: List[int] = []
         if take_profits:
@@ -365,7 +385,8 @@ class SimEngine:
                                          role="TP", reason=f"bracket TP{i+1}",
                                          parent_id=entry_id, tif_sec=24*3600,
                                          decision_tag=decision_tag,
-                                         armed_after_parent_fill=True)
+                                         armed_after_parent_fill=True,
+                                         now_ms=now_ms)
                 tp_ids.append(tp_id)
         return {"entry": entry_id, "stop": stop_id, "tps": tp_ids}
 

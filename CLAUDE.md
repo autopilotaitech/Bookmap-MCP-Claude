@@ -108,7 +108,11 @@ versioned jar policy. Bookmap can hold old jars open.
 - `pax_risk_gate.py` - pure operational HALT gate (kill switch / stale data /
   session limits) at the final pre-SIM-placement point. Not a strategy brain.
 - `pax_agent_replay.py` - deterministic decision-path replay over saved JSONL;
-  no orders/LLM/live. Reuses the policy, not a new engine.
+  no orders/LLM/live. Reuses the policy, not a new engine. `--clock-report`
+  gives a weekend/offline replay-clock verdict (pass|warn|fail).
+- `pax_replay_clock.py` - pure replay clock authority (no I/O, no wall-clock).
+  Derives time from replay_input.now_ms/ts_ms/feed ts only; `composedAtMs` is
+  never a clock or freshness source. Weekend replay uses the recorded weekday.
 - `pax_promotion_report.py` - honest per-setup promotion view; `validated`
   never auto-assigned.
 - `pax_evidence_report.py` - evidence grading + per-setup table; `candidate`

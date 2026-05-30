@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import pax_loop, pax_risk_gate   # pax_risk_gate is pure (no broker/LLM)
+from . import pax_replay_clock           # pure replay clock (no wall-clock)
 
 # Captured so the report is self-describing about the policy it replayed. These
 # are the deterministic pax_loop knobs that shape a decision.
@@ -131,45 +132,17 @@ def _num(x: Any) -> Optional[float]:
         return None
 
 
-def _market_age_sec(snap: Dict[str, Any], now_ms: int) -> Optional[float]:
-    """Market/feed data age (seconds) from a REAL bridge timestamp, or None when
-    none exists. Mirrors pax_sim_agent._market_age_sec; never uses dashboard
-    compose time. None -> the operational gate cannot be replayed (missing
-    fields), which is reported as a limitation rather than faked."""
-    as_of = _num(snap.get("marketDataAsOfMs"))
-    if as_of is None:
-        as_of = _num(snap.get("marketAsOfMs"))
-    if as_of is not None:
-        return max(0.0, (now_ms - as_of) / 1000.0)
-    age_ms = _num(snap.get("ageMs"))
-    if age_ms is None:
-        age_ms = _num(snap.get("snapshot_age_ms"))
-    if age_ms is not None:
-        return max(0.0, age_ms / 1000.0)
-    return None
-
-
 def _now_from(record: Dict[str, Any], snap: Dict[str, Any],
-              ri: Optional[Dict[str, Any]] = None) -> Tuple[Any, int]:
-    """Deterministic replay clock from ts_ms (UTC); never reads wall-clock.
-    Prefers replay_input.now_ms, then record.ts_ms, then snapshot timestamps."""
-    ts = None
-    if ri is not None:
-        ts = ri.get("now_ms")
-    if ts is None:
-        ts = record.get("ts_ms")
-    if ts is None:
-        ts = snap.get("marketDataAsOfMs") or snap.get("composedAtMs") or 0
-    try:
-        ts_ms = int(ts)
-    except (TypeError, ValueError):
-        ts_ms = 0
-    if ts_ms > 0:
-        now_dt = datetime.datetime.fromtimestamp(ts_ms / 1000.0,
-                                                 datetime.timezone.utc)
-    else:
-        now_dt = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
-    return now_dt, ts_ms
+              ri: Optional[Dict[str, Any]] = None
+              ) -> Tuple[Any, int, str]:
+    """Deterministic replay clock (UTC datetime, epoch ms, source label).
+
+    Delegates to ``pax_replay_clock`` -- the single pure clock authority. Never
+    reads wall-clock; ``composedAtMs`` is NOT a clock source. Returns ts_ms=0 /
+    source="none" when no real timestamp exists (reported as a limitation)."""
+    res = pax_replay_clock.resolve_clock(record, snap, ri)
+    now_dt = pax_replay_clock.replay_now_dt_utc(res.ts_ms)
+    return now_dt, res.ts_ms, res.source
 
 
 def iter_records(text: str) -> Tuple[List[Any], int]:
@@ -229,6 +202,10 @@ def replay_records(records: List[Dict[str, Any]],
     replay_input_count = 0                          # records carrying replay_input
     malformed_replay_input = 0                      # present but not a dict
     replay_input_version_counts: Counter = Counter()
+    clock_source_counts: Counter = Counter()       # per usable record
+    no_clock_count = 0                             # usable records w/o real clock
+    min_ts: Optional[int] = None                   # earliest real replay clock
+    max_ts: Optional[int] = None                   # latest real replay clock
 
     for idx, rec in enumerate(records):
         ri, ri_malformed = _replay_input_of(rec)
@@ -250,7 +227,13 @@ def replay_records(records: List[Dict[str, Any]],
             continue
         usable += 1
         status = _status_of(rec, ri)
-        now_dt, ts_ms = _now_from(rec, snap, ri)
+        now_dt, ts_ms, clock_source = _now_from(rec, snap, ri)
+        clock_source_counts[clock_source] += 1
+        if clock_source == "none" or ts_ms <= 0:
+            no_clock_count += 1
+        else:
+            min_ts = ts_ms if min_ts is None else min(min_ts, ts_ms)
+            max_ts = ts_ms if max_ts is None else max(max_ts, ts_ms)
         try:
             plan = pax_loop.decide(snap, status, now_dt, ts_ms)
         except Exception as exc:   # a malformed snapshot must not crash replay
@@ -279,10 +262,7 @@ def replay_records(records: List[Dict[str, Any]],
         # Operational fields: prefer the embedded replay_input (what the live
         # system actually saw), then legacy top-level record fields, then derive
         # market age from the snapshot timestamp.
-        if ri is not None and "market_age_sec" in ri:
-            market_age = _num(ri.get("market_age_sec"))
-        else:
-            market_age = _market_age_sec(snap, ts_ms)
+        market_age = pax_replay_clock.market_age_sec_for_replay(snap, ts_ms, ri)
         if market_age is None:
             # No real market timestamp -> cannot prove freshness without faking
             # it; do NOT run the gate (fail-closed faking is exactly what we are
@@ -290,8 +270,7 @@ def replay_records(records: List[Dict[str, Any]],
             op_missing_fields += 1
             continue
         kill_active = bool(_op_field(ri, rec, "kill_switch_active", False))
-        hb_raw = _op_field(ri, rec, "heartbeat_age_sec", None)
-        hb_age = _num(hb_raw) if hb_raw is not None else None
+        hb_age = pax_replay_clock.heartbeat_age_sec_for_replay(rec, ri)
         sim_raw = _op_field(ri, rec, "sim_broker_ok", None)
         sim_ok = bool(sim_raw) if sim_raw is not None \
             else (not status.get("_status_error"))
@@ -341,6 +320,31 @@ def replay_records(records: List[Dict[str, Any]],
     limitations.append("SIM-only deterministic replay: no orders, no LLM, no "
                        "live Bookmap; no market-edge claim.")
 
+    # Clock-specific limitations (subset focused on replay-clock safety).
+    clock_limitations: List[str] = []
+    if no_clock_count:
+        clock_limitations.append(
+            f"{no_clock_count} usable record(s) had no real replay clock "
+            "(no replay_input.now_ms / ts_ms / real feed timestamp; "
+            "composedAtMs is not a clock); decision ran at epoch and is NOT "
+            "time-anchored.")
+    snap_only = sum(clock_source_counts[s] for s in (
+        "snapshot.marketDataAsOfMs", "snapshot.marketAsOfMs",
+        "snapshot.eventMs", "snapshot.updatedAtMs"))
+    if snap_only:
+        clock_limitations.append(
+            f"{snap_only} usable record(s) derived the replay clock from a "
+            "snapshot feed timestamp (no replay_input.now_ms / ts_ms); fine "
+            "for replay, but log replay_input for the strongest provenance.")
+    clock_limitations.append(
+        "weekend/offline replay clock is derived from the recorded tape only; "
+        "the wall clock is never read for decisions (composedAtMs excluded).")
+
+    first_ct = (pax_replay_clock.replay_now_dt_ct(min_ts).isoformat()
+                if min_ts is not None else None)
+    last_ct = (pax_replay_clock.replay_now_dt_ct(max_ts).isoformat()
+               if max_ts is not None else None)
+
     return {
         "generated_ms": int(now_ms) if now_ms is not None else _wall_ms(),
         "input": input_path,
@@ -366,8 +370,70 @@ def replay_records(records: List[Dict[str, Any]],
         "malformed_replay_input": malformed_replay_input,
         "replay_input_version_counts": dict(sorted(
             replay_input_version_counts.items())),
+        # --- replay clock report (weekend/offline clock safety) ---
+        "replay_clock_source_counts": dict(sorted(clock_source_counts.items())),
+        "first_replay_time_ct": first_ct,
+        "last_replay_time_ct": last_ct,
+        "weekend_wall_clock_ignored": True,
+        "clock_limitations": clock_limitations,
         "deterministic_config": DETERMINISTIC_CONFIG,
         "limitations": limitations,
+    }
+
+
+def clock_report(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive a weekend/offline replay-clock verdict from a replay summary.
+
+    Pure: reads only the summary. Answers "can this tape be replayed offline
+    safely?" without re-running the replay.
+
+    overall:
+      pass  -- every usable record had a real replay clock AND every entry
+               record's market-freshness gate was replayable; no wall-clock
+               fallback was used.
+      warn  -- records replay, but some operational gate fields are missing
+               (e.g. market-freshness timestamp) or some records lacked a clock.
+      fail  -- no usable replay clock exists (no usable records, or none of
+               the usable records carried a real timestamp)."""
+    usable = int(summary.get("usable_snapshot_count") or 0)
+    src_counts = dict(summary.get("replay_clock_source_counts") or {})
+    no_clock = int(src_counts.get("none", 0))
+    real_clock = max(0, usable - no_clock)
+    mkt_missing = int(summary.get("op_gate_missing_fields_count") or 0)
+
+    replay_clock_ok = usable > 0 and no_clock == 0
+    if usable == 0 or real_clock == 0:
+        overall = "fail"
+    elif no_clock == 0 and mkt_missing == 0:
+        overall = "pass"
+    else:
+        overall = "warn"
+
+    required_actions: List[str] = []
+    if usable == 0:
+        required_actions.append(
+            "no usable snapshot to replay: capture a snapshot-embedding "
+            "log/fixture (replay_input.snapshot or top-level snapshot).")
+    if no_clock > 0:
+        required_actions.append(
+            f"{no_clock} usable record(s) had no real replay clock: log "
+            "replay_input.now_ms (or ts_ms / a real feed timestamp) per record.")
+    if mkt_missing > 0:
+        required_actions.append(
+            f"{mkt_missing} entry record(s) lacked market freshness: log "
+            "market_age_sec (or marketDataAsOfMs) so the freshness gate replays.")
+
+    return {
+        "overall": overall,
+        "replay_clock_ok": replay_clock_ok,
+        "usable_records": usable,
+        "clock_source_counts": dict(sorted(src_counts.items())),
+        "first_replay_time_ct": summary.get("first_replay_time_ct"),
+        "last_replay_time_ct": summary.get("last_replay_time_ct"),
+        "market_freshness_missing": mkt_missing,
+        "wall_clock_used": False,
+        "limitations": list(summary.get("clock_limitations") or []),
+        "required_actions": required_actions,
     }
 
 
@@ -408,6 +474,11 @@ def replay_file(input_path: Path, *, limit: Optional[int] = None,
             "replay_input_count": 0,
             "malformed_replay_input": 0,
             "replay_input_version_counts": {},
+            "replay_clock_source_counts": {},
+            "first_replay_time_ct": None,
+            "last_replay_time_ct": None,
+            "weekend_wall_clock_ignored": True,
+            "clock_limitations": [],
             "deterministic_config": DETERMINISTIC_CONFIG,
             "limitations": [f"input unreadable: {type(exc).__name__}: {exc}"],
         }
@@ -427,12 +498,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Write the summary JSON here (else stdout).")
     p.add_argument("--limit", type=int, default=None,
                    help="Replay at most N records.")
+    p.add_argument("--clock-report", action="store_true",
+                   help="Emit the weekend/offline replay-clock verdict "
+                        "(pass|warn|fail) instead of the full replay summary.")
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     report = replay_file(args.input, limit=args.limit)
+    if args.clock_report:
+        report = clock_report(report)
     body = json.dumps(report, indent=2, sort_keys=True, default=str)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

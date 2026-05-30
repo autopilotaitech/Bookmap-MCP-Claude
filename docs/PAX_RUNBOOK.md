@@ -360,6 +360,51 @@ Replay has **two layers**, both pure (no orders, no LLM, no live Bookmap):
    note ("operational risk gate not replayed for N records due to missing
    fields"), never faked into a pass/fail.
 
+### Weekend / offline replay clock safety
+
+PAX can be replayed on saved data while Bookmap/the market is closed. The
+replay clock is **derived from the recorded tape only -- the wall clock is never
+read for decisions.** Replaying a Wednesday tape on a Saturday uses the
+Wednesday recorded time, full stop. `pax_replay_clock` (pure, no I/O, no
+wall-clock) is the single clock authority; `pax_agent_replay`, `pax_loop`, and
+`pax_risk_gate` consume it.
+
+Clock source priority (highest first): `replay_input.now_ms` -> `record.ts_ms`
+-> snapshot `marketDataAsOfMs` -> `marketAsOfMs` -> `eventMs` -> `updatedAtMs` ->
+none (`ts_ms=0`, reported as a limitation, **never** the wall clock).
+`composedAtMs` is dashboard compose time and is **never** a clock source NOR a
+market-freshness source.
+
+Every replay summary carries: `replay_clock_source_counts`,
+`first_replay_time_ct` / `last_replay_time_ct` (CT, recorded weekday),
+`weekend_wall_clock_ignored: true`, and `clock_limitations`.
+
+Get a one-shot offline-safety verdict with `--clock-report`:
+
+```cmd
+python -m bookmap_mcp.pax_agent_replay --input D:\BookmapLogs\pax-agent\agent-loop.jsonl ^
+    --clock-report
+```
+
+It emits `overall` (`pass|warn|fail`), `replay_clock_ok`, `usable_records`,
+`clock_source_counts`, `market_freshness_missing`, `wall_clock_used` (always
+`false`), `limitations`, and `required_actions`. **`pass`** = every usable
+record had a real replay clock and every entry's freshness gate was replayable;
+**`warn`** = replays but some clock/freshness fields missing; **`fail`** = no
+usable replay clock at all. Best replay needs: `replay_input.now_ms`,
+`market_age_sec`, `heartbeat_age_sec`, `sim_broker_ok`, `kill_switch_active`, and
+the embedded `snapshot`/`status`.
+
+For deterministic SIM placement in replay/fixtures, `SimEngine.place_bracket` /
+`place_limit` / `place_stop_limit` accept an optional `now_ms` that stamps
+`placed_ms` (and the PLACE event ts); live callers omit it and get the wall
+clock unchanged. `tick(now_ms=)` already drives TIF expiry + EOD off the replay
+clock. **Remaining wall-clock (documented):** `SimEngine.snapshot()` derives
+today's session window (`fills_today` / `losers_today` / `realized_today_usd`)
+from `_today_rth_anchor_ms()`, which reads the wall clock -- those aggregates are
+"today" relative to the run, not the replay date. Per-trade placement/fill
+timing is replay-deterministic; session-date aggregation is not.
+
 ### Promotion report (new, honest, candidate is the ceiling)
 
 ```cmd

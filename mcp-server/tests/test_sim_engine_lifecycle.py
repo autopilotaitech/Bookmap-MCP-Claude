@@ -48,6 +48,54 @@ def _trade(price, nanos, side="sell", size=1):
     return {"price": price, "nanos": nanos, "size": size, "side": side}
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Replay clock: explicit now_ms on placement stamps the recorded time
+# ──────────────────────────────────────────────────────────────────────
+
+# A real WEDNESDAY instant, far from any test-run wall clock.
+_WED_MS = 1779300000000
+
+
+def _placed_ms(eng, order_id):
+    with eng._conn() as c:
+        row = c.execute("SELECT placed_ms FROM orders WHERE id=?",
+                        (order_id,)).fetchone()
+    return row["placed_ms"]
+
+
+def test_place_limit_with_now_ms_stamps_replay_time(db_path):
+    eng = _eng(db_path)
+    oid = eng.place_limit(side="BUY", qty=1, limit=100.0, now_ms=_WED_MS)
+    assert _placed_ms(eng, oid) == _WED_MS
+
+
+def test_place_stop_limit_with_now_ms_stamps_replay_time(db_path):
+    eng = _eng(db_path)
+    oid = eng.place_stop_limit(side="BUY", qty=1, stop=100.0, limit=100.25,
+                               now_ms=_WED_MS)
+    assert _placed_ms(eng, oid) == _WED_MS
+
+
+def test_place_bracket_with_now_ms_stamps_all_children(db_path):
+    eng = _eng(db_path)
+    ids = eng.place_bracket(
+        side="BUY", qty=2, entry_stop=100.50, entry_limit=100.75,
+        stop_loss=99.0, take_profits=[101.0, 102.0], now_ms=_WED_MS)
+    assert _placed_ms(eng, ids["entry"]) == _WED_MS
+    assert _placed_ms(eng, ids["stop"]) == _WED_MS
+    for tp in ids["tps"]:
+        assert _placed_ms(eng, tp) == _WED_MS
+
+
+def test_place_without_now_ms_uses_wall_clock(db_path):
+    # Live default unchanged: placed_ms is the wall clock (a large recent ms).
+    eng = _eng(db_path)
+    before = int(time.time() * 1000)
+    oid = eng.place_limit(side="BUY", qty=1, limit=100.0)
+    after = int(time.time() * 1000)
+    assert before <= _placed_ms(eng, oid) <= after
+
+
 def _snap(alias, price, nanos, side="sell", best_bid=None, best_ask=None):
     if best_bid is None: best_bid = price - 0.25
     if best_ask is None: best_ask = price + 0.25
