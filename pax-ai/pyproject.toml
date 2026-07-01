@@ -8,9 +8,18 @@ version = "0.1.0"
 description = "Pax AI - floating dark-glass quant chat over Bookmap MCP dashboard"
 requires-python = ">=3.11"
 authors = [{name = "Will (autopilotaitech)", email = "will@autopilotaitech.com"}]
-dependencies = [
-    "pywebview>=6.2.1",
-]
+# Runtime core is stdlib-only: the HTTP server, voice normalizer, and feature
+# bus have no third-party requirements, so the test suite resolves with no
+# external packages (`uv run --extra dev pytest`).
+#
+# The desktop floating-window shell needs pywebview, but it is imported LAZILY
+# in pax_ai/shell.py with a graceful "not installed" fallback and is installed
+# MANUALLY on the target machine (Windows):
+#     pip install pywebview
+# It is intentionally NOT declared here: pinning it as a project dependency
+# breaks dependency resolution on headless CI/build hosts where no GUI toolkit
+# (and no compatible pywebview build) is available.
+dependencies = []
 
 [project.optional-dependencies]
 dev = [
