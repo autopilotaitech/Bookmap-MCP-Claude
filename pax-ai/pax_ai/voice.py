@@ -45,7 +45,7 @@ _RULES: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"(?i)\bbuying\s+pressure\b"),  "bid-side pressure"),
     (re.compile(r"(?i)\bselling\s+pressure\b"), "ask-side pressure"),
     (re.compile(r"(?i)\bstop\s+sweep\b"),       "STOP_SWEEP"),
-    (re.compile(r"(?i)\bspoofing?\b"),          "SPOOF"),
+    (re.compile(r"(?i)\bspoof(?:ing)?\b"),      "SPOOF"),
     (re.compile(r"(?i)\bice\s*berg\b"),         "ICEBERG"),
 
     # Verdict words

@@ -30,6 +30,10 @@ from pax_ai import voice
     ("ice berg defending the ask",          "ICEBERG defending the ask"),
     ("stop sweep printed",                  "STOP_SWEEP printed"),
     ("spoofing at the bid",                 "SPOOF at the bid"),
+    ("spoof at the bid",                    "SPOOF at the bid"),
+    # 'spoofin' is a mis-transcription artifact, not the jargon word:
+    # the rule must NOT eagerly rewrite it.
+    ("spoofin around the level",            "spoofin around the level"),
 
     # verdict words
     ("call it a follow long",               "call it a FOLLOW long"),
