@@ -45,6 +45,9 @@ _RULES: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"(?i)\bbuying\s+pressure\b"),  "bid-side pressure"),
     (re.compile(r"(?i)\bselling\s+pressure\b"), "ask-side pressure"),
     (re.compile(r"(?i)\bstop\s+sweep\b"),       "STOP_SWEEP"),
+    # `(?:ing)?` groups the whole suffix so this matches 'spoof'/'spoofing'
+    # only. Do NOT write `spoofing?` -- that parses as 'spoof' + 'in' + an
+    # optional 'g', which wrongly rewrites the mis-transcription 'spoofin'.
     (re.compile(r"(?i)\bspoof(?:ing)?\b"),      "SPOOF"),
     (re.compile(r"(?i)\bice\s*berg\b"),         "ICEBERG"),
 
